@@ -4,6 +4,8 @@
 [![Release](https://img.shields.io/github/v/release/GMY2811/DO-Editor?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/latest)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 
+[English](README_EN.md)
+
 一款面向 Windows 的轻量 PDF 阅读与编辑工具，基于 Python + PySide6 + PyMuPDF 构建。支持阅读、标注、合并、拆分、签名、水印等常用 PDF 操作，并可读取 Word 文档。
 
 开发者：RAY <gmy.2811@gmail.com>
