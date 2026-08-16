@@ -4,6 +4,26 @@
 
 开发者：RAY <gmy.2811@gmail.com>
 
+## 下载安装（推荐）
+
+**Windows 用户无需安装 Python，直接下载安装包即可使用。**
+
+前往 [Releases](../../releases) 页面，下载最新版本的 `DO编辑器-Setup-v*.exe` 安装程序，双击安装即可。
+
+- 支持 Windows 10 / 11
+- 安装包约 35MB，安装后磁盘占用约 105MB
+- 安装时可选「将 PDF 文件关联到 DO编辑器」
+- 自带卸载程序（控制面板或开始菜单均可卸载）
+
+### 从源码运行（开发者）
+
+需 Python 3.9+，安装依赖后运行：
+
+```bash
+pip install PySide6 PyMuPDF pywin32
+python main.py
+```
+
 ## 功能
 
 - **阅读**：连续滚动、缩放、翻页、书签目录、缩略图侧栏、多标签页、全屏纯净模式
@@ -21,13 +41,6 @@
 - [PySide6](https://pypi.org/project/PySide6/)（Qt 界面）
 - [PyMuPDF](https://pypi.org/project/PyMuPDF/)（PDF 渲染与编辑核心）
 - [pywin32](https://pypi.org/project/pywin32/)（Word 转换，可选）
-
-## 运行
-
-```bash
-pip install PySide6 PyMuPDF pywin32
-python main.py
-```
 
 ## 打包
 
