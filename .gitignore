@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec.bak
+
+# 安装包产物
+installer/
+
+# 测试临时文件
+*.pdf
+*.docx
+*.doc
+*.png
+*.jpg
+*.jpeg
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 其他
+*.log
