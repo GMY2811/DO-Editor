@@ -12,6 +12,7 @@ dist/
 
 # 安装包产物
 installer/
+.build-tools/
 
 # 测试临时文件
 *.pdf

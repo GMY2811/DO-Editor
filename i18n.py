@@ -34,6 +34,7 @@ _STRINGS = {
     "extract": ("提取指定页", "Extract Pages"),
     "copy_all": ("复制本页全部文字", "Copy Page Text"),
     "image": ("插入图片", "Insert Image"),
+    "edit_color": ("编辑颜色", "Edit Color"),
     "sign": ("手写签名", "Signature"),
     "sign_lib": ("签名库", "Signature Library"),
     "about": ("关于", "About"),
@@ -57,6 +58,14 @@ _STRINGS = {
     "text": ("文本", "Text"),
     # 搜索
     "search_placeholder": ("搜索文字…", "Search text…"),
+    "search": ("搜索", "Search"),
+    "search_prev": ("上一条", "Previous"),
+    "search_next": ("下一条", "Next"),
+    # 关闭确认
+    "discard": ("不保存", "Don't Save"),
+    "unsaved_changes": ("文档有未保存的修改，是否保存？", "The document has unsaved changes. Save?"),
+    "unsaved_changes_file": ("「{f}」有未保存的修改，是否保存？", "\"{f}\" has unsaved changes. Save?"),
+    "hint": ("提示", "Info"),
     # 右键菜单
     "copy_selected": ("复制所选文字", "Copy Selection"),
     "select_text": ("选取文字", "Select Text"),
@@ -71,7 +80,10 @@ _STRINGS = {
     "page_of": ("第 {p} / {t} 页", "Page {p} / {t}"),
     # 修改文字对话框
     "new_text": ("新文字：", "New Text: "),
+    "font_family": ("字体：", "Font: "),
     "font_size": ("字号：", "Font Size: "),
+    "bold": ("加粗", "Bold"),
+    "italic": ("斜体", "Italic"),
     # 水印
     "add_watermark": ("添加水印", "Add Watermark"),
     "watermark_text": ("水印文字：", "Watermark Text: "),

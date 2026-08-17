@@ -68,14 +68,20 @@ def main():
     print("[OK] save-over + delete_page")
 
     # ================= GUI =================
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import QPointF
-    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtWidgets import QApplication, QWidget
+    from PySide6.QtCore import QPoint, QPointF, QEvent, Qt, QSettings, QTimer
+    from PySide6.QtGui import QColor, QImage, QMouseEvent
     import icons
-    from main_window import MainWindow
+    from main_window import MainWindow, AboutDialog
     from sign_dialog import save_signature, list_signatures, qimage_to_png_bytes, DrawingCanvas
 
     app = QApplication([])
+
+    # GUI 测试使用独立的 INI 设置目录，不能改动用户真实的主题和工具栏顺序。
+    settings_dir = tempfile.mkdtemp(prefix="do-editor-settings-")
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat,
+                      QSettings.Scope.UserScope, settings_dir)
 
     for name in icons.ICONS:
         assert not icons.get(name).isNull(), name
@@ -87,12 +93,82 @@ def main():
     assert view.doc is not None
     assert view.page_view.page_count() == 5
     assert view.thumb_list.count() == 5
-    assert view.bookmark_tree.topLevelItemCount() == 2   # 两个一级书签
+    assert not hasattr(view, "bookmark_tree")   # 书签模块已移除
+    assert win.act["edit_color"] in win.tb2.actions()
+    assert not win.act["edit_color"].icon().isNull()
+
+    # 拖动排序后按钮不能残留按下态，也不能丢失图标+文字样式。
+    win.show()
+    app.processEvents()
+    toolbar_actions = [a for a in win.tb1.actions() if a.property("do_key")]
+    drag_action = toolbar_actions[-1]
+    target_action = toolbar_actions[0]
+    drag_button = win.tb1.widgetForAction(drag_action)
+    target_button = win.tb1.widgetForAction(target_action)
+    drag_global = drag_button.mapToGlobal(drag_button.rect().center())
+    target_global = target_button.mapToGlobal(target_button.rect().center())
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(drag_button.rect().center()),
+        QPointF(drag_global), Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    move = QMouseEvent(
+        QEvent.Type.MouseMove, QPointF(drag_button.rect().center()),
+        QPointF(target_global), Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease, QPointF(drag_button.rect().center()),
+        QPointF(target_global), Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
+    win.tb1.eventFilter(drag_button, press)
+    drag_button.setDown(True)
+    win.tb1.eventFilter(drag_button, move)
+    win.tb1.eventFilter(drag_button, release)
+    app.processEvents()
+    moved_button = win.tb1.widgetForAction(drag_action)
+    assert win.tb1.actions().index(drag_action) < win.tb1.actions().index(target_action)
+    assert not moved_button.isDown()
+    assert moved_button.toolButtonStyle() == win.tb1.toolButtonStyle()
+    assert moved_button.iconSize() == win.tb1.iconSize()
+    assert moved_button.font() == win.tb1.font()
+    assert moved_button.style().metaObject().className() == \
+        app.style().metaObject().className()
+    print("[OK] 工具栏拖动排序外观")
+
+    # 菜单使用稳定的直角系统弹窗；多级菜单应正常显示并继承同一主题。
+    win._m_view.popup(QPoint(40, 40))
+    app.processEvents()
+    theme_rect = win._m_view.actionGeometry(win._m_theme.menuAction())
+    win._m_theme.popup(win._m_view.mapToGlobal(theme_rect.topRight()))
+    app.processEvents()
+    assert win._m_view.isVisible()
+    assert win._m_theme.isVisible()
+    assert len(win._m_theme.actions()) == 3
+    assert not win._m_view.testAttribute(
+        Qt.WidgetAttribute.WA_TranslucentBackground)
+    assert not win._m_theme.testAttribute(
+        Qt.WidgetAttribute.WA_TranslucentBackground)
+    win._m_theme.hide()
+    win._m_view.hide()
+    print("[OK] 直角下拉菜单 + 多级菜单")
+
+    # “关于”窗口使用应用自绘标题栏，不依赖不同步的 Windows 原生标题栏。
+    closed_about = []
+    QTimer.singleShot(30, lambda: [
+        (closed_about.append(widget), widget.accept())
+        for widget in app.topLevelWidgets()
+        if isinstance(widget, AboutDialog)])
+    win.about()
+    assert closed_about
+    about_dialog = closed_about[0]
+    assert about_dialog.windowFlags() & Qt.WindowType.FramelessWindowHint
+    assert about_dialog.findChild(QWidget, "aboutTitleBar") is not None
+    print("[OK] 关于窗口标题栏同步")
+
     view.set_mode("highlight")
     view.set_mode("text_select")
     view.set_mode("replace_text")
     view.set_mode("view")
-    print("[OK] 主窗口 + 连续滚动 + 书签 + 模式")
+    print("[OK] 主窗口 + 连续滚动 + 模式")
 
     img = QImage(40, 20, QImage.Format.Format_ARGB32)
     img.fill(QColor(200, 0, 0))
@@ -128,11 +204,30 @@ def main():
     assert view._inline_box is not None
     view._close_inline_editor()
     assert view._inline_box is None
+    # 文本工具保持激活时，双击刚确认的文本仍应重新进入编辑。
+    view._add_text_object("双击修改", 0, _QPF(100, 100), keep_mode=True)
+    text_obj = view.objects[-1]
+    view.set_mode("text")
+    text_pos = _QPF(
+        (text_obj["rect"].center().x()) * pv._zoom,
+        pv._offsets[0] + text_obj["rect"].center().y() * pv._zoom)
+    double_click = QMouseEvent(
+        QEvent.Type.MouseButtonDblClick, text_pos,
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier)
+    pv.mouseDoubleClickEvent(double_click)
+    assert view._inline_oid == text_obj["id"]
+    assert view._inline_edit.text() == "双击修改"
+    view._close_inline_editor()
     print("[OK] 文本选择 + 字体 + inline 编辑器")
 
     win.set_theme("dark")
     assert win.theme_mode == "dark"
+    if app.platformName() == "windows":
+        assert app.styleHints().colorScheme() == Qt.ColorScheme.Dark
     win.set_theme("light")
+    if app.platformName() == "windows":
+        assert app.styleHints().colorScheme() == Qt.ColorScheme.Light
     win.set_theme("system")
     canvas = DrawingCanvas()
     canvas.set_pen_width(8)

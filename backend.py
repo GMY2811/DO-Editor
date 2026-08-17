@@ -247,21 +247,48 @@ def _has_cjk(text):
     return any('\u4e00' <= c <= '\u9fff' for c in text)
 
 
-def insert_text_auto(page, rect, text, fontsize=12, color=(0, 0, 0)):
-    """插入文字，自动处理中英文字体（避免中文变成问号/消失）。"""
+def _css_font_family(family):
+    """系统字体名 → CSS font-family 类别（serif/sans-serif/monospace）。
+
+    PyMuPDF 的 Story 引擎只内置了衬线/无衬线/等宽三类字体（中文字形统一用
+    内置 CJK 字体），因此把系统字体归并到这三类即可得到可见的字体差异。
+    """
+    low = (family or "").lower()
+    if any(k in low for k in ("mono", "courier", "consolas", "console", "等宽")):
+        return "monospace"
+    if any(k in low for k in ("times", "roman", "serif", "宋体", "simsun",
+                              "楷", "仿宋", "fangsong", "kaiti", "song",
+                              "songti", "georgia", "garamond")):
+        return "serif"
+    return "sans-serif"
+
+
+def insert_text_auto(page, rect, text, fontsize=12, color=(0, 0, 0), fontfamily="",
+                     bold=False, italic=False):
+    """插入文字，自动处理中英文字体。fontfamily 为系统字体名，映射为衬线/无衬线/等宽。"""
     import html as _html
     safe = _html.escape(text).replace("\n", "<br>")
     r, g, b = [int(round(c * 255)) for c in color]
-    css = (f"* {{ font-family: sans-serif; font-size: {fontsize}px; "
-           f"color: rgb({r},{g},{b}); }}")
+    fam = _css_font_family(fontfamily)
+    weight = "bold" if bold else "normal"
+    style = "italic" if italic else "normal"
+    css = (f"* {{ font-family: {fam}; font-size: {fontsize}px; "
+           f"color: rgb({r},{g},{b}); font-weight: {weight}; font-style: {style}; }}")
     page.insert_htmlbox(rect, safe, css=css)
 
 
-def replace_text(page, rect, new_text, fontsize=12, color=(0, 0, 0)):
-    """覆盖式修改文字：删除原区域内容后写入新文字。返回新文本。"""
+def redact_rect(page, rect):
+    """删除指定矩形区域内的原有内容（用于修改文字前清除原文）。"""
     page.add_redact_annot(rect)
     page.apply_redactions()
-    insert_text_auto(page, rect, new_text, fontsize=fontsize, color=color)
+
+
+def replace_text(page, rect, new_text, fontsize=12, color=(0, 0, 0), fontfamily="",
+                 bold=False, italic=False):
+    """覆盖式修改文字：删除原区域内容后写入新文字。返回新文本。"""
+    redact_rect(page, rect)
+    insert_text_auto(page, rect, new_text, fontsize=fontsize, color=color,
+                     fontfamily=fontfamily, bold=bold, italic=italic)
     return new_text
 
 

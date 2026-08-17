@@ -271,6 +271,27 @@ def icon_edit():
     return _build(d)
 
 
+def icon_sidebar():
+    def d(p, s):
+        p.drawRoundedRect(QRectF(3, 4, 18, 16), 2, 2)
+        _line(p, 9, 4, 9, 20)
+        _line(p, 5.5, 8, 7, 8)
+        _line(p, 5.5, 11, 7, 11)
+    return _build(d)
+
+
+def icon_color():
+    """调色板图标，用于编辑工具颜色选择。"""
+    def d(p, s):
+        p.drawEllipse(QRectF(3, 4, 18, 16))
+        p.drawEllipse(QRectF(7, 7, 1.8, 1.8))
+        p.drawEllipse(QRectF(11, 6, 1.8, 1.8))
+        p.drawEllipse(QRectF(15, 8, 1.8, 1.8))
+        p.drawEllipse(QRectF(8, 12, 1.8, 1.8))
+        p.drawArc(QRectF(12, 12, 7, 6), 20 * 16, 190 * 16)
+    return _build(d)
+
+
 ICONS = {
     "open": icon_open,
     "save": icon_save,
@@ -279,6 +300,7 @@ ICONS = {
     "zoom_in": icon_zoom_in,
     "zoom_out": icon_zoom_out,
     "fit_width": icon_fit_width,
+    "sidebar": icon_sidebar,
     "select": icon_select,
     "highlight": icon_highlight,
     "underline": icon_underline,
@@ -298,6 +320,7 @@ ICONS = {
     "split": icon_split,
     "search": icon_search,
     "print": icon_print,
+    "color": icon_color,
 }
 
 

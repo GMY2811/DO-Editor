@@ -1,6 +1,6 @@
 ; DO编辑器 安装脚本 (Inno Setup 6)
 #define MyAppName "DO编辑器"
-#define MyAppVersion "2.2.3"
+#define MyAppVersion "2.5.4"
 #define MyAppPublisher "RAY"
 #define MyAppExeName "DO编辑器.exe"
 

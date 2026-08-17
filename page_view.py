@@ -1,13 +1,13 @@
 """连续滚动页面画布：多页垂直连续渲染 + 浮动对象 + 标注交互 + 右键菜单。"""
 from PySide6.QtCore import Qt, QRectF, QPointF, QPoint, Signal
 from PySide6.QtGui import QImage, QPainter, QPen, QColor, QBrush, QFont
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QWidget, QToolTip
 
 import backend
 
 _ACCENT = QColor(37, 99, 235)
 _PLACEHOLDER = QColor(255, 0, 255)   # 文本定位框高对比色（洋红）
-_GAP = 12   # 页间距（逻辑像素）
+_GAP = 18   # 页间距（逻辑像素）
 
 
 class PageView(QWidget):
@@ -52,8 +52,8 @@ class PageView(QWidget):
         self._selecting = False
 
         # 搜索高亮
-        self._search_page = None
-        self._search_rects = []
+        self._search_all = {}        # page -> [rects]
+        self._search_current = None  # (page, rect) 当前定位
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -145,6 +145,14 @@ class PageView(QWidget):
         pno = max(0, min(len(self._offsets) - 1, pno))
         return int(self._offsets[pno])
 
+    def scroll_to_rect(self, pno, rect):
+        """返回让指定 rect 显示在可视区中央的滚动值。"""
+        if not self._offsets:
+            return 0
+        pno = max(0, min(len(self._offsets) - 1, pno))
+        target_y = self._offsets[pno] + (rect.y0 + rect.y1) / 2 * self._zoom
+        return int(target_y - self._viewport_h / 2)
+
     # ---------------- 坐标 ----------------
     def _page_at(self, y):
         for i in range(len(self._offsets) - 1, -1, -1):
@@ -194,8 +202,14 @@ class PageView(QWidget):
         return None
 
     @staticmethod
-    def _corners(wr):
-        return [wr.topLeft(), wr.topRight(), wr.bottomRight(), wr.bottomLeft()]
+    def _handles(wr):
+        """返回 8 个缩放手柄：0-3 四角（等比），4-5 上下边（垂直），6-7 左右边（水平）。"""
+        tl = wr.topLeft(); tr = wr.topRight()
+        br = wr.bottomRight(); bl = wr.bottomLeft()
+        cx = wr.center().x(); cy = wr.center().y()
+        return [tl, tr, br, bl,
+                QPointF(cx, wr.top()), QPointF(cx, wr.bottom()),
+                QPointF(wr.left(), cy), QPointF(wr.right(), cy)]
 
     def _handle_at(self, pos):
         if self._selected is None:
@@ -203,10 +217,9 @@ class PageView(QWidget):
         obj = self._find(self._selected)
         if obj is None:
             return None
-        corners = self._corners(self._widget_rect(obj["page"], obj["rect"]))
-        for i, c in enumerate(corners):
+        for i, c in enumerate(self._handles(self._widget_rect(obj["page"], obj["rect"]))):
             d = pos - c
-            if abs(d.x()) + abs(d.y()) <= 8:
+            if abs(d.x()) + abs(d.y()) <= 9:
                 return i
         return None
 
@@ -236,14 +249,21 @@ class PageView(QWidget):
                                 (x1 - x0) * self._zoom, (y1 - y0) * self._zoom)
                     p.fillRect(wr, QColor(37, 99, 235, 90))
 
-            # 搜索高亮（黄色）
-            if self._search_rects and self._search_page is not None:
-                for r in self._search_rects:
+            # 搜索高亮：所有匹配黄色，当前定位深橙
+            for pno, rects in self._search_all.items():
+                for r in rects:
                     wr = QRectF(r.x0 * self._zoom,
-                                self._offsets[self._search_page] + r.y0 * self._zoom,
+                                self._offsets[pno] + r.y0 * self._zoom,
                                 (r.x1 - r.x0) * self._zoom,
                                 (r.y1 - r.y0) * self._zoom)
-                    p.fillRect(wr, QColor(255, 200, 0, 130))
+                    p.fillRect(wr, QColor(255, 200, 0, 110))
+            if self._search_current is not None:
+                pno, r = self._search_current
+                wr = QRectF(r.x0 * self._zoom,
+                            self._offsets[pno] + r.y0 * self._zoom,
+                            (r.x1 - r.x0) * self._zoom,
+                            (r.y1 - r.y0) * self._zoom)
+                p.fillRect(wr, QColor(255, 140, 0, 210))
 
             for obj in self._objects:
                 wr = self._widget_rect(obj["page"], obj["rect"])
@@ -254,6 +274,8 @@ class PageView(QWidget):
                     family = obj.get("fontfamily") or "Microsoft YaHei UI"
                     f = QFont(family)
                     f.setPixelSize(max(10, int(obj.get("fontsize", 11) * self._zoom)))
+                    f.setBold(bool(obj.get("bold", False)))
+                    f.setItalic(bool(obj.get("italic", False)))
                     p.setFont(f)
                     p.setPen(obj.get("color") or QColor(0, 0, 0))
                     p.drawText(wr, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
@@ -269,7 +291,7 @@ class PageView(QWidget):
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     p.drawRect(wr)
                     hs = 7.0
-                    for c in self._corners(wr):
+                    for c in self._handles(wr):
                         p.setPen(QPen(_ACCENT, 1.2))
                         p.setBrush(QBrush(QColor(255, 255, 255)))
                         p.drawRect(QRectF(c.x() - hs / 2, c.y() - hs / 2, hs, hs))
@@ -317,6 +339,22 @@ class PageView(QWidget):
                     self._sel_page = self._page_at(pos.y())
             self.update()
         else:
+            # point 模式（文本）：点手柄缩放、点对象拖动、点空白继续添加
+            if self._mode == "point":
+                h = self._handle_at(pos)
+                if h is not None:
+                    obj = self._find(self._selected)
+                    if obj is not None:
+                        self._drag = ("resize", h, pos, QRectF(obj["rect"]), obj["page"])
+                        self.update()
+                        return
+                obj = self._object_at(pos)
+                if obj is not None:
+                    self._selected = obj["id"]
+                    self.objectSelected.emit(obj["id"])
+                    self._drag = ("move", None, pos, QRectF(obj["rect"]), obj["page"])
+                    self.update()
+                    return
             self._drawing = True
             self._start = pos
             self._cur = pos
@@ -334,17 +372,43 @@ class PageView(QWidget):
                                              delta.y() / self._zoom)
                 self._apply_rect(self._selected, wr)
             elif kind == "resize":
-                corners = self._corners(self._widget_rect(page, orig))
-                opp = corners[(h + 2) % 4]
-                o_corner = corners[h]
-                s = self._dist(pos, opp) / max(1e-6, self._dist(o_corner, opp))
-                s = max(0.05, min(50.0, s))
-                new_w = orig.width() * s
-                new_h = orig.height() * s
                 off = self._offsets[page]
-                x = opp.x() / self._zoom - (new_w if h in (0, 3) else 0.0)
-                y = (opp.y() - off) / self._zoom - (new_h if h in (0, 1) else 0.0)
-                self._apply_rect(self._selected, QRectF(x, y, new_w, new_h))
+                if h <= 3:
+                    # 四角：等比缩放
+                    corners = self._handles(self._widget_rect(page, orig))
+                    opp = corners[(h + 2) % 4]
+                    o_corner = corners[h]
+                    s = self._dist(pos, opp) / max(1e-6, self._dist(o_corner, opp))
+                    s = max(0.05, min(50.0, s))
+                    new_w = orig.width() * s
+                    new_h = orig.height() * s
+                    x = opp.x() / self._zoom - (new_w if h in (0, 3) else 0.0)
+                    y = (opp.y() - off) / self._zoom - (new_h if h in (0, 1) else 0.0)
+                    self._apply_rect(self._selected, QRectF(x, y, new_w, new_h))
+                elif h in (4, 5):
+                    # 上下边中点：垂直缩放（宽度不变）
+                    py = (pos.y() - off) / self._zoom
+                    if h == 4:  # 上边：底边固定
+                        bottom = orig.y() + orig.height()
+                        new_h = max(6.0, bottom - py)
+                        self._apply_rect(self._selected,
+                                         QRectF(orig.x(), py, orig.width(), new_h))
+                    else:  # 下边：顶边固定
+                        new_h = max(6.0, py - orig.y())
+                        self._apply_rect(self._selected,
+                                         QRectF(orig.x(), orig.y(), orig.width(), new_h))
+                else:
+                    # 左右边中点：水平缩放（高度不变）
+                    px = pos.x() / self._zoom
+                    if h == 6:  # 左边：右边固定
+                        right = orig.x() + orig.width()
+                        new_w = max(6.0, right - px)
+                        self._apply_rect(self._selected,
+                                         QRectF(px, orig.y(), new_w, orig.height()))
+                    else:  # 右边：左边固定
+                        new_w = max(6.0, px - orig.x())
+                        self._apply_rect(self._selected,
+                                         QRectF(orig.x(), orig.y(), new_w, orig.height()))
             self.update()
         elif self._selecting:
             self._sel_cur = pos
@@ -400,13 +464,17 @@ class PageView(QWidget):
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
             return
-        if self._mode != "view":
+        # 新建文本确认后会继续停留在 point（文本）模式；此时双击已有
+        # 文本也应进入编辑，而不是被模式判断直接忽略。
+        if self._mode not in ("view", "point"):
             return
         obj = self._object_at(e.position())
         if obj is not None and obj.get("kind") == "text":
             self._selected = obj["id"]
             self._drag = None
+            self._drawing = False
             self._selecting = False
+            self._ink = []
             self.update()
             self.objectDoubleClicked.emit(obj["id"])
         else:
@@ -447,14 +515,20 @@ class PageView(QWidget):
         self._selecting = False
         self.update()
 
-    def set_search_highlights(self, page, rects):
-        self._search_page = page
-        self._search_rects = rects or []
+    def set_search_all(self, all_dict):
+        """设置所有匹配 {page: [rects]}，全部黄色高亮。"""
+        self._search_all = all_dict or {}
+        self._search_current = None
+        self.update()
+
+    def set_search_current(self, page, rect):
+        """设置当前定位的匹配（深橙色高亮）。"""
+        self._search_current = (page, rect)
         self.update()
 
     def clear_search_highlights(self):
-        self._search_page = None
-        self._search_rects = []
+        self._search_all = {}
+        self._search_current = None
         self.update()
 
     def _apply_rect(self, oid, rect):
@@ -479,14 +553,30 @@ class PageView(QWidget):
         return self._mode
 
     def _update_cursor(self, pos):
-        if self._mode != "view":
+        if self._mode not in ("view", "point"):
             return
-        if self._handle_at(pos) is not None:
-            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-        elif self._object_at(pos) is not None:
+        h = self._handle_at(pos)
+        if h is not None:
+            tips = {0: "等比缩放", 1: "等比缩放", 2: "等比缩放", 3: "等比缩放",
+                    4: "上下缩放", 5: "上下缩放", 6: "左右缩放", 7: "左右缩放"}
+            if h in (0, 2):            # 左上↔右下角
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif h in (1, 3):          # 右上↔左下角
+                self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            elif h in (4, 5):          # 上下边中点：垂直缩放
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+            else:                      # 6, 7 左右边中点：水平缩放
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            QToolTip.showText(self.mapToGlobal(pos.toPoint()), tips[h], self)
+        elif self._mode == "view" and self._object_at(pos) is not None:
             self.setCursor(Qt.CursorShape.SizeAllCursor)
+            QToolTip.showText(self.mapToGlobal(pos.toPoint()), "拖动移动", self)
         else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            if self._mode == "view":
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            else:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            QToolTip.hideText()
 
     @staticmethod
     def _dist(a, b):

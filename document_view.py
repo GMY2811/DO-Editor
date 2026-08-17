@@ -1,14 +1,15 @@
-"""单个文档的视图：连续滚动页面 + 侧边栏（缩略图/书签）+ 编辑逻辑。"""
+"""单个文档的视图：连续滚动页面 + 缩略图侧栏 + 编辑逻辑。"""
 import os
 import pymupdf
 from PySide6.QtCore import Qt, QSize, QRectF, QPointF, Signal, QEvent
 from PySide6.QtGui import (QImage, QPixmap, QIcon, QColor, QPainter, QShortcut,
                            QKeySequence)
-from PySide6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QSplitter,
+from PySide6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout, QSplitter,
                                QScrollArea, QListWidget, QListWidgetItem,
-                               QTreeWidget, QTreeWidgetItem, QTabWidget,
+                               QTabWidget, QStackedWidget, QFrame, QPushButton,
                                QLabel, QLineEdit, QFileDialog, QMessageBox,
-                               QInputDialog, QApplication, QMenu, QColorDialog)
+                               QInputDialog, QApplication, QMenu, QColorDialog,
+                               QGraphicsDropShadowEffect)
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog
 
 import backend
@@ -33,19 +34,25 @@ MODE_VIEW = {k: v for k, _l, v, _i in MODE_DEFS}
 
 
 class ReplaceTextDialog(QDialog):
-    """修改文字对话框：文字 + 字号 + 颜色。"""
+    """修改文字对话框：文字 + 字体 + 字号 + 颜色。"""
 
-    def __init__(self, parent=None, old_text="", default_size=10):
+    def __init__(self, parent=None, old_text="", default_size=10, default_family="",
+                 default_color=None, default_bold=False, default_italic=False):
         super().__init__(parent)
         self.setWindowTitle(i18n.tr("replace_text"))
         from PySide6.QtWidgets import (QTextEdit, QSpinBox, QPushButton,
-                                      QHBoxLayout)
+                                      QHBoxLayout, QFontComboBox, QCheckBox)
+        from PySide6.QtGui import QFont
         self._fontsize = default_size
-        self._color = QColor(0, 0, 0)
+        self._color = QColor(default_color) if default_color is not None else QColor(0, 0, 0)
 
         self._edit = QTextEdit()
         self._edit.setPlainText(old_text)
-        self._edit.setFixedHeight(90)
+        self._edit.setFixedHeight(56)
+
+        self._font_combo = QFontComboBox()
+        if default_family:
+            self._font_combo.setCurrentFont(QFont(default_family))
 
         self._size_spin = QSpinBox()
         self._size_spin.setRange(6, 72)
@@ -56,24 +63,45 @@ class ReplaceTextDialog(QDialog):
         self._color_btn.clicked.connect(self._pick_color)
         self._style_color_btn()
 
+        self._bold_check = QCheckBox(i18n.tr("bold"))
+        self._bold_check.setChecked(default_bold)
+
+        self._italic_check = QCheckBox(i18n.tr("italic"))
+        self._italic_check.setChecked(default_italic)
+
         btn_ok = QPushButton(i18n.tr("confirm"))
         btn_cancel = QPushButton(i18n.tr("cancel"))
         btn_ok.clicked.connect(self.accept)
         btn_cancel.clicked.connect(self.reject)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel(i18n.tr("font_size")))
-        row.addWidget(self._size_spin)
-        row.addWidget(self._color_btn)
-        row.addStretch(1)
-        row.addWidget(btn_ok)
-        row.addWidget(btn_cancel)
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
+        row1.addWidget(QLabel(i18n.tr("font_family")))
+        row1.addWidget(self._font_combo)
+        row1.addWidget(QLabel(i18n.tr("font_size")))
+        row1.addWidget(self._size_spin)
+        row1.addWidget(self._color_btn)
+        row1.addWidget(self._bold_check)
+        row1.addWidget(self._italic_check)
+        row1.addStretch(1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        row2.addStretch(1)
+        row2.addWidget(btn_ok)
+        row2.addWidget(btn_cancel)
 
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel(i18n.tr("new_text")))
-        lay.addWidget(self._edit)
-        lay.addLayout(row)
-        self.resize(480, 220)
+        lay.setContentsMargins(12, 12, 12, 8)
+        lay.setSpacing(6)
+        row_text = QHBoxLayout()
+        row_text.setSpacing(6)
+        row_text.addWidget(QLabel(i18n.tr("new_text")))
+        row_text.addWidget(self._edit, 1)
+        lay.addLayout(row_text)
+        lay.addLayout(row1)
+        lay.addLayout(row2)
+        self.resize(560, 160)
 
     def _pick_color(self):
         c = QColorDialog.getColor(self._color, self, i18n.tr("color"))
@@ -88,7 +116,10 @@ class ReplaceTextDialog(QDialog):
 
     def result(self):
         return (self._edit.toPlainText(), self._size_spin.value(),
-                (self._color.redF(), self._color.greenF(), self._color.blueF()))
+                (self._color.redF(), self._color.greenF(), self._color.blueF()),
+                self._font_combo.currentFont().family(),
+                self._bold_check.isChecked(),
+                self._italic_check.isChecked())
 
 
 class AddWatermarkDialog(QDialog):
@@ -176,6 +207,7 @@ class DocumentView(QWidget):
     statusMessage = Signal(str, int)
     titleChanged = Signal(str)
     pageChanged = Signal(int, int)
+    openRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -191,12 +223,15 @@ class DocumentView(QWidget):
         self.pending_sign_qimg = None
         self.pending_paste_text = None
         self.mode_actions = {}
+        self._search_results = []
+        self._search_index = 0
         self._build_ui()
 
     # ================= UI =================
     def _build_ui(self):
         self.side_tabs = QTabWidget()
-        self.side_tabs.setFixedWidth(180)
+        self.side_tabs.setObjectName("sidePanel")
+        self.side_tabs.setFixedWidth(196)
         self.side_tabs.setVisible(False)
 
         self.thumb_list = QListWidget()
@@ -207,12 +242,8 @@ class DocumentView(QWidget):
         self.thumb_list.setMovement(QListWidget.Movement.Static)
         self.thumb_list.itemClicked.connect(self._on_thumb_clicked)
 
-        self.bookmark_tree = QTreeWidget()
-        self.bookmark_tree.setHeaderHidden(True)
-        self.bookmark_tree.itemClicked.connect(self._on_bookmark_clicked)
-
         self.side_tabs.addTab(self.thumb_list, "页面")
-        self.side_tabs.addTab(self.bookmark_tree, "书签")
+        self.side_tabs.setTabBarAutoHide(True)
 
         self.page_view = PageView()
         self.scroll = QScrollArea()
@@ -221,9 +252,78 @@ class DocumentView(QWidget):
         self.scroll.setWidgetResizable(False)
         self.scroll.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
+        # 无文档时显示欢迎页，避免主区域只剩一块空灰色画布。
+        start_page = QWidget()
+        start_page.setObjectName("startPage")
+        start_outer = QVBoxLayout(start_page)
+        start_outer.setContentsMargins(32, 32, 32, 32)
+        start_outer.addStretch(1)
+
+        start_card = QFrame()
+        start_card.setObjectName("startCard")
+        start_card.setMaximumWidth(520)
+        card_shadow = QGraphicsDropShadowEffect(start_card)
+        card_shadow.setBlurRadius(36)
+        card_shadow.setOffset(0, 10)
+        card_shadow.setColor(QColor(24, 31, 45, 34))
+        start_card.setGraphicsEffect(card_shadow)
+        card_lay = QVBoxLayout(start_card)
+        card_lay.setContentsMargins(54, 46, 54, 44)
+        card_lay.setSpacing(12)
+
+        mark_row = QHBoxLayout()
+        mark_row.addStretch(1)
+        mark = QLabel("DO")
+        mark.setObjectName("startMark")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(62, 62)
+        mark_row.addWidget(mark)
+        mark_row.addStretch(1)
+        card_lay.addLayout(mark_row)
+
+        title = QLabel("DO编辑器")
+        title.setObjectName("startTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_lay.addWidget(title)
+
+        subtitle = QLabel("轻量、专注的 PDF 阅读与编辑工具")
+        subtitle.setObjectName("startSubtitle")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_lay.addWidget(subtitle)
+        card_lay.addSpacing(8)
+
+        open_row = QHBoxLayout()
+        open_row.addStretch(1)
+        open_btn = QPushButton("打开文档")
+        open_btn.setObjectName("startOpenButton")
+        open_btn.setDefault(True)
+        open_btn.clicked.connect(self.openRequested.emit)
+        open_row.addWidget(open_btn)
+        open_row.addStretch(1)
+        card_lay.addLayout(open_row)
+
+        hint = QLabel("支持 PDF、DOCX、DOC  ·  Ctrl+O 快速打开")
+        hint.setObjectName("startHint")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_lay.addWidget(hint)
+
+        card_row = QHBoxLayout()
+        card_row.addStretch(1)
+        card_row.addWidget(start_card)
+        card_row.addStretch(1)
+        start_outer.addLayout(card_row)
+        start_outer.addStretch(1)
+
+        self.workspace_stack = QStackedWidget()
+        self.workspace_stack.addWidget(start_page)
+        self.workspace_stack.addWidget(self.scroll)
+        self.workspace_stack.setCurrentWidget(start_page)
+
         splitter = QSplitter()
+        splitter.setObjectName("documentSplitter")
+        splitter.setHandleWidth(1)
         splitter.addWidget(self.side_tabs)
-        splitter.addWidget(self.scroll)
+        splitter.addWidget(self.workspace_stack)
         splitter.setStretchFactor(1, 1)
 
         lay = QVBoxLayout(self)
@@ -256,9 +356,9 @@ class DocumentView(QWidget):
         self.objects = []
         self._obj_counter = 0
         self.titleChanged.emit(os.path.basename(path))
+        self.workspace_stack.setCurrentWidget(self.scroll)
         self._refresh()
         self._rebuild_thumbnails()
-        self._rebuild_bookmarks()
         self.fit_width()
         self.set_mode("view")
         return True
@@ -277,7 +377,7 @@ class DocumentView(QWidget):
         self.titleChanged.emit("未命名")
         self.page_view.set_document(None, 1.0, 1.0)
         self.thumb_list.clear()
-        self.bookmark_tree.clear()
+        self.workspace_stack.setCurrentIndex(0)
         self.pageChanged.emit(0, 0)
 
     def save(self):
@@ -310,7 +410,6 @@ class DocumentView(QWidget):
             self.file_path = path
             self.modified = False
             self.titleChanged.emit(os.path.basename(path))
-            self._rebuild_bookmarks()
             self._refresh()
             self.statusMessage.emit("已保存", 2000)
         except Exception as e:
@@ -324,14 +423,12 @@ class DocumentView(QWidget):
             if obj.get("kind") == "text":
                 c = obj.get("color")
                 rgb = (c.redF(), c.greenF(), c.blueF()) if c else (0, 0, 0)
-                try:
-                    backend.insert_text_auto(
-                        page, fr, obj.get("text", ""),
-                        fontsize=obj.get("fontsize", 12), color=rgb)
-                except Exception:
-                    backend.insert_text_auto(
-                        page, fr, obj.get("text", ""),
-                        fontsize=obj.get("fontsize", 12), color=(0, 0, 0))
+                backend.insert_text_auto(
+                    page, fr, obj.get("text", ""),
+                    fontsize=obj.get("fontsize", 12), color=rgb,
+                    fontfamily=obj.get("fontfamily", ""),
+                    bold=bool(obj.get("bold", False)),
+                    italic=bool(obj.get("italic", False)))
             else:
                 page.insert_image(fr, stream=obj["png"])
         self.objects = []
@@ -424,53 +521,59 @@ class DocumentView(QWidget):
             item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
             self.thumb_list.addItem(item)
 
-    def _rebuild_bookmarks(self):
-        self.bookmark_tree.clear()
-        if self.doc is None:
-            return
-        toc = self.doc.get_toc()
-        stack = []
-        for level, title, page in toc:
-            node = QTreeWidgetItem([title])
-            node.setData(0, Qt.ItemDataRole.UserRole, page - 1)
-            if stack:
-                while stack and stack[-1][0] >= level:
-                    stack.pop()
-                if stack:
-                    stack[-1][1].addChild(node)
-                else:
-                    self.bookmark_tree.addTopLevelItem(node)
-            else:
-                self.bookmark_tree.addTopLevelItem(node)
-            stack.append((level, node))
-
     def _on_thumb_clicked(self, item):
         pno = item.data(Qt.ItemDataRole.UserRole)
         if pno is not None:
             self.show_page(int(pno))
 
-    def _on_bookmark_clicked(self, item, col):
-        pno = item.data(0, Qt.ItemDataRole.UserRole)
-        if pno is not None:
-            self.show_page(int(pno))
-
     # ================= 搜索 / 复制 =================
     def search(self, text):
+        """搜索全文，收集所有匹配并全部高亮，定位到第一个结果。"""
+        self._search_text = text
+        self._search_results = []
         if not text or self.doc is None:
+            self.page_view.clear_search_highlights()
             return
         total = len(self.doc)
         start = self.page_view.current_page()
+        all_map = {}
         for off in range(total):
             pno = (start + off) % total
             rects = self.doc[pno].search_for(text)
             if rects:
-                self.show_page(pno)
-                self.page_view.set_search_highlights(pno, rects)
-                self.statusMessage.emit(
-                    f"找到“{text}”：第 {pno + 1} 页，共 {len(rects)} 处", 3000)
-                return
-        self.page_view.clear_search_highlights()
-        self.statusMessage.emit(f"未找到“{text}”", 3000)
+                all_map[pno] = rects
+                for r in rects:
+                    self._search_results.append((pno, r))
+        if not self._search_results:
+            self.page_view.clear_search_highlights()
+            self.statusMessage.emit(f"未找到“{text}”", 3000)
+            return
+        # 全部匹配黄色高亮
+        self.page_view.set_search_all(all_map)
+        self._search_index = 0
+        self._goto_search(0)
+
+    def _goto_search(self, idx):
+        n = len(self._search_results)
+        if n == 0:
+            return
+        idx = idx % n
+        self._search_index = idx
+        pno, rect = self._search_results[idx]
+        # 定位到具体匹配位置（显示在可视区中央），而非仅页面顶部
+        self.scroll.verticalScrollBar().setValue(
+            self.page_view.scroll_to_rect(pno, rect))
+        self.page_view.set_search_current(pno, rect)
+        self.statusMessage.emit(
+            f"共 {n} 处匹配，第 {idx + 1} 处（第 {pno + 1} 页）", 0)
+
+    def search_next(self):
+        if self._search_results:
+            self._goto_search(self._search_index + 1)
+
+    def search_prev(self):
+        if self._search_results:
+            self._goto_search(self._search_index - 1)
 
     def copy_page_text(self):
         if self.doc is None:
@@ -517,14 +620,40 @@ class DocumentView(QWidget):
             return
         if self.current_mode == "replace_text":
             old = backend.extract_text(self.doc, page, r)
-            dlg = ReplaceTextDialog(self, old_text=old, default_size=10)
+            fmt = {"family": "", "size": 10, "color": QColor(0, 0, 0),
+                   "bold": False, "italic": False}
+            try:
+                c = QPointF((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+                fmt = self._detect_format_at(page, c)
+            except Exception:
+                pass
+            dlg = ReplaceTextDialog(self, old_text=old,
+                                    default_size=int(round(fmt["size"])),
+                                    default_family=fmt["family"],
+                                    default_color=fmt["color"],
+                                    default_bold=fmt["bold"],
+                                    default_italic=fmt["italic"])
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                text, fontsize, color = dlg.result()
+                text, fontsize, color, fontfamily, bold, italic = dlg.result()
                 if text.strip():
-                    backend.replace_text(self.doc[page], r, text,
-                                         fontsize=fontsize, color=color)
+                    # 删除原文字
+                    backend.redact_rect(self.doc[page], r)
+                    # 创建可拖动的浮动文本对象（保存时烘焙进 PDF）
+                    self._obj_counter += 1
+                    fr = QRectF(r.x0, r.y0, max(40.0, r.x1 - r.x0),
+                                max(20.0, r.y1 - r.y0))
+                    self.objects.append({
+                        "id": self._obj_counter, "page": page,
+                        "rect": fr,
+                        "text": text,
+                        "color": QColor.fromRgbF(*color),
+                        "fontsize": fontsize, "fontfamily": fontfamily,
+                        "bold": bold, "italic": italic, "kind": "text",
+                    })
                     self.modified = True
+                    self.set_mode("view")
                     self._refresh()
+                    self.page_view.select(self._obj_counter)
             return
         p = self.doc[page]
         color = self._edit_rgb()
@@ -573,34 +702,61 @@ class DocumentView(QWidget):
             self.pending_paste_text = None
         self._refresh()
 
-    def _detect_font_at(self, page, pt):
-        """检测点击位置附近文字的字体，映射为系统字体名（用于文本默认字体）。"""
+    def _detect_format_at(self, page, pt):
+        """检测点击位置文字格式（字体/字号/颜色/粗细）。
+
+        优先取同行左侧文字；同行左侧无字则取上一行最后一段。
+        返回 {"family", "size", "color", "bold", "italic"}。
+        """
+        fmt = {"family": "", "size": 10, "color": QColor(0, 0, 0),
+               "bold": False, "italic": False}
         try:
             p = self.doc[page]
-            clip = pymupdf.Rect(pt.x() - 4, pt.y() - 4, pt.x() + 4, pt.y() + 4)
-            d = p.get_text("dict", clip=clip)
-            for block in d.get("blocks", []):
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        mapped = self._map_pdf_font(span.get("font", ""))
-                        if mapped:
-                            return mapped
-            # 回退：取整页出现最多的字体
-            counts = {}
+            lines = []
             for block in p.get_text("dict").get("blocks", []):
+                if block.get("type") != 0:
+                    continue
                 for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        f = span.get("font", "")
-                        if f:
-                            counts[f] = counts.get(f, 0) + 1
-            if counts:
-                best = max(counts, key=counts.get)
-                mapped = self._map_pdf_font(best)
-                if mapped:
-                    return mapped
+                    spans = line.get("spans", [])
+                    if spans:
+                        lines.append(spans)
+            if not lines:
+                return fmt
+
+            # 找 pt 所在行（按 y 范围）
+            target_idx = None
+            for i, spans in enumerate(lines):
+                y0 = min(s["bbox"][1] for s in spans)
+                y1 = max(s["bbox"][3] for s in spans)
+                if y0 - 3 <= pt.y() <= y1 + 3:
+                    target_idx = i
+                    break
+            if target_idx is None:
+                target_idx = min(
+                    range(len(lines)),
+                    key=lambda i: abs(min(s["bbox"][1] for s in lines[i]) - pt.y()))
+            target = lines[target_idx]
+
+            # 同行左侧文字
+            left = [s for s in target if s["bbox"][2] <= pt.x() + 2]
+            if left:
+                span = left[-1]
+            elif target_idx > 0:
+                span = lines[target_idx - 1][-1]   # 上一行最后一段
+            else:
+                span = target[0]
+
+            fam = self._map_pdf_font(span.get("font", ""))
+            if fam:
+                fmt["family"] = fam
+            fmt["size"] = round(span.get("size", 10), 1)
+            c = span.get("color", 0) & 0xFFFFFF
+            fmt["color"] = QColor((c >> 16) & 255, (c >> 8) & 255, c & 255)
+            fmt["bold"] = bool(span.get("flags", 0) & 16)
+            fmt["italic"] = bool(span.get("flags", 0) & 2)
         except Exception:
             pass
-        return ""
+        return fmt
 
     @staticmethod
     def _map_pdf_font(pdf_font):
@@ -627,7 +783,7 @@ class DocumentView(QWidget):
     def _start_inline_text(self, page, pt, oid=None):
         """在页面位置显示 inline 文字输入框（字体/字号/颜色），oid 非空则为编辑模式。"""
         from PySide6.QtWidgets import (QTextEdit, QFontComboBox, QSpinBox,
-                                      QPushButton, QHBoxLayout)
+                                      QPushButton, QHBoxLayout, QCheckBox)
         from PySide6.QtGui import QFont
         self._close_inline_editor()
 
@@ -642,17 +798,27 @@ class DocumentView(QWidget):
             init_family = existing.get("fontfamily", "")
             init_size = existing.get("fontsize", 10)
             cur_color = existing.get("color") or QColor(self.edit_color)
+            init_bold = existing.get("bold", False)
+            init_italic = existing.get("italic", False)
         else:
             wx = int(pt.x() * self.page_view._zoom)
             wy = int(self.page_view._offsets[page] + pt.y() * self.page_view._zoom)
             init_text = ""
-            init_family = self._detect_font_at(page, pt)
-            init_size = 10
-            cur_color = QColor(0, 0, 0)
+            fmt = self._detect_format_at(page, pt)
+            init_family = fmt["family"]
+            init_size = int(round(fmt["size"]))
+            cur_color = fmt["color"]
+            init_bold = fmt["bold"]
+            init_italic = fmt["italic"]
 
         box = QWidget(self.page_view)
+        box.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        box.setObjectName("inlineTextBar")
+        box.setStyleSheet(
+            "#inlineTextBar { background: #eceff3; border: 1px solid #c8cdd4;"
+            " border-radius: 6px; }")
         lay = QHBoxLayout(box)
-        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(4)
         edit = QLineEdit(init_text)
         edit.setMinimumWidth(180)
@@ -672,15 +838,23 @@ class DocumentView(QWidget):
         btn_color.clicked.connect(lambda: self._pick_text_color(color_state, btn_color))
         self._style_color_btn(btn_color, color_state["color"])
 
+        bold_check = QCheckBox(i18n.tr("bold"))
+        bold_check.setChecked(init_bold)
+
+        italic_check = QCheckBox(i18n.tr("italic"))
+        italic_check.setChecked(init_italic)
+
         btn_ok = QPushButton("确定")
         btn_cancel = QPushButton("取消")
         lay.addWidget(edit, 1)
         lay.addWidget(font_combo)
         lay.addWidget(size_spin)
         lay.addWidget(btn_color)
+        lay.addWidget(bold_check)
+        lay.addWidget(italic_check)
         lay.addWidget(btn_ok)
         lay.addWidget(btn_cancel)
-        box.setFixedWidth(640)
+        box.setFixedWidth(760)
         box.adjustSize()
         box_w = box.width()
         box_h = box.height()
@@ -699,6 +873,8 @@ class DocumentView(QWidget):
             family = font_combo.currentFont().family()
             size = size_spin.value()
             color = color_state["color"]
+            bold = bold_check.isChecked()
+            italic = italic_check.isChecked()
             self._close_inline_editor()
             if not text.strip():
                 if existing is not None:
@@ -709,11 +885,14 @@ class DocumentView(QWidget):
                 existing["fontfamily"] = family
                 existing["fontsize"] = size
                 existing["color"] = color
+                existing["bold"] = bold
+                existing["italic"] = italic
                 self.modified = True
                 self._refresh_objects()
                 self.page_view.select(oid)
             else:
-                self._add_text_object(text, page, pt, family, size, color)
+                self._add_text_object(text, page, pt, family, size, color, bold,
+                                      italic, keep_mode=True)
 
         btn_ok.clicked.connect(on_ok)
         btn_cancel.clicked.connect(self._close_inline_editor)
@@ -753,18 +932,36 @@ class DocumentView(QWidget):
         self._refresh_objects()
         self.page_view.select(self._obj_counter)
 
-    def _add_text_object(self, text, page, pt, fontfamily="", fontsize=12, color=None):
+    def _add_text_object(self, text, page, pt, fontfamily="", fontsize=12, color=None,
+                         bold=False, italic=False, keep_mode=False):
+        rect = self._measure_text_rect(text, fontfamily, fontsize, bold, italic)
+        rect.moveTo(pt.x(), pt.y())
         self._obj_counter += 1
         self.objects.append({
             "id": self._obj_counter, "page": page,
-            "rect": QRectF(pt.x(), pt.y(), 240, 60),
+            "rect": rect,
             "text": text, "color": color if color is not None else QColor(0, 0, 0),
-            "fontsize": fontsize, "fontfamily": fontfamily, "kind": "text",
+            "fontsize": fontsize, "fontfamily": fontfamily, "bold": bold,
+            "italic": italic, "kind": "text",
         })
         self.modified = True
-        self.set_mode("view")
+        if not keep_mode:
+            self.set_mode("view")
         self._refresh_objects()
         self.page_view.select(self._obj_counter)
+
+    @staticmethod
+    def _measure_text_rect(text, fontfamily, fontsize, bold, italic=False):
+        """根据文字内容测量单行框大小（返回 PDF 坐标 QRectF）。"""
+        from PySide6.QtGui import QFont, QFontMetrics
+        f = QFont(fontfamily if fontfamily else "Microsoft YaHei UI")
+        f.setPixelSize(max(10, int(fontsize)))
+        f.setBold(bold)
+        f.setItalic(italic)
+        fm = QFontMetrics(f)
+        w = fm.horizontalAdvance(text) + 12
+        h = fm.height() + 6
+        return QRectF(0, 0, max(30.0, float(w)), max(16.0, float(h)))
 
     def _find_object(self, oid):
         for o in self.objects:
@@ -948,7 +1145,6 @@ class DocumentView(QWidget):
         self.modified = True
         self._refresh()
         self._rebuild_thumbnails()
-        self._rebuild_bookmarks()
 
     # ================= 打印 =================
     def print_pdf(self):
