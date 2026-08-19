@@ -1,51 +1,184 @@
 """PDF 核心逻辑（纯 PyMuPDF，无界面依赖，便于独立测试）。"""
+import hashlib
 import os
+import queue
+import tempfile
 import threading
 import pymupdf
 
 
-def open_pdf(path):
-    return pymupdf.open(path)
+class PdfPasswordRequired(Exception):
+    """PDF 已加密且需要打开密码。"""
 
 
-_word_app = None
-_word_lock = threading.Lock()
+class PdfPasswordInvalid(Exception):
+    """提供的 PDF 密码不正确。"""
+
+
+def _has_encrypt_dictionary(doc):
+    try:
+        return doc.xref_get_key(-1, "Encrypt")[0] != "null"
+    except Exception:
+        return bool(doc.needs_pass)
+
+
+def open_pdf(path, password=None):
+    """打开 PDF；加密文件会验证密码并记录认证级别。"""
+    doc = pymupdf.open(path)
+    # 需要密码时不能在 authenticate() 之前读取 Encrypt 字典；MuPDF
+    # 会因此提前解析加密对象，随后重写文档可能产生损坏的 AES 数据流。
+    requires_password = bool(doc.needs_pass)
+    encrypted = True if requires_password else _has_encrypt_dictionary(doc)
+    auth_level = 0
+    if requires_password and password is None:
+        doc.close()
+        raise PdfPasswordRequired(path)
+    if encrypted and password is not None:
+        auth_level = int(doc.authenticate(password))
+        # PyMuPDF 1.28 在 authenticate() 成功后再次读取 needs_pass 会
+        # 破坏后续 AES 流解码，因此只使用认证前缓存的布尔值。
+        if requires_password and not auth_level:
+            doc.close()
+            raise PdfPasswordInvalid(path)
+    doc._do_was_encrypted = encrypted
+    doc._do_auth_level = auth_level
+    doc._do_open_password = password
+    return doc
+
+
+def pdf_permissions(allow_print=True, allow_copy=True, allow_modify=True,
+                    allow_annotate=True):
+    """生成 PyMuPDF 权限位；始终保留辅助功能读取权限。"""
+    value = pymupdf.PDF_PERM_ACCESSIBILITY
+    if allow_print:
+        value |= pymupdf.PDF_PERM_PRINT | pymupdf.PDF_PERM_PRINT_HQ
+    if allow_copy:
+        value |= pymupdf.PDF_PERM_COPY
+    if allow_modify:
+        value |= (pymupdf.PDF_PERM_MODIFY | pymupdf.PDF_PERM_ASSEMBLE |
+                  pymupdf.PDF_PERM_FORM)
+    if allow_annotate:
+        value |= pymupdf.PDF_PERM_ANNOTATE
+    return value
+
+
+_word_thread = None
+_word_queue = None
+_word_thread_lock = threading.Lock()
+
+
+def _word_cache_path(src_path):
+    """按路径、大小和修改时间生成转换缓存；源文件变化后自动失效。"""
+    absolute = os.path.abspath(src_path)
+    stat = os.stat(absolute)
+    fingerprint = f"{os.path.normcase(absolute)}\0{stat.st_size}\0{stat.st_mtime_ns}"
+    key = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+    cache_dir = os.path.join(tempfile.gettempdir(), "do_editor_word_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"{key}.pdf")
+
+
+def _word_conversion_loop(requests):
+    """在固定 COM 线程中转换 Word；每次转换结束后立即退出 Word。"""
+    import pythoncom
+    import win32com.client
+
+    pythoncom.CoInitialize()
+    try:
+        while True:
+            request = requests.get()
+            if request is None:
+                break
+            src_path, out_path, done, result = request
+            doc = None
+            word = None
+            try:
+                # 仅在用户实际打开 Word 文档时创建独立的隐藏实例，避免
+                # 软件空闲时长期驻留 WINWORD.EXE 后台进程。
+                word = win32com.client.DispatchEx("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = 0
+                try:
+                    word.ScreenUpdating = False
+                    word.AutomationSecurity = 3  # 禁用文档宏
+                except Exception:
+                    pass
+                doc = word.Documents.Open(
+                    os.path.abspath(src_path), ConfirmConversions=False,
+                    ReadOnly=True, AddToRecentFiles=False, Visible=False,
+                    OpenAndRepair=False, NoEncodingDialog=True)
+                # ExportAsFixedFormat 比 SaveAs 更直接，不触发格式转换提示。
+                doc.ExportAsFixedFormat(
+                    OutputFileName=out_path, ExportFormat=17,
+                    OpenAfterExport=False, OptimizeFor=0)
+                result["path"] = out_path
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                if doc is not None:
+                    try:
+                        doc.Close(False)
+                    except Exception:
+                        pass
+                if word is not None:
+                    try:
+                        word.Quit()
+                    except Exception:
+                        pass
+                if done is not None:
+                    done.set()
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def _ensure_word_thread():
+    global _word_thread, _word_queue
+    with _word_thread_lock:
+        if _word_thread is None or not _word_thread.is_alive():
+            _word_queue = queue.Queue()
+            _word_thread = threading.Thread(
+                target=_word_conversion_loop, args=(_word_queue,),
+                name="DOEditorWordConverter", daemon=True)
+            _word_thread.start()
+        return _word_queue
 
 
 def word_to_pdf(src_path):
     """用本机 Microsoft Word 把 .docx/.doc 转为 PDF，返回临时 PDF 路径。
 
-    复用 Word 实例以加快连续转换；需要本机安装 Word；失败抛异常。
+    仅在转换期间启动隐藏 Word 实例，完成后立即退出；需要本机安装
+    Word；失败抛异常。
     """
-    import tempfile
-    import win32com.client
-    global _word_app
-    with _word_lock:
-        if _word_app is None:
-            _word_app = win32com.client.Dispatch("Word.Application")
-            try:
-                _word_app.Visible = False
-            except Exception:
-                pass
-        out_dir = tempfile.mkdtemp(prefix="do_word_")
-        out_path = os.path.join(out_dir, "converted.pdf")
-        doc = _word_app.Documents.Open(src_path, ReadOnly=True)
-        try:
-            doc.SaveAs(out_path, FileFormat=17)  # 17 = wdFormatPDF
-        finally:
-            doc.Close(False)
+    out_path = _word_cache_path(src_path)
+    if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
         return out_path
+
+    done = threading.Event()
+    result = {}
+    _ensure_word_thread().put((src_path, out_path, done, result))
+    done.wait()
+    if "error" in result:
+        # 不保留 Word 可能写到一半的无效缓存。
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except OSError:
+            pass
+        raise result["error"]
+    return result["path"]
 
 
 def cleanup_word():
     """程序退出时释放复用的 Word 实例。"""
-    global _word_app
-    if _word_app is not None:
-        try:
-            _word_app.Quit()
-        except Exception:
-            pass
-        _word_app = None
+    global _word_thread, _word_queue
+    with _word_thread_lock:
+        thread = _word_thread
+        requests = _word_queue
+        _word_thread = None
+        _word_queue = None
+    if thread is not None and thread.is_alive():
+        requests.put(None)
+        thread.join(timeout=5)
 
 
 def page_count(doc):
@@ -70,6 +203,90 @@ def extract_text(doc, pno, rect=None):
     if rect is not None:
         return page.get_text("text", clip=rect).strip()
     return page.get_text("text").strip()
+
+
+# ---------------- OCR ----------------
+
+def create_ocr_engine():
+    """创建离线 RapidOCR 引擎；延迟导入以免拖慢普通启动。"""
+    from rapidocr import RapidOCR
+    return RapidOCR()
+
+
+def recognize_page_ocr(engine, doc, pno, dpi=220, min_score=0.45):
+    """识别一页并返回 PDF 坐标系中的文字行。
+
+    返回值中的每一项为 ``text / score / rect``。OCR 在较高分辨率的
+    RGB 图像上运行，随后把检测框精确缩放回 72 dpi 的 PDF 页面坐标。
+    """
+    import numpy as np
+
+    page = doc[pno]
+    scale = max(1.0, float(dpi) / 72.0)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+    image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+        pix.height, pix.width, pix.n)
+    if pix.n > 3:
+        image = image[:, :, :3]
+    result = engine(image)
+    boxes = getattr(result, "boxes", None)
+    texts = getattr(result, "txts", None)
+    scores = getattr(result, "scores", None)
+    if boxes is None or texts is None:
+        return []
+
+    sx = page.rect.width / max(1, pix.width)
+    sy = page.rect.height / max(1, pix.height)
+    lines = []
+    for box, text, score in zip(boxes, texts, scores or (1.0,) * len(texts)):
+        text = str(text).strip()
+        score = float(score)
+        if not text or score < min_score:
+            continue
+        xs = [float(point[0]) * sx for point in box]
+        ys = [float(point[1]) * sy for point in box]
+        rect = pymupdf.Rect(min(xs), min(ys), max(xs), max(ys))
+        if rect.width < 1 or rect.height < 1:
+            continue
+        lines.append({
+            "text": text,
+            "score": score,
+            "rect": (rect.x0, rect.y0, rect.x1, rect.y1),
+        })
+    return lines
+
+
+def add_ocr_text_layer(doc, page_results):
+    """把 OCR 结果作为不可见文字层写入 PDF，返回写入的文字行数。"""
+    inserted = 0
+    for item in page_results:
+        pno = int(item["page"])
+        if pno < 0 or pno >= len(doc):
+            continue
+        page = doc[pno]
+        for line in item.get("lines", []):
+            text = str(line.get("text", "")).strip()
+            if not text:
+                continue
+            rect = pymupdf.Rect(line["rect"])
+            # 略微放宽检测框，避免倾斜或紧边界导致 insert_textbox 拒绝写入。
+            rect = pymupdf.Rect(rect.x0, rect.y0,
+                                min(page.rect.x1, rect.x1 + 2),
+                                min(page.rect.y1, rect.y1 + 2))
+            fontsize = max(4.0, min(48.0, rect.height * 0.78))
+            fontname = "china-s" if _has_cjk(text) else "helv"
+            remaining = page.insert_textbox(
+                rect, text, fontname=fontname, fontsize=fontsize,
+                render_mode=3, overlay=True, lineheight=1.0)
+            # 长行偶尔比检测框略宽，逐级缩小直至成功。
+            while remaining < 0 and fontsize > 4.0:
+                fontsize *= 0.86
+                remaining = page.insert_textbox(
+                    rect, text, fontname=fontname, fontsize=fontsize,
+                    render_mode=3, overlay=True, lineheight=1.0)
+            if remaining >= 0:
+                inserted += 1
+    return inserted
 
 
 # ---------------- 水印 ----------------
@@ -184,7 +401,8 @@ def extract_pages(doc, pages, out_path):
 def add_highlight(page, rect, color=None):
     a = page.add_highlight_annot(rect)
     if color is not None:
-        _color(a, fill=color)
+        # PyMuPDF 的文本标记颜色属于 stroke；fill 会被 PDF 引擎忽略。
+        _color(a, stroke=color)
     return a
 
 
@@ -218,8 +436,11 @@ def add_line(page, p1, p2, color=None):
     return a
 
 
-def add_note(page, point, text):
-    return page.add_text_annot(point, text)
+def add_note(page, point, text, color=None):
+    annot = page.add_text_annot(point, text)
+    if color is not None:
+        _color(annot, stroke=color)
+    return annot
 
 
 def add_text_box(page, rect, text, color=None):

@@ -19,6 +19,9 @@ installer/
 *.docx
 *.doc
 *.png
+!app-icon.png
+!website/assets/app-dark.png
+!website/assets/app-light.png
 *.jpg
 *.jpeg
 
@@ -30,3 +33,7 @@ Thumbs.db
 
 # 其他
 *.log
+
+# 浏览器自动化临时目录
+.chrome-qa*/
+.edge-qa*/

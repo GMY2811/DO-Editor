@@ -35,7 +35,7 @@ python main.py
 - **Reading**: continuous scrolling, zoom, page navigation, thumbnail sidebar, multi-tab, clean fullscreen mode
 - **Editing**: highlight, underline, strikethrough, rectangle, line, freehand drawing, text (font/size/color), replace text, insert image
 - **Merge / Split**: merge multiple files, split by page range / every N pages, extract specific pages
-- **Signature**: handwritten signature, text signature, signature library (save/reuse)
+- **Signature**: signature design, text signature, signature library (save/reuse)
 - **Watermark**: text watermark (size/color/opacity/rotation/tiled)
 - **Copy / Search**: drag to select text and copy, Ctrl+C / Ctrl+V, search with highlighted results
 - **Open Word**: convert .docx/.doc to PDF via local Microsoft Word

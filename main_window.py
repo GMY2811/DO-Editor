@@ -3,14 +3,18 @@ import os
 import sys
 import json
 import ctypes
-from PySide6.QtCore import Qt, QSize, QSettings, QEvent, Signal, QTimer, QThread
+import pymupdf
+from PySide6.QtCore import (Qt, QSize, QSettings, QEvent, Signal, QTimer,
+                            QThread, QPointF)
 from PySide6.QtGui import (QAction, QKeySequence, QActionGroup, QGuiApplication,
-                           QColor, QFont, QIcon, QShortcut, QPainter)
+                           QColor, QFont, QIcon, QShortcut, QPainter, QPen)
 from PySide6.QtWidgets import (QMainWindow, QDialog, QTabWidget, QToolBar,
                                QLabel, QLineEdit, QFileDialog, QMessageBox,
                                QApplication, QToolButton, QInputDialog, QMenu,
                                QProxyStyle, QStyle, QWidget, QVBoxLayout,
-                               QHBoxLayout, QPushButton)
+                               QHBoxLayout, QPushButton, QFrame, QTabBar,
+                               QProgressDialog, QCheckBox, QFormLayout,
+                               QGroupBox, QStyleOptionToolButton)
 
 import backend
 import app_config as cfg
@@ -21,18 +25,95 @@ from document_view import DocumentView, MODE_DEFS
 
 
 class ToolbarProxyStyle(QProxyStyle):
-    """隐藏工具栏原生溢出入口，改用统一主题的自定义菜单。"""
+    """统一工具栏边距，并隐藏原生溢出入口。"""
 
     def pixelMetric(self, metric, option=None, widget=None):
         if metric == QStyle.PixelMetric.PM_ToolBarExtensionExtent:
             return 0
+        if metric in (QStyle.PixelMetric.PM_ToolBarItemMargin,
+                      QStyle.PixelMetric.PM_ToolBarFrameWidth):
+            return 0
         return super().pixelMetric(metric, option, widget)
+
+
+class RoundedMenuArrowStyle(QProxyStyle):
+    """使用圆头、圆角折线绘制二级菜单箭头。"""
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if (element == QStyle.PrimitiveElement.PE_IndicatorArrowRight and
+                isinstance(widget, QMenu)):
+            app = QApplication.instance()
+            dark = bool(app.property("do_dark_theme")) if app else False
+            enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+            selected = bool(option.state & QStyle.StateFlag.State_Selected)
+            if not enabled:
+                color = QColor("#77777d" if dark else "#a4a7ad")
+            elif selected:
+                color = QColor("#ffffff")
+            else:
+                color = QColor("#d5d8de" if dark else "#626872")
+
+            center = option.rect.center()
+            half_h = min(4.0, max(3.2, option.rect.height() * 0.22))
+            half_w = min(2.8, max(2.2, option.rect.width() * 0.18))
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(
+                color, 1.65, Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.drawLine(
+                QPointF(center.x() - half_w, center.y() - half_h),
+                QPointF(center.x() + half_w, center.y()))
+            painter.drawLine(
+                QPointF(center.x() + half_w, center.y()),
+                QPointF(center.x() - half_w, center.y() + half_h))
+            painter.restore()
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+
+class TabCloseButton(QToolButton):
+    """固定逻辑坐标绘制的标签关闭按钮，不受 QIcon/DPI 缓存影响。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._close_color = QColor("#1769aa")
+
+    def setCloseColor(self, color):
+        self._close_color = QColor(color)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        option = QStyleOptionToolButton()
+        self.initStyleOption(option)
+        # 先让当前主题绘制透明/悬停/按下背景，再绘制固定尺寸叉线。
+        self.style().drawComplexControl(
+            QStyle.ComplexControl.CC_ToolButton, option, painter, self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(
+            self._close_color, 1.25, Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        center = self.rect().center()
+        # 保持点击区域易用，但叉线本体只占 6x6 逻辑像素；在 150%/200%
+        # 缩放下也不会显得像工具栏图标一样大。
+        half = 3.0
+        painter.drawLine(
+            QPointF(center.x() - half, center.y() - half),
+            QPointF(center.x() + half, center.y() + half))
+        painter.drawLine(
+            QPointF(center.x() + half, center.y() - half),
+            QPointF(center.x() - half, center.y() + half))
 
 
 class SortableToolBar(QToolBar):
     """支持拖动按钮调整顺序的工具栏；按钮溢出时自动显示 >> 下拉框。"""
 
     orderChanged = Signal()
+    BUTTON_SIZE = QSize(80, 62)
+    # 收窄按钮以显示更多功能；图标与文字高度保持不变，较长的
+    # “删除当前页”等五字名称仍能在 80px 宽度内完整显示。
+    ICON_SIZE = QSize(32, 24)
 
     def __init__(self, title, parent=None):
         super().__init__(title, parent)
@@ -58,18 +139,28 @@ class SortableToolBar(QToolBar):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        # 覆盖部分 Windows/Qt 样式强制绘制的工具栏底边高光。
+        # 覆盖部分 Windows/Qt 样式强制绘制的工具栏边缘高光。
         dark = theme.is_dark(getattr(self.window(), "theme_mode", "system"))
         painter = QPainter(self)
-        color = QColor("#1d222b" if dark else "#f7f7f9")
+        color = QColor("#232529" if dark else "#f0f2f5")
         painter.fillRect(0, 0, self.width(), 2, color)
         painter.fillRect(0, max(0, self.height() - 2), self.width(), 2, color)
+        # 两个 QToolBar 并排时 Windows 样式会在交界处强制画出一条
+        # 明暗边线。将各自交界边缘恢复为工具栏底色；子按钮随后绘制，
+        # 因而悬停和选中背景仍可无缝延伸到边缘。
+        if self.objectName() == "fileToolBar":
+            painter.fillRect(max(0, self.width() - 2), 0, 2,
+                             self.height(), color)
+        elif self.objectName() == "editToolBar":
+            painter.fillRect(0, 0, 2, self.height(), color)
 
     def _install_button_filters(self):
         for btn in self.findChildren(QToolButton):
             if btn.objectName() == "qt_toolbar_ext_button":
                 btn.setFixedWidth(0)
                 btn.hide()
+                continue
+            if btn.objectName() == "toolbar_more_btn":
                 continue
             # 工具栏自身使用 ToolbarProxyStyle 隐藏原生溢出入口。Qt 在
             # QAction 重排时新建的按钮会错误继承该代理样式，导致背景、
@@ -83,6 +174,7 @@ class SortableToolBar(QToolBar):
             btn.setToolButtonStyle(self.toolButtonStyle())
             btn.setIconSize(self.iconSize())
             btn.setFont(self.font())
+            btn.setFixedSize(self.BUTTON_SIZE)
             btn.ensurePolished()
             btn.updateGeometry()
             try:
@@ -167,11 +259,13 @@ class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("aboutDialog")
-        self.setWindowTitle(f"关于 {cfg.APP_NAME}")
+        localized_app_name = i18n.tr("app_name", cfg.APP_NAME)
+        about_title = i18n.tr("about_title").format(app=localized_app_name)
+        self.setWindowTitle(about_title)
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setModal(True)
-        self.setFixedWidth(430)
+        self.setFixedWidth(460)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, 1, 1, 1)
@@ -179,9 +273,10 @@ class AboutDialog(QDialog):
 
         title_bar = DialogTitleBar(self)
         title_bar.setObjectName("aboutTitleBar")
-        title_bar.setFixedHeight(48)
+        title_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        title_bar.setFixedHeight(46)
         title_layout = QHBoxLayout(title_bar)
-        title_layout.setContentsMargins(12, 0, 8, 0)
+        title_layout.setContentsMargins(14, 0, 8, 0)
         title_layout.setSpacing(9)
 
         icon_label = QLabel(title_bar)
@@ -192,7 +287,7 @@ class AboutDialog(QDialog):
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         title_layout.addWidget(icon_label)
 
-        title_label = QLabel(f"关于 {cfg.APP_NAME}", title_bar)
+        title_label = QLabel(about_title, title_bar)
         title_label.setObjectName("aboutTitleText")
         title_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -201,37 +296,233 @@ class AboutDialog(QDialog):
         close_button = QToolButton(title_bar)
         close_button.setObjectName("aboutCloseButton")
         close_button.setText("×")
-        close_button.setToolTip("关闭")
+        close_button.setToolTip(i18n.tr("dialog_close"))
         close_button.setFixedSize(34, 32)
         close_button.clicked.connect(self.reject)
         title_layout.addWidget(close_button)
+        self._apply_header_theme(
+            title_bar, title_label, close_button,
+            theme.is_dark(getattr(parent, "theme_mode", "system")))
         outer.addWidget(title_bar)
 
         body = QWidget(self)
         body.setObjectName("aboutBody")
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(28, 22, 28, 20)
-        body_layout.setSpacing(18)
+        body_layout.setContentsMargins(32, 26, 32, 22)
+        body_layout.setSpacing(20)
 
-        info = QLabel(body)
-        info.setObjectName("aboutInfo")
-        info.setTextFormat(Qt.TextFormat.RichText)
-        info.setText(
-            f"<h3>{cfg.APP_NAME}</h3>"
-            f"<p>版本 {cfg.APP_VERSION}</p>"
-            f"<p>开发者：{cfg.DEVELOPER}<br>邮箱：{cfg.DEVELOPER_EMAIL}</p>"
-            f"<p>基于 PySide6 + PyMuPDF 构建</p>"
-            f"<p>{cfg.COPYRIGHT}</p>")
-        body_layout.addWidget(info)
+        hero = QWidget(body)
+        hero.setObjectName("aboutHero")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(0, 0, 0, 0)
+        hero_layout.setSpacing(18)
 
-        ok_button = QPushButton("OK", body)
+        app_icon = QLabel(hero)
+        app_icon.setObjectName("aboutAppIcon")
+        app_icon.setFixedSize(68, 68)
+        app_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        app_icon.setPixmap(self.windowIcon().pixmap(48, 48))
+        hero_layout.addWidget(app_icon)
+
+        identity = QVBoxLayout()
+        identity.setContentsMargins(0, 3, 0, 3)
+        identity.setSpacing(5)
+        app_name = QLabel(localized_app_name, hero)
+        app_name.setObjectName("aboutAppName")
+        version = QLabel(
+            i18n.tr("about_version").format(version=cfg.APP_VERSION), hero)
+        version.setObjectName("aboutVersion")
+        summary = QLabel(i18n.tr("about_summary"), hero)
+        summary.setObjectName("aboutSummary")
+        identity.addWidget(app_name)
+        identity.addWidget(version)
+        identity.addStretch(1)
+        identity.addWidget(summary)
+        hero_layout.addLayout(identity, 1)
+        body_layout.addWidget(hero)
+
+        divider = QFrame(body)
+        divider.setObjectName("aboutDivider")
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setFixedHeight(1)
+        body_layout.addWidget(divider)
+
+        details = QWidget(body)
+        details.setObjectName("aboutDetails")
+        details_layout = QVBoxLayout(details)
+        details_layout.setContentsMargins(18, 14, 18, 14)
+        details_layout.setSpacing(11)
+
+        def add_detail(label_text, value_text, selectable=False):
+            row = QWidget(details)
+            row.setObjectName("aboutDetailRow")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(16)
+            label = QLabel(label_text, row)
+            label.setObjectName("aboutMetaLabel")
+            label.setFixedWidth(72)
+            value = QLabel(value_text, row)
+            value.setObjectName("aboutMetaValue")
+            if selectable:
+                value.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse)
+            row_layout.addWidget(label)
+            row_layout.addWidget(value, 1)
+            details_layout.addWidget(row)
+
+        add_detail(i18n.tr("about_developer"), cfg.DEVELOPER)
+        add_detail(i18n.tr("about_email"), cfg.DEVELOPER_EMAIL, selectable=True)
+        add_detail(i18n.tr("about_framework"), "PySide6 · PyMuPDF")
+        body_layout.addWidget(details)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(12)
+        copyright_label = QLabel(cfg.COPYRIGHT, body)
+        copyright_label.setObjectName("aboutCopyright")
+        footer.addWidget(copyright_label)
+        footer.addStretch(1)
+
+        ok_button = QPushButton(i18n.tr("confirm"), body)
         ok_button.setObjectName("primaryButton")
         ok_button.setDefault(True)
-        ok_button.setFixedWidth(94)
+        ok_button.setFixedSize(92, 34)
         ok_button.clicked.connect(self.accept)
-        body_layout.addWidget(
-            ok_button, 0, Qt.AlignmentFlag.AlignRight)
+        footer.addWidget(ok_button)
+        body_layout.addLayout(footer)
         outer.addWidget(body)
+
+    @staticmethod
+    def _apply_header_theme(title_bar, title_label, close_button, dark):
+        """显式同步“关于”标题栏，避免继承到切换前的全局样式。"""
+        title_bar.setProperty("do_theme_dark", dark)
+        if dark:
+            title_bar.setStyleSheet(
+                "QWidget#aboutTitleBar { background: #242426; border: none; "
+                "border-bottom: 1px solid #3a3a3c; }"
+                "QLabel#aboutTitleText { color: #f5f5f7; font-size: 11pt; "
+                "font-weight: 600; }"
+                "QToolButton#aboutCloseButton { background: transparent; "
+                "border: none; color: #d1d1d6; font-family: 'Segoe UI'; "
+                "font-size: 20px; padding: 0; }"
+                "QToolButton#aboutCloseButton:hover { background: #e5484d; "
+                "color: #ffffff; }")
+        else:
+            title_bar.setStyleSheet(
+                "QWidget#aboutTitleBar { background: #f7f7f9; border: none; "
+                "border-bottom: 1px solid #d9dde3; }"
+                "QLabel#aboutTitleText { color: #1d1d1f; font-size: 11pt; "
+                "font-weight: 600; }"
+                "QToolButton#aboutCloseButton { background: transparent; "
+                "border: none; color: #3a3a3c; font-family: 'Segoe UI'; "
+                "font-size: 20px; padding: 0; }"
+                "QToolButton#aboutCloseButton:hover { background: #e5484d; "
+                "color: #ffffff; }")
+        title_label.ensurePolished()
+        close_button.ensurePolished()
+        title_bar.update()
+
+
+class PdfSecurityDialog(QDialog):
+    """设置 AES-256 密码与 PDF 使用权限。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置 PDF 密码")
+        self.setModal(True)
+        self.setMinimumWidth(470)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(16)
+
+        intro = QLabel(
+            "使用 AES-256 加密。打开密码用于查看文档；所有者密码用于管理权限。",
+            self)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(10)
+        self.user_password = QLineEdit(self)
+        self.user_password.setPlaceholderText("可留空：无需密码即可打开")
+        self.user_confirm = QLineEdit(self)
+        self.owner_password = QLineEdit(self)
+        self.owner_password.setPlaceholderText("必填，用于修改或移除保护")
+        self.owner_confirm = QLineEdit(self)
+        for edit in (self.user_password, self.user_confirm,
+                     self.owner_password, self.owner_confirm):
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            edit.setMaxLength(40)
+        form.addRow("打开密码：", self.user_password)
+        form.addRow("确认打开密码：", self.user_confirm)
+        form.addRow("所有者密码：", self.owner_password)
+        form.addRow("确认所有者密码：", self.owner_confirm)
+        layout.addLayout(form)
+
+        self.show_passwords = QCheckBox("显示密码", self)
+        self.show_passwords.toggled.connect(self._toggle_passwords)
+        layout.addWidget(self.show_passwords)
+
+        permissions = QGroupBox("允许的操作", self)
+        permission_layout = QVBoxLayout(permissions)
+        self.allow_print = QCheckBox("打印", permissions)
+        self.allow_copy = QCheckBox("复制文字和图片", permissions)
+        self.allow_modify = QCheckBox("编辑文档与页面", permissions)
+        self.allow_annotate = QCheckBox("添加批注和签名", permissions)
+        for checkbox in (self.allow_print, self.allow_copy,
+                         self.allow_modify, self.allow_annotate):
+            checkbox.setChecked(True)
+            permission_layout.addWidget(checkbox)
+        layout.addWidget(permissions)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("取消", self)
+        confirm = QPushButton("应用", self)
+        confirm.setObjectName("primaryButton")
+        confirm.setDefault(True)
+        cancel.clicked.connect(self.reject)
+        confirm.clicked.connect(self._validate_and_accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(confirm)
+        layout.addLayout(buttons)
+
+    def _toggle_passwords(self, shown):
+        mode = (QLineEdit.EchoMode.Normal if shown else
+                QLineEdit.EchoMode.Password)
+        for edit in (self.user_password, self.user_confirm,
+                     self.owner_password, self.owner_confirm):
+            edit.setEchoMode(mode)
+
+    def _validate_and_accept(self):
+        user_pw = self.user_password.text()
+        owner_pw = self.owner_password.text()
+        if user_pw != self.user_confirm.text():
+            QMessageBox.warning(self, "密码不一致", "两次输入的打开密码不一致。")
+            self.user_confirm.setFocus()
+            return
+        if not owner_pw:
+            QMessageBox.warning(self, "缺少密码", "必须设置所有者密码。")
+            self.owner_password.setFocus()
+            return
+        if owner_pw != self.owner_confirm.text():
+            QMessageBox.warning(self, "密码不一致", "两次输入的所有者密码不一致。")
+            self.owner_confirm.setFocus()
+            return
+        if user_pw and user_pw == owner_pw:
+            QMessageBox.warning(
+                self, "密码重复", "打开密码和所有者密码应设置为不同内容。")
+            self.owner_password.setFocus()
+            return
+        self.accept()
+
+    def values(self):
+        permissions = backend.pdf_permissions(
+            self.allow_print.isChecked(), self.allow_copy.isChecked(),
+            self.allow_modify.isChecked(), self.allow_annotate.isChecked())
+        return self.user_password.text(), self.owner_password.text(), permissions
 
 
 class WordConvertWorker(QThread):
@@ -252,6 +543,45 @@ class WordConvertWorker(QThread):
             self.failed.emit(str(e))
 
 
+class OcrWorker(QThread):
+    """在独立 PDF 快照上运行 OCR，避免阻塞或跨线程访问界面文档。"""
+
+    progress = Signal(int, int)
+    completed = Signal(object)
+    failed = Signal(str)
+    canceled = Signal()
+
+    def __init__(self, pdf_bytes, pages, parent=None):
+        super().__init__(parent)
+        self.pdf_bytes = pdf_bytes
+        self.pages = list(pages)
+
+    def run(self):
+        doc = None
+        try:
+            import pymupdf
+            doc = pymupdf.open(stream=self.pdf_bytes, filetype="pdf")
+            engine = backend.create_ocr_engine()
+            results = []
+            total = len(self.pages)
+            for index, pno in enumerate(self.pages, 1):
+                if self.isInterruptionRequested():
+                    self.canceled.emit()
+                    return
+                lines = backend.recognize_page_ocr(engine, doc, pno)
+                results.append({"page": pno, "lines": lines})
+                self.progress.emit(index, total)
+            if self.isInterruptionRequested():
+                self.canceled.emit()
+            else:
+                self.completed.emit(results)
+        except Exception as e:
+            self.failed.emit(str(e))
+        finally:
+            if doc is not None:
+                doc.close()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -264,9 +594,18 @@ class MainWindow(QMainWindow):
 
         self.settings = QSettings(cfg.ORG_NAME, cfg.APP_NAME)
         self.theme_mode = self.settings.value("theme", cfg.DEFAULT_THEME, type=str)
+        self.sidebar_default_visible = self.settings.value(
+            "sidebar_default_visible", True, type=bool)
         i18n.set_lang(self.settings.value("language", "zh"))
+        self.setWindowTitle(i18n.tr("app_name", cfg.APP_NAME))
         self._icon_color = icons.icon_color_for_dark(theme.is_dark(self.theme_mode))
         self._word_workers = []
+        self._ocr_worker = None
+        self._ocr_progress = None
+        self._ocr_target_view = None
+        self._menu_arrow_style = RoundedMenuArrowStyle()
+        # 监听整个应用内新出现的弹窗，统一同步 Windows 标题栏主题。
+        QApplication.instance().installEventFilter(self)
 
         self._build_tabs()
         self._build_actions()
@@ -286,14 +625,14 @@ class MainWindow(QMainWindow):
 
         QGuiApplication.styleHints().colorSchemeChanged.connect(
             self._on_system_theme_changed)
-
     # ================= 标签页 =================
     def _build_tabs(self):
         self.tabs = QTabWidget()
-        self.tabs.setTabsClosable(True)
+        # 禁用 Qt 自动关闭按钮，完全由应用管理。原生按钮会在标题更新时
+        # 被 Windows 样式重建，并与自定义按钮叠加成左右两个小叉。
+        self.tabs.setTabsClosable(False)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
-        self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self.tabs)
 
@@ -306,37 +645,180 @@ class MainWindow(QMainWindow):
         view.statusMessage.connect(self._on_status)
         view.titleChanged.connect(lambda t, v=view: self._update_tab_title(v, t))
         view.pageChanged.connect(self._on_page_changed)
-        idx = self.tabs.addTab(view, "未命名")
+        view.securityChanged.connect(
+            lambda v=view: self._sync_security_actions(v)
+            if v is self.current_view() else None)
+        view.ocrRequested.connect(
+            lambda pno, v=view: self.ocr_page(v, pno))
+        idx = self.tabs.addTab(view, i18n.tr("untitled"))
+        view.set_sidebar_visible(self.sidebar_default_visible)
+        self._style_tab_close_button(idx)
+        # Qt 在加入第一个自定义标签按钮时可能重新继承系统字体。
+        self._apply_ui_fonts()
         self.tabs.setCurrentIndex(idx)
         self._sync_mode_buttons(view)
+        self._sync_security_actions(view)
         return view
+
+    def _style_tab_close_button(self, index):
+        """用主题一致的细线图标替换 Qt 默认标签关闭按钮。"""
+        tab_bar = self.tabs.tabBar()
+        left_pos = QTabBar.ButtonPosition.LeftSide
+        right_pos = QTabBar.ButtonPosition.RightSide
+
+        # 左侧永远不允许出现关闭按钮；清理旧版本留下的自定义按钮以及
+        # Windows 样式可能生成的原生小叉。
+        left_button = tab_bar.tabButton(index, left_pos)
+        if left_button is not None:
+            tab_bar.setTabButton(index, left_pos, None)
+            left_button.deleteLater()
+
+        existing = tab_bar.tabButton(index, right_pos)
+        if isinstance(existing, TabCloseButton) and \
+                existing.objectName() == "tabCloseButton":
+            button = existing
+        else:
+            if existing is not None:
+                tab_bar.setTabButton(index, right_pos, None)
+                existing.deleteLater()
+            view = self.tabs.widget(index)
+            button = TabCloseButton(tab_bar)
+            button.clicked.connect(
+                lambda checked=False, v=view: self._close_tab_for_view(v))
+            tab_bar.setTabButton(index, right_pos, button)
+        button.setObjectName("tabCloseButton")
+        # 自定义 QToolButton 上使用居中的矢量细线叉；既避开 Windows
+        # 原生红色方形底板，也不会受字体字形和基线差异影响。
+        dark = theme.is_dark(getattr(self, "theme_mode", "system"))
+        close_color = "#72b4ff" if dark else "#1769aa"
+        button.setText("")
+        button.setIcon(QIcon())
+        button.setCloseColor(close_color)
+        button.setFixedSize(16, 16)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip("关闭标签页")
+
+    def _close_tab_for_view(self, view):
+        """关闭自定义标签按钮所属的页面，兼容标签拖动后的索引变化。"""
+        index = self.tabs.indexOf(view)
+        if index >= 0:
+            self._close_tab(index)
 
     def _update_tab_title(self, view, title):
         idx = self.tabs.indexOf(view)
         if idx >= 0:
             self.tabs.setTabText(idx, title)
+            # Windows 样式在标签文字由“未命名”变为文件名时，可能重新
+            # 创建一个原生小型关闭按钮，而且重建可能发生在缩略图与页面
+            # 布局完成之后。覆盖多个布局阶段重装自定义按钮，不能再依赖
+            # 用户切换主题来触发恢复。
+            self._schedule_tab_close_restyle(view)
             if view is self.current_view():
-                self.setWindowTitle(f"{cfg.APP_NAME} — {title}")
+                self.setWindowTitle(
+                    f"{i18n.tr('app_name', cfg.APP_NAME)} — {title}")
+
+    def _schedule_tab_close_restyle(self, view):
+        self._restyle_tab_close_for_view(view)
+        for delay in (0, 40, 120, 280, 600):
+            QTimer.singleShot(
+                delay, lambda v=view: self._restyle_tab_close_for_view(v))
+
+    def _restyle_tab_close_for_view(self, view):
+        # 标签可能在延迟重绘计时器触发前已被关闭并销毁。
+        try:
+            idx = self.tabs.indexOf(view)
+        except RuntimeError:
+            return
+        if idx >= 0:
+            self._style_tab_close_button(idx)
 
     def _on_tab_changed(self, idx):
         view = self.tabs.widget(idx)
         if view:
             self._sync_mode_buttons(view)
+            self._sync_security_actions(view)
+            self._schedule_tab_close_restyle(view)
             if view.file_path:
-                self.setWindowTitle(f"{cfg.APP_NAME} — {os.path.basename(view.file_path)}")
+                self.setWindowTitle(
+                    f"{i18n.tr('app_name', cfg.APP_NAME)} — "
+                    f"{os.path.basename(view.file_path)}")
             else:
-                self.setWindowTitle(cfg.APP_NAME)
+                self.setWindowTitle(i18n.tr("app_name", cfg.APP_NAME))
+        else:
+            self._sync_security_actions(None)
 
     def _sync_mode_buttons(self, view):
         for k, act in self.mode_actions.items():
             act.setChecked(k == view.current_mode)
+
+    def _sync_security_actions(self, view):
+        """根据 PDF 权限同步菜单、工具栏和快捷入口。"""
+        has_doc = bool(view and view.doc is not None)
+
+        def allowed(permission):
+            return has_doc and view.permission_allowed(permission)
+
+        can_print = allowed(pymupdf.PDF_PERM_PRINT)
+        can_copy = allowed(pymupdf.PDF_PERM_COPY)
+        can_modify = allowed(pymupdf.PDF_PERM_MODIFY)
+        can_annotate = allowed(pymupdf.PDF_PERM_ANNOTATE)
+        can_assemble = allowed(pymupdf.PDF_PERM_ASSEMBLE)
+
+        self.act["print"].setEnabled(can_print)
+        self.act["copy_all"].setEnabled(can_copy)
+        for key in ("image", "watermark", "delete_page"):
+            self.act[key].setEnabled(can_modify)
+        for key in ("sign", "sign_lib", "annotation"):
+            self.act[key].setEnabled(can_annotate)
+        self.act["edit_color"].setEnabled(can_modify or can_annotate)
+        for key in ("split_every", "split_ranges", "extract"):
+            self.act[key].setEnabled(can_assemble)
+        for key in ("ocr_current", "ocr_all", "ocr_toolbar"):
+            self.act[key].setEnabled(can_modify and can_copy)
+        for key in ("security_set", "security_remove", "security_status"):
+            self.act[key].setEnabled(has_doc)
+
+        mode_permissions = {
+            "text_select": can_copy,
+            "replace_text": can_modify,
+            "text": can_modify,
+            "highlight": can_annotate,
+            "underline": can_annotate,
+            "strikeout": can_annotate,
+            "rect": can_annotate,
+            "line": can_annotate,
+            "ink": can_annotate,
+        }
+        self.mode_actions["view"].setEnabled(has_doc)
+        for key, enabled in mode_permissions.items():
+            self.mode_actions[key].setEnabled(enabled)
+        if has_doc and view.current_mode in mode_permissions and \
+                not mode_permissions[view.current_mode]:
+            view.set_mode("view")
+            self._sync_mode_buttons(view)
+
+        if has_doc and view._source_encrypted:
+            if view._auth_level & 4:
+                self.statusBar().showMessage(
+                    "已用所有者密码打开：拥有完整管理权限", 5000)
+            else:
+                blocked = []
+                for label, enabled in (("打印", can_print), ("复制", can_copy),
+                                       ("编辑", can_modify),
+                                       ("批注", can_annotate)):
+                    if not enabled:
+                        blocked.append(label)
+                if blocked:
+                    self.statusBar().showMessage(
+                        "受保护 PDF：已禁止" + "、".join(blocked), 5000)
 
     def _on_status(self, msg, timeout):
         self.statusBar().showMessage(msg, timeout)
 
     def _on_page_changed(self, pno, total):
         if total > 0:
-            self.page_label.setText(f"第 {pno + 1} / {total} 页")
+            self.page_label.setText(
+                i18n.tr("page_status").format(p=pno + 1, t=total))
         else:
             self.page_label.setText("")
 
@@ -352,7 +834,7 @@ class MainWindow(QMainWindow):
                 return
         if self.tabs.count() <= 1:
             view.close_doc()
-            self._update_tab_title(view, "未命名")
+            self._update_tab_title(view, i18n.tr("untitled"))
             self._on_page_changed(0, 0)
         else:
             self.tabs.removeTab(idx)
@@ -390,6 +872,9 @@ class MainWindow(QMainWindow):
         mk("fit_width", "fit_width", "适合宽度",
            triggered=lambda: self.current_view().fit_width())
         mk("sidebar", "sidebar", "侧边栏", triggered=self._toggle_sidebar)
+        mk("sidebar_default", None, "启动时显示侧边栏", checkable=True,
+           toggled=self._set_sidebar_default)
+        a["sidebar_default"].setChecked(self.sidebar_default_visible)
 
         mk("delete_page", "trash", "删除当前页",
            triggered=lambda: self.current_view().delete_current_page())
@@ -398,12 +883,24 @@ class MainWindow(QMainWindow):
         mk("split_ranges", None, "按页码范围拆分", triggered=self.split_by_ranges)
         mk("extract", None, "提取指定页", triggered=self.extract_pages)
         mk("watermark", "watermark", "添加水印", triggered=self.add_watermark)
+        mk("ocr_current", "ocr", "识别当前页面",
+           triggered=self.ocr_current_page)
+        mk("ocr_all", "ocr_all", "识别全部页面",
+           triggered=self.ocr_all_pages)
+        mk("ocr_toolbar", "ocr", "OCR识别",
+           triggered=self.ocr_current_page)
+        mk("security_set", None, "设置密码", triggered=self.set_pdf_security)
+        mk("security_remove", None, "删除密码", triggered=self.remove_pdf_security)
+        mk("security_status", None, "查看加密状态",
+           triggered=self.show_pdf_security_status)
         mk("copy_all", None, "复制本页全部文字",
            triggered=lambda: self.current_view().copy_page_text())
         mk("image", "image", "插入图片",
            triggered=lambda: self.current_view().start_image())
+        mk("annotation", "annotation", "批注",
+           triggered=lambda: self.current_view().start_note())
         mk("edit_color", "color", "编辑颜色", triggered=self._pick_color)
-        mk("sign", "sign", "手写签名",
+        mk("sign", "sign", "签名设计",
            triggered=lambda: self.current_view().start_sign())
         mk("sign_lib", "library", "签名库",
            triggered=lambda: self.current_view().open_sign_lib())
@@ -439,6 +936,9 @@ class MainWindow(QMainWindow):
             act.setChecked(k == key)
 
     def _escape_to_select(self):
+        if self.isFullScreen():
+            self.toggle_fullscreen()
+            return
         self._trigger_mode("view")
 
     def _copy_shortcut(self):
@@ -453,10 +953,14 @@ class MainWindow(QMainWindow):
 
     # ================= 工具栏 =================
     def _build_toolbars(self):
-        default_file = ["save", "fit_width", "sidebar", "merge", "split_every",
-                        "watermark"]
-        default_edit = [k for k, _l, _vm, _i in MODE_DEFS[1:]] + \
-                       ["edit_color", "image", "sign", "sign_lib", "delete_page"]
+        default_file = ["save", "fit_width", "sidebar"]
+        mode_keys = [k for k, _l, _vm, _i in MODE_DEFS[1:]]
+        insert_at = mode_keys.index("replace_text") + 1
+        default_edit = mode_keys[:insert_at] + ["sign", "sign_lib"] + \
+            mode_keys[insert_at:]
+        default_edit.insert(default_edit.index("text"), "watermark")
+        default_edit += ["edit_color", "image", "annotation",
+                         "ocr_toolbar", "delete_page"]
         saved_raw = self.settings.value("toolbar_order", None)
         saved = None
         if saved_raw:
@@ -465,14 +969,67 @@ class MainWindow(QMainWindow):
             except Exception:
                 saved = None
 
+        # 分版本迁移旧布局；每项只执行一次，之后继续尊重用户拖动顺序。
+        order_version = self.settings.value(
+            "toolbar_order_version", 0, type=int)
+        migrated = False
+        if saved and order_version < 1:
+            edit = list(saved.get("edit") or [])
+            if "replace_text" in edit:
+                for key in ("sign", "sign_lib"):
+                    if key in edit:
+                        edit.remove(key)
+                at = edit.index("replace_text") + 1
+                edit[at:at] = ["sign", "sign_lib"]
+                saved["edit"] = edit
+                migrated = True
+        if saved and order_version < 2:
+            file_items = list(saved.get("file") or [])
+            edit = list(saved.get("edit") or [])
+            for key in ("watermark", "ocr_toolbar"):
+                if key in file_items:
+                    file_items.remove(key)
+                if key in edit:
+                    edit.remove(key)
+            if "text" in edit:
+                edit.insert(edit.index("text"), "watermark")
+            else:
+                edit.append("watermark")
+            if "image" in edit:
+                edit.insert(edit.index("image") + 1, "ocr_toolbar")
+            else:
+                edit.append("ocr_toolbar")
+            saved["file"] = file_items
+            saved["edit"] = edit
+            migrated = True
+        if saved and order_version < 3:
+            edit = list(saved.get("edit") or [])
+            if "annotation" in edit:
+                edit.remove("annotation")
+            if "image" in edit:
+                edit.insert(edit.index("image") + 1, "annotation")
+            else:
+                edit.append("annotation")
+            saved["edit"] = edit
+            migrated = True
+        self.settings.setValue("toolbar_order_version", 3)
+        if migrated:
+            self.settings.setValue("toolbar_order", json.dumps(saved))
+
         # 第一行：文件/工具
         self.tb1 = SortableToolBar("文件", self)
         self.tb1.setObjectName("fileToolBar")
-        self.tb1.setIconSize(QSize(16, 16))
+        self.tb1.setIconSize(SortableToolBar.ICON_SIZE)
         self.tb1.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         self.tb1.orderChanged.connect(self._toolbar_order_changed)
         self.addToolBar(self.tb1)
         file_order = list((saved.get("file") if saved else None) or default_file)
+        # 水印已迁入编辑功能区；合并与按页拆分只保留在工具菜单。
+        # 始终过滤旧布局，避免历史顺序把这些按钮重新带回文件功能区。
+        file_toolbar_exclusions = {"watermark", "merge", "split_every"}
+        file_order = [
+            key for key in file_order if key not in file_toolbar_exclusions]
+        file_order = list(dict.fromkeys(file_order))
         for key in default_file:  # 补齐默认顺序里新增的按钮
             if key not in file_order:
                 file_order.append(key)
@@ -483,14 +1040,22 @@ class MainWindow(QMainWindow):
         # 第二行：编辑
         self.tb2 = SortableToolBar("编辑", self)
         self.tb2.setObjectName("editToolBar")
-        self.tb2.setIconSize(QSize(16, 16))
+        self.tb2.setIconSize(SortableToolBar.ICON_SIZE)
         self.tb2.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         self.tb2.orderChanged.connect(self._toolbar_order_changed)
         self.addToolBar(self.tb2)
         edit_order = list((saved.get("edit") if saved else None) or default_edit)
+        # 清理历史设置中可能保存的重复项；一个 QAction 在功能区只出现一次。
+        edit_order = list(dict.fromkeys(edit_order))
         for key in default_edit:  # 补齐默认顺序里新增的按钮
             if key not in edit_order:
-                if key == "edit_color" and "image" in edit_order:
+                if key == "watermark" and "text" in edit_order:
+                    edit_order.insert(edit_order.index("text"), key)
+                elif key == "ocr_toolbar" and "image" in edit_order:
+                    edit_order.insert(edit_order.index("image") + 1, key)
+                elif key == "annotation" and "image" in edit_order:
+                    edit_order.insert(edit_order.index("image") + 1, key)
+                elif key == "edit_color" and "image" in edit_order:
                     edit_order.insert(edit_order.index("image"), key)
                 else:
                     edit_order.append(key)
@@ -500,13 +1065,13 @@ class MainWindow(QMainWindow):
             elif key in self.act:
                 self.tb2.addAction(self.act[key])
 
-        # QMainWindow 会在相邻工具栏之间强制绘制一条竖向分隔边；使用与
-        # 主题同色的无交互覆盖层消除突兀竖线，不影响按钮拖动排序。
+        # 两个工具栏及按钮均使用零横向间距，不再绘制交界补偿条。
         self.toolbar_seam_cover = QWidget(self)
         self.toolbar_seam_cover.setObjectName("toolbarSeamCover")
         self.toolbar_seam_cover.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.toolbar_seam_cover.setFixedWidth(4)
+        self.toolbar_seam_cover.setFixedWidth(0)
+        self.toolbar_seam_cover.hide()
 
         # 独立溢出入口使用普通 QMenu，确保菜单背景与当前主题同步。
         self.more_tools_menu = QMenu(self)
@@ -515,14 +1080,17 @@ class MainWindow(QMainWindow):
 
         self.more_tools_btn = QToolButton(self.tb2)
         self.more_tools_btn.setObjectName("toolbar_more_btn")
-        self.more_tools_btn.setText("▾")
+        self.more_tools_btn.setText("")
+        self.more_tools_btn.setIcon(
+            icons.get("more_down", self._icon_color))
+        self.more_tools_btn.setIconSize(QSize(20, 20))
         self.more_tools_btn.setToolTip("更多工具")
         self.more_tools_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.more_tools_btn.setPopupMode(
             QToolButton.ToolButtonPopupMode.InstantPopup)
         self.more_tools_btn.setMenu(self.more_tools_menu)
         self.more_tools_btn.setAutoRaise(True)
-        self.more_tools_btn.setFixedSize(24, 24)
+        self.more_tools_btn.setFixedSize(32, 30)
         self.more_tools_btn.hide()
         self._more_visibility_pending = False
 
@@ -598,11 +1166,7 @@ class MainWindow(QMainWindow):
     def _position_toolbar_seam_cover(self):
         if not hasattr(self, "toolbar_seam_cover"):
             return
-        geo = self.tb2.geometry()
-        self.toolbar_seam_cover.setGeometry(
-            max(0, geo.x() - 2), geo.y(), 4, geo.height())
-        self.toolbar_seam_cover.setVisible(self.tb2.isVisible())
-        self.toolbar_seam_cover.raise_()
+        self.toolbar_seam_cover.hide()
     def _apply_ui_fonts(self):
         """为菜单和工具栏设置清晰的独立字号与字重。"""
         menu_font = QFont("Microsoft YaHei UI")
@@ -620,7 +1184,7 @@ class MainWindow(QMainWindow):
             menu.setFont(menu_font)
 
         toolbar_font = QFont("Microsoft YaHei UI")
-        toolbar_font.setPointSizeF(8.5)
+        toolbar_font.setPointSizeF(9.5)
         toolbar_font.setWeight(QFont.Weight.Medium)
         toolbar_font.setHintingPreference(
             QFont.HintingPreference.PreferVerticalHinting)
@@ -630,6 +1194,17 @@ class MainWindow(QMainWindow):
         toolbar_font.setKerning(True)
         self.tb1.setFont(toolbar_font)
         self.tb2.setFont(toolbar_font)
+
+        # 标签文字独立缩小，避免“未命名/文件名”在紧凑标签栏里显得突兀。
+        tab_font = QFont("Microsoft YaHei UI")
+        tab_font.setPointSizeF(8.0)
+        tab_font.setWeight(QFont.Weight.Normal)
+        tab_font.setHintingPreference(
+            QFont.HintingPreference.PreferVerticalHinting)
+        tab_font.setStyleStrategy(
+            QFont.StyleStrategy.PreferAntialias |
+            QFont.StyleStrategy.NoSubpixelAntialias)
+        self.tabs.tabBar().setFont(tab_font)
 
     def _save_toolbar_order(self):
         order = {}
@@ -664,8 +1239,6 @@ class MainWindow(QMainWindow):
         for key, _l, _vm, _i in MODE_DEFS:
             self._m_edit.addAction(self.mode_actions[key])
         self._m_edit.addSeparator()
-        self._m_edit.addAction(self.act["copy_all"])
-        self._m_edit.addSeparator()
         self._m_edit.addAction(self.act["image"])
         self._m_edit.addAction(self.act["edit_color"])
         self._m_edit.addAction(self.act["delete_page"])
@@ -676,10 +1249,21 @@ class MainWindow(QMainWindow):
         self._m_tools.addAction(self.act["split_ranges"])
         self._m_tools.addAction(self.act["extract"])
         self._m_tools.addAction(self.act["watermark"])
+        self._m_tools.addAction(self.act["annotation"])
+        self._m_tools.addSeparator()
+        self._m_signature_tools = self._m_tools.addMenu(i18n.tr("sign_title"))
+        self._m_signature_tools.addAction(self.act["sign"])
+        self._m_signature_tools.addAction(self.act["sign_lib"])
+        self._m_tools.addSeparator()
+        self._m_ocr = self._m_tools.addMenu(i18n.tr("menu_ocr"))
+        self._m_ocr.addAction(self.act["ocr_current"])
+        self._m_ocr.addAction(self.act["ocr_all"])
 
         self._m_sign = self.menuBar().addMenu(i18n.tr("menu_sign"))
-        self._m_sign.addAction(self.act["sign"])
-        self._m_sign.addAction(self.act["sign_lib"])
+        self._m_sign.addAction(self.act["security_set"])
+        self._m_sign.addAction(self.act["security_remove"])
+        self._m_sign.addSeparator()
+        self._m_sign.addAction(self.act["security_status"])
 
         self._m_view = self.menuBar().addMenu(i18n.tr("menu_view"))
         self._m_theme = self._m_view.addMenu(i18n.tr("menu_theme"))
@@ -702,6 +1286,7 @@ class MainWindow(QMainWindow):
 
         self._m_view.addSeparator()
         self._m_view.addAction(self.act["sidebar"])
+        self._m_view.addAction(self.act["sidebar_default"])
         self._m_view.addAction(self.act["fullscreen"])
 
         self._m_help = self.menuBar().addMenu(i18n.tr("menu_help"))
@@ -724,6 +1309,8 @@ class MainWindow(QMainWindow):
         self._m_file.setTitle(i18n.tr("menu_file"))
         self._m_edit.setTitle(i18n.tr("menu_edit"))
         self._m_tools.setTitle(i18n.tr("menu_tools"))
+        self._m_signature_tools.setTitle(i18n.tr("sign_title"))
+        self._m_ocr.setTitle(i18n.tr("menu_ocr"))
         self._m_sign.setTitle(i18n.tr("menu_sign"))
         self._m_view.setTitle(i18n.tr("menu_view"))
         self._m_theme.setTitle(i18n.tr("menu_theme"))
@@ -735,6 +1322,235 @@ class MainWindow(QMainWindow):
         self._lang_en_act.setChecked(i18n.get_lang() == "en")
         if hasattr(self, "search_edit"):
             self.search_edit.setPlaceholderText(i18n.tr("search_placeholder"))
+            self.btn_search.setText(i18n.tr("search"))
+            self.btn_search.setToolTip(i18n.tr("search"))
+            self.btn_search_prev.setToolTip(i18n.tr("search_prev"))
+            self.btn_search_next.setToolTip(i18n.tr("search_next"))
+        if hasattr(self, "more_tools_btn"):
+            self.more_tools_btn.setToolTip(i18n.tr("more_tools"))
+        for index in range(self.tabs.count()):
+            view = self.tabs.widget(index)
+            if isinstance(view, DocumentView):
+                view.apply_language()
+                if view.file_path is None:
+                    self.tabs.setTabText(index, i18n.tr("untitled"))
+        current = self.current_view()
+        if current and current.doc is not None:
+            self._on_page_changed(
+                current.page_view.current_page(), len(current.doc))
+        self._on_tab_changed(self.tabs.currentIndex())
+
+    # ================= OCR =================
+    def ocr_current_page(self):
+        view = self.current_view()
+        if not view or view.doc is None:
+            QMessageBox.information(self, i18n.tr("hint"), "请先打开 PDF 文件。")
+            return
+        self.ocr_page(view, view.page_view.current_page())
+
+    def ocr_page(self, view, pno):
+        """识别指定文档视图的指定页面，供工具栏和右键菜单共用。"""
+        if not view or view.doc is None:
+            return
+        if not (view.permission_allowed(pymupdf.PDF_PERM_MODIFY) and
+                view.permission_allowed(pymupdf.PDF_PERM_COPY)):
+            self.statusBar().showMessage("文档安全设置禁止 OCR 提取或写入文字", 4000)
+            return
+        pno = max(0, min(int(pno), len(view.doc) - 1))
+        existing = backend.extract_text(view.doc, pno)
+        if existing:
+            answer = QMessageBox.question(
+                self, "OCR 文字识别",
+                f"第 {pno + 1} 页已经包含可搜索文字。继续识别可能产生重复文字层，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._start_ocr(view, [pno])
+
+    def ocr_all_pages(self):
+        view = self.current_view()
+        if not view or view.doc is None:
+            QMessageBox.information(self, i18n.tr("hint"), "请先打开 PDF 文件。")
+            return
+        if not (view.permission_allowed(pymupdf.PDF_PERM_MODIFY) and
+                view.permission_allowed(pymupdf.PDF_PERM_COPY)):
+            self.statusBar().showMessage("文档安全设置禁止 OCR 提取或写入文字", 4000)
+            return
+        # 全文识别默认跳过已有文字的页面，防止反复执行后叠加重复文字层。
+        pages = [pno for pno in range(len(view.doc))
+                 if not backend.extract_text(view.doc, pno)]
+        skipped = len(view.doc) - len(pages)
+        if not pages:
+            QMessageBox.information(
+                self, "OCR 文字识别", "所有页面都已经包含可搜索文字，无需重复识别。")
+            return
+        if skipped:
+            self.statusBar().showMessage(
+                f"已自动跳过 {skipped} 个包含文字的页面", 4000)
+        self._start_ocr(view, pages)
+
+    def _start_ocr(self, view, pages):
+        if self._ocr_worker is not None and self._ocr_worker.isRunning():
+            QMessageBox.information(self, i18n.tr("hint"), "OCR 正在运行，请稍候。")
+            return
+        try:
+            snapshot = view.doc.tobytes(garbage=3, deflate=True)
+        except Exception as e:
+            QMessageBox.warning(self, "OCR 文字识别", f"无法准备文档：{e}")
+            return
+
+        self._ocr_target_view = view
+        progress = QProgressDialog("正在准备离线识别…", "取消", 0, len(pages), self)
+        progress.setWindowTitle("OCR 文字识别")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        self._ocr_progress = progress
+
+        worker = OcrWorker(snapshot, pages, self)
+        self._ocr_worker = worker
+        progress.canceled.connect(worker.requestInterruption)
+        worker.progress.connect(self._on_ocr_progress)
+        worker.completed.connect(self._on_ocr_completed)
+        worker.failed.connect(self._on_ocr_failed)
+        worker.canceled.connect(self._on_ocr_canceled)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        progress.show()
+
+    def _on_ocr_progress(self, current, total):
+        if self._ocr_progress is not None:
+            self._ocr_progress.setLabelText(
+                i18n.tr("ocr_progress").format(p=current, t=total))
+            self._ocr_progress.setValue(current)
+
+    def _finish_ocr_ui(self):
+        if self._ocr_progress is not None:
+            self._ocr_progress.close()
+            self._ocr_progress.deleteLater()
+        self._ocr_progress = None
+        self._ocr_worker = None
+
+    def _on_ocr_completed(self, results):
+        view = self._ocr_target_view
+        self._ocr_target_view = None
+        self._finish_ocr_ui()
+        if view is None or view.doc is None:
+            return
+        try:
+            inserted = backend.add_ocr_text_layer(view.doc, results)
+        except Exception as e:
+            QMessageBox.warning(self, "OCR 文字识别", f"写入文字层失败：{e}")
+            return
+        text = "\n\n".join(
+            "\n".join(line["text"] for line in item.get("lines", []))
+            for item in results).strip()
+        if not inserted or not text:
+            QMessageBox.information(self, "OCR 文字识别", "未识别到清晰文字。")
+            return
+        QApplication.clipboard().setText(text)
+        view.modified = True
+        view._search_results = []
+        view.page_view.clear_search_highlights()
+        QMessageBox.information(
+            self, "OCR 文字识别",
+            f"识别完成：共写入 {inserted} 行可搜索文字。\n"
+            "识别结果已复制到剪贴板；保存文档即可永久保留文字层。")
+        self.statusBar().showMessage(
+            f"OCR 完成，已写入 {inserted} 行并复制识别文字", 5000)
+
+    def _on_ocr_failed(self, message):
+        self._ocr_target_view = None
+        self._finish_ocr_ui()
+        QMessageBox.warning(self, "OCR 文字识别", f"识别失败：{message}")
+
+    def _on_ocr_canceled(self):
+        self._ocr_target_view = None
+        self._finish_ocr_ui()
+        self.statusBar().showMessage("OCR 已取消，文档未作修改", 3000)
+
+    # ================= PDF 安全 =================
+    def set_pdf_security(self):
+        view = self._view_doc()
+        if not view:
+            return
+        dialog = PdfSecurityDialog(self)
+        if self._exec_themed_dialog(dialog) != QDialog.DialogCode.Accepted:
+            return
+        user_pw, owner_pw, permissions = dialog.values()
+        view.set_pdf_encryption(user_pw, owner_pw, permissions)
+        QMessageBox.information(
+            self, "PDF 安全",
+            "已设置 AES-256 加密。保存文档后密码与权限设置正式生效。\n\n"
+            "请妥善保管所有者密码，遗失后无法由软件恢复。")
+        self.statusBar().showMessage("已设置 PDF 加密，保存后生效", 5000)
+
+    def remove_pdf_security(self):
+        view = self._view_doc()
+        if not view:
+            return
+        status = view.security_status()
+        if status == "plain":
+            QMessageBox.information(self, "PDF 安全", "当前文档没有密码保护。")
+            return
+
+        if view._source_encrypted and not (view._auth_level & 4):
+            owner_pw, ok = QInputDialog.getText(
+                self, "验证所有者密码",
+                "移除 PDF 保护需要输入所有者密码：",
+                QLineEdit.EchoMode.Password)
+            if not ok:
+                return
+            auth_level = int(view.doc.authenticate(owner_pw))
+            if not (auth_level & 4):
+                QMessageBox.warning(self, "验证失败", "所有者密码不正确。")
+                return
+            view._auth_level = auth_level
+            view._open_password = owner_pw
+
+        answer = QMessageBox.question(
+            self, "删除 PDF 密码",
+            "确定在下次保存时移除打开密码和全部权限限制吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        view.remove_pdf_encryption()
+        self.statusBar().showMessage("已设置移除 PDF 密码，保存后生效", 5000)
+
+    def show_pdf_security_status(self):
+        view = self._view_doc()
+        if not view:
+            return
+        status = view.security_status()
+        if status == "pending_encrypt":
+            permissions = int(view._security_options.get("permissions", 0))
+            headline = "已设置 AES-256 加密（保存后生效）"
+        elif status == "pending_remove":
+            QMessageBox.information(
+                self, "PDF 安全状态", "已设置删除密码，保存文档后生效。")
+            return
+        elif status == "plain":
+            QMessageBox.information(
+                self, "PDF 安全状态", "当前文档未加密，没有使用权限限制。")
+            return
+        else:
+            permissions = int(view.doc.permissions)
+            headline = "当前文档已加密"
+
+        def allowed(mask):
+            return "允许" if permissions & mask else "禁止"
+
+        details = (
+            f"{headline}\n\n"
+            f"打印：{allowed(pymupdf.PDF_PERM_PRINT)}\n"
+            f"复制：{allowed(pymupdf.PDF_PERM_COPY)}\n"
+            f"编辑：{allowed(pymupdf.PDF_PERM_MODIFY)}\n"
+            f"批注：{allowed(pymupdf.PDF_PERM_ANNOTATE)}")
+        QMessageBox.information(self, "PDF 安全状态", details)
 
     def _mk_exit(self):
         self.act["exit"] = QAction(i18n.tr("exit"), self,
@@ -767,15 +1583,19 @@ class MainWindow(QMainWindow):
 
         self.btn_search_prev = QToolButton()
         self.btn_search_prev.setObjectName("btn_search_prev")
-        self.btn_search_prev.setText("▲")
-        self.btn_search_prev.setFixedSize(31, 28)
+        self.btn_search_prev.setIcon(
+            icons.get("search_up", self._icon_color))
+        self.btn_search_prev.setIconSize(QSize(18, 18))
+        self.btn_search_prev.setFixedSize(32, 30)
         self.btn_search_prev.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_search_prev.setToolTip(i18n.tr("search_prev"))
         self.btn_search_prev.clicked.connect(self._search_prev)
         self.btn_search_next = QToolButton()
         self.btn_search_next.setObjectName("btn_search_next")
-        self.btn_search_next.setText("▼")
-        self.btn_search_next.setFixedSize(31, 28)
+        self.btn_search_next.setIcon(
+            icons.get("search_down", self._icon_color))
+        self.btn_search_next.setIconSize(QSize(18, 18))
+        self.btn_search_next.setFixedSize(32, 30)
         self.btn_search_next.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_search_next.setToolTip(i18n.tr("search_next"))
         self.btn_search_next.clicked.connect(self._search_next)
@@ -784,6 +1604,10 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.btn_search)
         self.statusBar().addPermanentWidget(self.btn_search_prev)
         self.statusBar().addPermanentWidget(self.btn_search_next)
+        self.search_nav_spacer = QWidget()
+        self.search_nav_spacer.setObjectName("searchNavSpacer")
+        self.search_nav_spacer.setFixedWidth(8)
+        self.statusBar().addPermanentWidget(self.search_nav_spacer)
         self.statusBar().addPermanentWidget(self.zoom_label)
 
     # ================= 主题 =================
@@ -805,6 +1629,7 @@ class MainWindow(QMainWindow):
 
         dark = theme.is_dark(self.theme_mode)
         app = QApplication.instance()
+        app.setProperty("do_dark_theme", dark)
         style_hints = app.styleHints()
         # 同时更新 Qt 的原生颜色方案。仅修改样式表无法约束 Windows
         # 标题栏，Qt 可能在稍后的系统事件中把它恢复成系统主题。
@@ -815,15 +1640,33 @@ class MainWindow(QMainWindow):
         else:
             style_hints.setColorScheme(Qt.ColorScheme.Light)
         app.setStyleSheet(theme.qss_for(self.theme_mode))
+        # 应用级 QSS 会在部分 Windows/Qt 组合上把标签字体恢复为系统
+        # 默认值；主题落地后再次锁定菜单、工具栏和紧凑标签字体。
+        self._apply_ui_fonts()
         self._icon_color = icons.icon_color_for_dark(dark)
         for act, ikey in self._icon_key_of.items():
             act.setIcon(icons.get(ikey, self._icon_color))
+        for index in range(self.tabs.count()):
+            self._style_tab_close_button(index)
         if getattr(self, "search_action", None) is not None:
             self.search_action.setIcon(icons.get("search", self._icon_color))
+        if getattr(self, "btn_search_prev", None) is not None:
+            nav_color = "#7fc0ff" if dark else "#176fb6"
+            self.btn_search_prev.setIcon(
+                icons.get("search_up", nav_color))
+            self.btn_search_next.setIcon(
+                icons.get("search_down", nav_color))
+        if getattr(self, "more_tools_btn", None) is not None:
+            more_color = "#ff7048" if dark else "#d9502b"
+            self.more_tools_btn.setIcon(
+                icons.get("more_down", more_color))
         self.act["theme_light"].setChecked(self.theme_mode == "light")
         self.act["theme_dark"].setChecked(self.theme_mode == "dark")
         self.act["theme_system"].setChecked(self.theme_mode == "system")
         self._apply_titlebar_dark()
+        for top_level in app.topLevelWidgets():
+            if isinstance(top_level, QDialog):
+                self._schedule_dialog_titlebar_sync(top_level)
         # Windows 在切换样式表后会异步重建非客户区，分阶段同步可避免
         # 标题栏偶尔仍停留在上一个主题。
         QTimer.singleShot(0, self._apply_titlebar_dark)
@@ -884,9 +1727,9 @@ class MainWindow(QMainWindow):
                 return red | (green << 8) | (blue << 16)
 
             palette = (
-                ((30, 34, 42), (235, 239, 247), (56, 63, 75))
+                ((36, 36, 38), (245, 245, 247), (58, 58, 60))
                 if dark else
-                ((247, 247, 249), (38, 38, 41), (213, 213, 218))
+                ((247, 247, 249), (29, 29, 31), (210, 210, 215))
             )
             for attr, rgb in zip((35, 36, 34), palette):
                 color = ctypes.c_uint(colorref(*rgb))
@@ -907,6 +1750,31 @@ class MainWindow(QMainWindow):
                 pass
         except Exception:
             pass
+
+    def _schedule_dialog_titlebar_sync(self, dialog):
+        """在窗口句柄建立和 Windows 延迟重绘后持续同步弹窗标题栏。"""
+        if not isinstance(dialog, QDialog):
+            return
+        dialog.setProperty("do_theme_managed", True)
+        if dialog.windowIcon().isNull():
+            dialog.setWindowIcon(self.windowIcon())
+        if dialog.windowFlags() & Qt.WindowType.FramelessWindowHint:
+            return
+        self._apply_titlebar_dark(dialog)
+        for delay in (0, 80, 220, 500):
+            QTimer.singleShot(
+                delay,
+                lambda window=dialog: self._apply_titlebar_dark(window))
+
+    def eventFilter(self, obj, event):
+        """同步弹窗标题栏，并为所有菜单应用圆润的二级菜单箭头。"""
+        if isinstance(obj, QMenu) and event.type() == QEvent.Type.Show:
+            if not obj.property("do_rounded_menu_arrow"):
+                obj.setStyle(self._menu_arrow_style)
+                obj.setProperty("do_rounded_menu_arrow", True)
+        if isinstance(obj, QDialog) and event.type() == QEvent.Type.Show:
+            self._schedule_dialog_titlebar_sync(obj)
+        return super().eventFilter(obj, event)
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -975,12 +1843,33 @@ class MainWindow(QMainWindow):
             f"无法转换 Word 文档（需要本机安装 Microsoft Word）：\n{msg}")
 
     def _load_doc(self, path):
+        password = None
+        wrong_password = False
+        while True:
+            try:
+                probe = backend.open_pdf(path, password)
+                probe.close()
+                break
+            except (backend.PdfPasswordRequired, backend.PdfPasswordInvalid):
+                prompt = ("密码不正确，请重新输入：" if wrong_password else
+                          "该 PDF 已加密，请输入打开密码：")
+                password, ok = QInputDialog.getText(
+                    self, "打开加密 PDF", prompt,
+                    QLineEdit.EchoMode.Password)
+                if not ok:
+                    self.statusBar().showMessage("已取消打开加密 PDF", 3000)
+                    return
+                wrong_password = True
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"无法打开该文件：\n{e}")
+                return
+
         view = self.current_view()
         if view is not None and view.doc is None and self.tabs.count() == 1:
-            view.load(path)
+            view.load(path, password)
         else:
             view = self._new_tab()
-            view.load(path)
+            view.load(path, password)
 
     def _jump_to_page(self):
         try:
@@ -1021,6 +1910,17 @@ class MainWindow(QMainWindow):
         if view:
             view.toggle_sidebar()
 
+    def _set_sidebar_default(self, visible):
+        """保存侧边栏默认状态，并立即同步所有已打开的标签页。"""
+        self.sidebar_default_visible = bool(visible)
+        self.settings.setValue(
+            "sidebar_default_visible", self.sidebar_default_visible)
+        self.settings.sync()
+        for index in range(self.tabs.count()):
+            view = self.tabs.widget(index)
+            if isinstance(view, DocumentView):
+                view.set_sidebar_visible(self.sidebar_default_visible)
+
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
@@ -1040,7 +1940,7 @@ class MainWindow(QMainWindow):
         self.statusBar().setVisible(visible)
         view = self.current_view()
         if view:
-            view.side_tabs.setVisible(
+            view.set_sidebar_visible(
                 visible and getattr(self, "_fs_sidebar", False))
 
     # ================= 合并 / 拆分 =================
@@ -1054,13 +1954,14 @@ class MainWindow(QMainWindow):
             return
         text, fontsize, color, opacity, rotate, tiled = dlg.result()
         if not text:
-            QMessageBox.information(self, "提示", "水印文字不能为空")
+            QMessageBox.information(
+                self, i18n.tr("hint"), i18n.tr("watermark_empty"))
             return
         backend.add_watermark(view.doc, text, fontsize=fontsize, color=color,
                               opacity=opacity, rotate=rotate, tiled=tiled)
         view.modified = True
         view._refresh()
-        self.statusBar().showMessage("已添加水印", 3000)
+        self.statusBar().showMessage(i18n.tr("watermark_added"), 3000)
 
     def merge_pdfs(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择要合并的 PDF", "",
@@ -1203,6 +2104,13 @@ class MainWindow(QMainWindow):
         return dialog.exec()
 
     def closeEvent(self, e):
+        if self._ocr_worker is not None and self._ocr_worker.isRunning():
+            self._ocr_worker.requestInterruption()
+            if not self._ocr_worker.wait(5000):
+                QMessageBox.information(
+                    self, "OCR 文字识别", "正在结束当前识别任务，请稍后再退出。")
+                e.ignore()
+                return
         for i in range(self.tabs.count()):
             view = self.tabs.widget(i)
             if view and view.modified:

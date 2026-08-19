@@ -1,23 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
 # DO编辑器 精简打包配置（onedir 模式，剔除无用模块与 DLL 以减小体积）
 import os
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+
+_ocr_datas = collect_data_files('rapidocr')
+_ocr_binaries = collect_dynamic_libs('onnxruntime')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
+    binaries=_ocr_binaries,
+    datas=[
+        ('icon.ico', '.'),
+        ('app-icon.png', '.'),
+    ] + _ocr_datas,
     hiddenimports=[
         'win32com', 'win32com.client', 'pythoncom', 'pywintypes',
         'win32api', 'win32gui',
+        'rapidocr', 'onnxruntime',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'PIL', 'PIL.Image', 'PIL.ImageFilter', 'PIL.ImageOps', 'PIL.ImageDraw',
-        'PIL.ImageFont', 'PIL.ImageQt', 'PIL.ImageGrab', 'PIL.ImageTk',
-        'PIL.ImageMode', 'PIL.ImagePalette', 'PIL._imagingtk', 'PIL._tkinter_finder',
         'PySide6.QtNetwork', 'PySide6.QtSvg', 'PySide6.QtOpenGL',
         'tkinter', 'unittest', 'pydoc', 'doctest', 'pdb', 'test', 'tests',
         'pythonwin', 'win32ui', 'pywin.framework', 'pywin.dialogs', 'pywin.mfc',

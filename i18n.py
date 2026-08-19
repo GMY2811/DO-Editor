@@ -1,14 +1,22 @@
 """国际化：中文/英文界面切换（默认中文）。"""
 
 _LANG = "zh"
+_QT_TRANSLATOR = None
 
 # key: (中文, English)
 _STRINGS = {
+    "app_name": ("DO编辑器", "DO Editor"),
+    "untitled": ("未命名", "Untitled"),
+    "pages": ("页面", "Pages"),
+    "page_status": ("第 {p} / {t} 页", "Page {p} / {t}"),
+    "start_open": ("打开文档", "Open Document"),
+    "start_hint": ("支持 PDF、DOCX、DOC  ·  Ctrl+O 快速打开",
+                   "PDF, DOCX and DOC supported  ·  Ctrl+O to open"),
     # 菜单栏
     "menu_file": ("文件", "File"),
     "menu_edit": ("编辑", "Edit"),
     "menu_tools": ("工具", "Tools"),
-    "menu_sign": ("签名", "Signature"),
+    "menu_sign": ("安全", "Security"),
     "menu_view": ("视图", "View"),
     "menu_theme": ("主题", "Theme"),
     "menu_lang": ("语言", "Language"),
@@ -25,9 +33,15 @@ _STRINGS = {
     "zoom_out": ("缩小", "Zoom Out"),
     "fit_width": ("适合宽度", "Fit Width"),
     "sidebar": ("侧边栏", "Sidebar"),
+    "sidebar_default": ("启动时显示侧边栏", "Show Sidebar by Default"),
     "fullscreen": ("全屏", "Fullscreen"),
+    "more_tools": ("更多工具", "More Tools"),
     # 工具
     "delete_page": ("删除当前页", "Delete Page"),
+    "delete_this_page": ("删除本页", "Delete This Page"),
+    "delete_selected_pages": ("删除所选页", "Delete Selected Pages"),
+    "delete_selected_pages_confirm": ("确定删除所选的 {n} 页吗？", "Delete the {n} selected pages?"),
+    "keep_one_page": ("文档至少需要保留一页，无法删除全部页面", "A document must keep at least one page."),
     "merge": ("合并 PDF", "Merge PDF"),
     "split_every": ("每 N 页拆分", "Split Every N"),
     "split_ranges": ("按页码范围拆分", "Split by Ranges"),
@@ -35,9 +49,16 @@ _STRINGS = {
     "copy_all": ("复制本页全部文字", "Copy Page Text"),
     "image": ("插入图片", "Insert Image"),
     "edit_color": ("编辑颜色", "Edit Color"),
-    "sign": ("手写签名", "Signature"),
+    "sign": ("签名设计", "Signature Design"),
     "sign_lib": ("签名库", "Signature Library"),
     "about": ("关于", "About"),
+    "about_title": ("关于 {app}", "About {app}"),
+    "about_version": ("版本 {version}", "Version {version}"),
+    "about_summary": ("轻巧、专注的 PDF 阅读与编辑工具", "A lightweight, focused PDF reader and editor"),
+    "about_developer": ("开发者", "Developer"),
+    "about_email": ("联系邮箱", "Email"),
+    "about_framework": ("技术框架", "Framework"),
+    "dialog_close": ("关闭", "Close"),
     # 主题
     "theme_light": ("浅色", "Light"),
     "theme_dark": ("深色", "Dark"),
@@ -47,11 +68,16 @@ _STRINGS = {
     "lang_en": ("English", "English"),
     # 编辑模式
     "view": ("选择", "Select"),
-    "text_select": ("选择文字", "Select Text"),
+    "text_select": ("快捷复制", "Quick Copy"),
     "replace_text": ("修改文字", "Replace Text"),
     "highlight": ("高亮", "Highlight"),
     "underline": ("下划线", "Underline"),
     "strikeout": ("删除线", "Strikethrough"),
+    "annotation": ("批注", "Comment"),
+    "annotation_title": ("添加批注", "Add Comment"),
+    "annotation_prompt": ("请输入批注内容：", "Enter comment text:"),
+    "annotation_place": ("请在页面上点击批注位置", "Click the page to place the comment"),
+    "edit_annotation": ("编辑批注", "Edit Comment"),
     "rect": ("矩形", "Rectangle"),
     "line": ("直线", "Line"),
     "ink": ("手绘", "Ink"),
@@ -68,7 +94,7 @@ _STRINGS = {
     "hint": ("提示", "Info"),
     # 右键菜单
     "copy_selected": ("复制所选文字", "Copy Selection"),
-    "select_text": ("选取文字", "Select Text"),
+    "select_text": ("快捷复制", "Quick Copy"),
     "copy_page": ("复制本页全部文字", "Copy Page Text"),
     "paste_text": ("粘贴文字", "Paste Text"),
     "edit_text": ("编辑文字", "Edit Text"),
@@ -85,12 +111,26 @@ _STRINGS = {
     "bold": ("加粗", "Bold"),
     "italic": ("斜体", "Italic"),
     # 水印
+    "watermark": ("添加水印", "Add Watermark"),
     "add_watermark": ("添加水印", "Add Watermark"),
     "watermark_text": ("水印文字：", "Watermark Text: "),
     "watermark_rotate": ("旋转角度：", "Rotate: "),
     "watermark_opacity": ("透明度：", "Opacity: "),
     "tiled": ("平铺水印", "Tiled"),
     "watermark_default": ("机密", "CONFIDENTIAL"),
+    "watermark_empty": ("水印文字不能为空", "Watermark text cannot be empty."),
+    "watermark_added": ("已添加水印", "Watermark added"),
+    # OCR
+    "menu_ocr": ("OCR 文字识别", "OCR Text Recognition"),
+    "ocr_current": ("识别当前页面", "Recognize Current Page"),
+    "ocr_all": ("识别全部页面", "Recognize All Pages"),
+    "ocr_toolbar": ("OCR识别", "OCR"),
+    "ocr_progress": ("正在识别第 {p} / {t} 页…", "Recognizing page {p} / {t}…"),
+    # PDF 安全
+    "menu_security": ("PDF 安全", "PDF Security"),
+    "security_set": ("设置密码", "Set Password"),
+    "security_remove": ("删除密码", "Remove Password"),
+    "security_status": ("查看加密状态", "Encryption Status"),
     # 签名
     "sign_title": ("签名", "Signature"),
     "text_sign": ("文字签名", "Text Signature"),
@@ -112,6 +152,32 @@ _STRINGS = {
 def set_lang(lang):
     global _LANG
     _LANG = lang if lang in ("zh", "en") else "zh"
+    _sync_qt_translator()
+
+
+def _sync_qt_translator():
+    """让 QColorDialog 等 Qt 标准界面跟随软件的中英文设置。"""
+    global _QT_TRANSLATOR
+    try:
+        from PySide6.QtCore import (QCoreApplication, QLibraryInfo,
+                                    QTranslator)
+        app = QCoreApplication.instance()
+        if app is None:
+            return
+        if _QT_TRANSLATOR is not None:
+            app.removeTranslator(_QT_TRANSLATOR)
+            _QT_TRANSLATOR = None
+        if _LANG == "zh":
+            translator = QTranslator(app)
+            translations_path = QLibraryInfo.path(
+                QLibraryInfo.LibraryPath.TranslationsPath)
+            if translator.load("qtbase_zh_CN", translations_path):
+                app.installTranslator(translator)
+                # 必须持有引用，否则 Python 回收后标准界面会恢复英文。
+                _QT_TRANSLATOR = translator
+    except Exception:
+        # 缺少可选翻译文件时不影响程序主体启动。
+        _QT_TRANSLATOR = None
 
 
 def get_lang():

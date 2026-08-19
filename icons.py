@@ -1,29 +1,71 @@
 """DO阅读器 工具栏矢量图标（QPainter 绘制，无需图片资源）。"""
 from PySide6.QtCore import Qt, QRectF, QPointF
-from PySide6.QtGui import QImage, QPainter, QPen, QColor, QIcon, QPixmap
+from PySide6.QtGui import (QImage, QPainter, QPen, QColor, QIcon, QPixmap,
+                           QPainterPath)
 
 _GRAY = QColor(90, 100, 115)
 _LIGHT_GRAY = QColor(200, 206, 215)
 _WHITE = QColor(255, 255, 255)
 _CURRENT_COLOR = _GRAY
+_CURRENT_WIDE = False
+
+# 功能图标采用克制的分组强调色。浅色主题使用较深的颜色保证对比度，
+# 深色主题使用更明亮的同色系；危险操作始终保留红色语义。
+_ACCENT_LIGHT = {
+    "open": "#2474d2", "save": "#2474d2", "fit_width": "#2474d2",
+    "sidebar": "#526f91", "merge": "#6d55c7", "split": "#8057c8",
+    "watermark": "#087d91", "text": "#2468c9", "edit": "#087ca5",
+    "sign": "#7056c8", "library": "#7657bf", "text_select": "#3e63c7",
+    "highlight": "#a86f08", "annotation": "#b46908", "underline": "#087f75",
+    "strikeout": "#c34843", "rect": "#2870ae", "line": "#2870ae",
+    "ink": "#6755b5", "color": "#d15d2f", "image": "#168068",
+    "ocr": "#5368c9", "ocr_all": "#6757c8",
+    "trash": "#cf4545", "select": "#3e63c7",
+}
+_ACCENT_DARK = {
+    "open": "#69adff", "save": "#69adff", "fit_width": "#69adff",
+    "sidebar": "#a8c9ec", "merge": "#b6a0ff", "split": "#c09cff",
+    "watermark": "#62d9ed", "text": "#72b3ff", "edit": "#67d7f4",
+    "sign": "#c0a5ff", "library": "#c7a7ff", "text_select": "#91adff",
+    "highlight": "#f2c45c", "annotation": "#ffc45c", "underline": "#5bd4c7",
+    "strikeout": "#ff8178", "rect": "#77baff", "line": "#77baff",
+    "ink": "#b7a4ff", "color": "#ff9a66", "image": "#62d5af",
+    "ocr": "#9caeff", "ocr_all": "#b7a5ff",
+    "trash": "#ff746f", "select": "#91adff",
+}
+_WIDE_ICONS = frozenset(_ACCENT_LIGHT)
 
 
 def _build(draw, s=24):
     color = _CURRENT_COLOR
+    width = 32 if _CURRENT_WIDE else s
     icon = QIcon()
-    for c, state in ((color, QIcon.State.Off), (_WHITE, QIcon.State.On)):
-        img = QImage(s * 2, s * 2, QImage.Format.Format_ARGB32)
-        img.fill(Qt.GlobalColor.transparent)
-        p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.scale(2, 2)
-        p.setPen(QPen(c, 1.9, Qt.PenStyle.SolidLine,
-                      Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        draw(p, s)
-        p.end()
-        icon.addPixmap(QPixmap.fromImage(img), QIcon.Mode.Normal, state)
-        icon.addPixmap(QPixmap.fromImage(img), QIcon.Mode.Active, state)
+    # 选中时保持原有功能色，避免彩色图标突然跳变为纯白。
+    for c, state in ((color, QIcon.State.Off), (color, QIcon.State.On)):
+        # 为每种显示缩放提供原生像素资源，并标记正确 DPR。此前只生成
+        # 96x72 普通位图，Qt 会再缩小到 32x24，造成明显的二次插值模糊。
+        for dpr in (1, 2, 3):
+            img = QImage(width * dpr, s * dpr,
+                         QImage.Format.Format_ARGB32)
+            img.fill(Qt.GlobalColor.transparent)
+            p = QPainter(img)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.scale(dpr, dpr)
+            p.setPen(QPen(c, 2.0, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap,
+                          Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if _CURRENT_WIDE:
+                # 无背景纯线图标略微横向舒展；控制变形幅度以保持边缘锐利。
+                p.translate(width / 2, s / 2)
+                p.scale(1.20, 1.0)
+                p.translate(-s / 2, -s / 2)
+            draw(p, s)
+            p.end()
+            pixmap = QPixmap.fromImage(img)
+            pixmap.setDevicePixelRatio(dpr)
+            icon.addPixmap(pixmap, QIcon.Mode.Normal, state)
+            icon.addPixmap(pixmap, QIcon.Mode.Active, state)
     return icon
 
 
@@ -226,6 +268,53 @@ def icon_search():
     return _build(d)
 
 
+def icon_search_up():
+    """搜索结果向上导航；与向下图标共用完全一致的几何尺寸。"""
+    def d(p, s):
+        pen = p.pen()
+        pen.setWidthF(2.5)
+        p.setPen(pen)
+        p.drawPolyline([QPointF(4, 16), QPointF(12, 8), QPointF(20, 16)])
+    return _build(d)
+
+
+def icon_search_down():
+    """搜索结果向下导航；与向上图标共用完全一致的几何尺寸。"""
+    def d(p, s):
+        pen = p.pen()
+        pen.setWidthF(2.5)
+        p.setPen(pen)
+        p.drawPolyline([QPointF(4, 8), QPointF(12, 16), QPointF(20, 8)])
+    return _build(d)
+
+
+def icon_more_down():
+    """带圆润转角的实心倒三角，用于工具栏溢出入口。"""
+    def d(p, s):
+        color = p.pen().color()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        path = QPainterPath(QPointF(7.0, 7.5))
+        path.lineTo(17.0, 7.5)
+        path.quadTo(18.8, 7.5, 17.7, 9.0)
+        path.lineTo(13.3, 15.5)
+        path.quadTo(12.0, 17.3, 10.7, 15.5)
+        path.lineTo(6.3, 9.0)
+        path.quadTo(5.2, 7.5, 7.0, 7.5)
+        path.closeSubpath()
+        p.drawPath(path)
+    return _build(d)
+
+
+def icon_close():
+    """轻量关闭图标，用于标签页等紧凑控件。"""
+    def d(p, s):
+        # 保留适中安全边距，避免高 DPI 和主题切换后叉线贴边溢出。
+        _line(p, 4.0, 4.0, 20.0, 20.0)
+        _line(p, 20.0, 4.0, 4.0, 20.0)
+    return _build(d)
+
+
 def icon_print():
     def d(p, s):
         p.drawRect(QRectF(6, 7, 12, 10))
@@ -241,6 +330,46 @@ def icon_text_select():
         _line(p, 7, 18, 12, 6)
         _line(p, 12, 6, 17, 18)
         _line(p, 9, 14, 15, 14)
+    return _build(d)
+
+
+def icon_ocr():
+    """OCR 扫描框与文字标识，缩小后仍保持清晰。"""
+    def d(p, s):
+        _line(p, 4, 9, 4, 5)
+        _line(p, 4, 5, 8, 5)
+        _line(p, 16, 5, 20, 5)
+        _line(p, 20, 5, 20, 9)
+        _line(p, 4, 15, 4, 19)
+        _line(p, 4, 19, 8, 19)
+        _line(p, 16, 19, 20, 19)
+        _line(p, 20, 19, 20, 15)
+        _line(p, 8, 9, 16, 9)
+        _line(p, 12, 9, 12, 16)
+    return _build(d)
+
+
+def icon_ocr_all():
+    """叠放页面与扫描线，表示对全部页面执行 OCR。"""
+    def d(p, s):
+        # 后方页面只露出顶部与右侧，和单页扫描框形成明显区别。
+        _line(p, 8, 3.5, 19, 3.5)
+        _line(p, 19, 3.5, 19, 17)
+        p.drawRect(QRectF(5, 6.5, 11, 14))
+        _line(p, 7.5, 11, 13.5, 11)
+        _line(p, 7.5, 14, 13.5, 14)
+        _line(p, 7.5, 17, 11.5, 17)
+    return _build(d)
+
+
+def icon_annotation():
+    """带折角的便笺图标。"""
+    def d(p, s):
+        p.drawRect(QRectF(5, 4, 14, 16))
+        _line(p, 14, 4, 14, 9)
+        _line(p, 14, 9, 19, 9)
+        _line(p, 8, 12, 16, 12)
+        _line(p, 8, 15, 14, 15)
     return _build(d)
 
 
@@ -310,6 +439,9 @@ ICONS = {
     "ink": icon_ink,
     "text": icon_text,
     "text_select": icon_text_select,
+    "ocr": icon_ocr,
+    "ocr_all": icon_ocr_all,
+    "annotation": icon_annotation,
     "edit": icon_edit,
     "library": icon_library,
     "watermark": icon_watermark,
@@ -319,14 +451,23 @@ ICONS = {
     "merge": icon_merge,
     "split": icon_split,
     "search": icon_search,
+    "search_up": icon_search_up,
+    "search_down": icon_search_down,
+    "more_down": icon_more_down,
+    "close": icon_close,
     "print": icon_print,
     "color": icon_color,
 }
 
 
 def get(name, color=None):
-    global _CURRENT_COLOR
-    _CURRENT_COLOR = color if color is not None else _GRAY
+    global _CURRENT_COLOR, _CURRENT_WIDE
+    base = QColor(color if color is not None else _GRAY)
+    # 传入的主题基色较亮表示当前为深色背景。
+    dark_background = base.lightness() >= 145
+    palette = _ACCENT_DARK if dark_background else _ACCENT_LIGHT
+    _CURRENT_COLOR = QColor(palette.get(name, base.name()))
+    _CURRENT_WIDE = name in _WIDE_ICONS
     return ICONS[name]() if name in ICONS else QIcon()
 
 
