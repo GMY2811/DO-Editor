@@ -1,10 +1,10 @@
-# DO编辑器介绍网页
+# DO编辑器介绍网站
 
-直接打开 `index.html` 即可预览。网页不依赖第三方框架或在线字体，包含：
+直接打开 `index.html` 即可预览。页面不依赖外部字体、脚本或样式库，也可以部署到任意静态网站服务。
 
-- 响应式桌面与移动端布局
-- 浅色/深色软件截图切换
-- 安装包下载入口
-- GitHub 与开发者联系方式
+- `index.html`：页面结构和介绍内容
+- `styles.css`：Windows 10/11 风格的全屏响应式设计
+- `script.js`：导航、滚动动效和浅色/深色截图切换
+- `assets/`：软件图标，以及使用专用演示文档生成的中英文浅色、深色真实界面截图
 
-如需部署到独立网站，请同时上传 `website` 目录，并将下载链接替换为正式 Release 地址。
+网页中的下载按钮指向 GitHub Releases：`https://github.com/GMY2811/DO-Editor/releases/download/v2.6.0/DO-Editor-Setup-v2.6.0.exe`。

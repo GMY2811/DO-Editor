@@ -22,6 +22,8 @@ installer/
 !app-icon.png
 !website/assets/app-dark.png
 !website/assets/app-light.png
+!website/assets/app-dark-en.png
+!website/assets/app-light-en.png
 *.jpg
 *.jpeg
 
