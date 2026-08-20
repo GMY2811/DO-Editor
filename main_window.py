@@ -639,6 +639,65 @@ class MainWindow(QMainWindow):
     def current_view(self):
         return self.tabs.currentWidget()
 
+    def _fit_window_to_document(self, page_w, page_h):
+        """打开文档后按页面方向调整主窗口宽高比：竖版文件窗口瘦高，
+        横版文件窗口宽扁。保持窗口面积近似不变，且不超出屏幕可用区域，
+        调整后窗口居中显示（后续用户可随意拖动，不再干预）。"""
+        view = self.current_view()
+        if view is None or page_w <= 0 or page_h <= 0:
+            return
+        # 全屏/最大化状态下不改变窗口形态，避免打断用户的展示场景。
+        if self.isFullScreen() or self.isMaximized():
+            return
+        screen = QApplication.primaryScreen()
+        screen_geo = screen.availableGeometry() if screen else None
+        area = max(400000.0, float(self.width() * self.height()))
+        # 页面宽高比限制在合理范围，避免窗口过于极端。
+        aspect = max(0.55, min(1.9, page_w / page_h))
+        w = int((area * aspect) ** 0.5)
+        h = int((area / aspect) ** 0.5)
+        if screen_geo is not None:
+            sw = max(760, screen_geo.width() - 40)
+            sh = max(560, screen_geo.height() - 40)
+            if w > sw or h > sh:
+                scale = min(sw / w, sh / h)
+                w = int(w * scale)
+                h = int(h * scale)
+        w = max(760, w)
+        h = max(560, h)
+        # 同方向的文档（如竖版→竖版）不重新调整窗口与位置，保留用户
+        # 已拖放的位置；仅当文档方向变化（竖版↔横版）时才调整窗口形态。
+        orientation = "portrait" if aspect < 1.0 else "landscape"
+        if orientation == getattr(self, "_last_doc_orientation", None):
+            return
+        self._last_doc_orientation = orientation
+        # 程序主动调整窗口：抑制 resizeEvent 的宽度适配，布局稳定后
+        # 统一执行整页适配，保证打开后页面完整显示。
+        view._suppress_resize_fit = True
+        self.resize(w, h)
+        # 定位：横版窗口垂直居中；竖版窗口水平居中、垂直偏上（靠上打开），
+        # 底部不超出屏幕。之后用户可自由拖动，不再干预。
+        if screen_geo is not None:
+            x = screen_geo.x() + (screen_geo.width() - w) // 2
+            if aspect < 1.0:
+                y = screen_geo.y() + int(screen_geo.height() * 0.08)
+                y = min(y, screen_geo.y() + screen_geo.height() - h - 20)
+            else:
+                y = screen_geo.y() + (screen_geo.height() - h) // 2
+            self.move(x, y)
+
+        def _after_resize():
+            view._suppress_resize_fit = False
+            # 停掉本次调整触发的适宽定时器，避免其随后覆盖整页适配。
+            view._window_fit_timer.stop()
+            if view.doc is not None:
+                view.fit_page()
+            # 同步视口尺寸基准，防止下一次 resizeEvent 重复触发适配。
+            view._last_viewport_w = view.scroll.viewport().width()
+            view._last_viewport_h = view.scroll.viewport().height()
+
+        QTimer.singleShot(60, _after_resize)
+
     def _new_tab(self):
         view = DocumentView()
         view.openRequested.connect(self.open_pdf)
@@ -648,8 +707,14 @@ class MainWindow(QMainWindow):
         view.securityChanged.connect(
             lambda v=view: self._sync_security_actions(v)
             if v is self.current_view() else None)
+        view.undoAvailableChanged.connect(
+            lambda _available, v=view: self._sync_undo_action(v)
+            if v is self.current_view() else None)
         view.ocrRequested.connect(
             lambda pno, v=view: self.ocr_page(v, pno))
+        view.pageOrientationChanged.connect(
+            lambda pw, ph, v=view: self._fit_window_to_document(pw, ph)
+            if v is self.current_view() else None)
         idx = self.tabs.addTab(view, i18n.tr("untitled"))
         view.set_sidebar_visible(self.sidebar_default_visible)
         self._style_tab_close_button(idx)
@@ -658,6 +723,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(idx)
         self._sync_mode_buttons(view)
         self._sync_security_actions(view)
+        self._sync_undo_action(view)
         return view
 
     def _style_tab_close_button(self, index):
@@ -737,6 +803,7 @@ class MainWindow(QMainWindow):
         if view:
             self._sync_mode_buttons(view)
             self._sync_security_actions(view)
+            self._sync_undo_action(view)
             self._schedule_tab_close_restyle(view)
             if view.file_path:
                 self.setWindowTitle(
@@ -746,10 +813,26 @@ class MainWindow(QMainWindow):
                 self.setWindowTitle(i18n.tr("app_name", cfg.APP_NAME))
         else:
             self._sync_security_actions(None)
+            self._sync_undo_action(None)
 
     def _sync_mode_buttons(self, view):
         for k, act in self.mode_actions.items():
             act.setChecked(k == view.current_mode)
+
+    def _sync_undo_action(self, view):
+        if "undo" in self.act:
+            self.act["undo"].setEnabled(bool(
+                view and view.doc is not None and view.can_undo()))
+
+    def _perform_undo(self):
+        """文本输入控件优先撤销输入，其余情况撤销当前 PDF 编辑。"""
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QLineEdit):
+            focus.undo()
+            return
+        view = self.current_view()
+        if view:
+            view.undo()
 
     def _sync_security_actions(self, view):
         """根据 PDF 权限同步菜单、工具栏和快捷入口。"""
@@ -776,6 +859,9 @@ class MainWindow(QMainWindow):
         for key in ("ocr_current", "ocr_all", "ocr_toolbar"):
             self.act[key].setEnabled(can_modify and can_copy)
         for key in ("security_set", "security_remove", "security_status"):
+            self.act[key].setEnabled(has_doc)
+        # 无文档时这几个动作也跟随整体灰度：保存、适合宽度、侧边栏、幻灯片。
+        for key in ("save", "fit_width", "sidebar", "slideshow"):
             self.act[key].setEnabled(has_doc)
 
         mode_permissions = {
@@ -865,6 +951,10 @@ class MainWindow(QMainWindow):
         mk("close", None, "关闭标签页", shortcut="Ctrl+W",
            triggered=lambda: self._close_tab(self.tabs.currentIndex()))
 
+        mk("undo", None, "撤销", shortcut=QKeySequence.StandardKey.Undo,
+           triggered=self._perform_undo)
+        a["undo"].setEnabled(False)
+
         mk("zoom_in", "zoom_in", "放大", shortcut=QKeySequence.StandardKey.ZoomIn,
            triggered=lambda: self.current_view().zoom_in())
         mk("zoom_out", "zoom_out", "缩小", shortcut=QKeySequence.StandardKey.ZoomOut,
@@ -905,6 +995,8 @@ class MainWindow(QMainWindow):
         mk("sign_lib", "library", "签名库",
            triggered=lambda: self.current_view().open_sign_lib())
         mk("fullscreen", None, "全屏", triggered=self.toggle_fullscreen)
+        mk("slideshow", "slideshow", "幻灯片", shortcut="F5",
+           triggered=lambda: self.current_view().start_slideshow())
         mk("about", None, "关于", triggered=self.about)
 
         self.theme_group = QActionGroup(self)
@@ -953,7 +1045,7 @@ class MainWindow(QMainWindow):
 
     # ================= 工具栏 =================
     def _build_toolbars(self):
-        default_file = ["save", "fit_width", "sidebar"]
+        default_file = ["save", "fit_width", "sidebar", "slideshow"]
         mode_keys = [k for k, _l, _vm, _i in MODE_DEFS[1:]]
         insert_at = mode_keys.index("replace_text") + 1
         default_edit = mode_keys[:insert_at] + ["sign", "sign_lib"] + \
@@ -1236,6 +1328,8 @@ class MainWindow(QMainWindow):
         self._m_file.addAction(self.act["exit"] if "exit" in self.act else self._mk_exit())
 
         self._m_edit = self.menuBar().addMenu(i18n.tr("menu_edit"))
+        self._m_edit.addAction(self.act["undo"])
+        self._m_edit.addSeparator()
         for key, _l, _vm, _i in MODE_DEFS:
             self._m_edit.addAction(self.mode_actions[key])
         self._m_edit.addSeparator()
@@ -1288,6 +1382,7 @@ class MainWindow(QMainWindow):
         self._m_view.addAction(self.act["sidebar"])
         self._m_view.addAction(self.act["sidebar_default"])
         self._m_view.addAction(self.act["fullscreen"])
+        self._m_view.addAction(self.act["slideshow"])
 
         self._m_help = self.menuBar().addMenu(i18n.tr("menu_help"))
         self._m_help.addAction(self.act["about"])
@@ -1441,6 +1536,7 @@ class MainWindow(QMainWindow):
         if view is None or view.doc is None:
             return
         try:
+            view.begin_undo_step(document_change=True)
             inserted = backend.add_ocr_text_layer(view.doc, results)
         except Exception as e:
             QMessageBox.warning(self, "OCR 文字识别", f"写入文字层失败：{e}")
@@ -1957,6 +2053,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, i18n.tr("hint"), i18n.tr("watermark_empty"))
             return
+        view.begin_undo_step(document_change=True)
         backend.add_watermark(view.doc, text, fontsize=fontsize, color=color,
                               opacity=opacity, rotate=rotate, tiled=tiled)
         view.modified = True

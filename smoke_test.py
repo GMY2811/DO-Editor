@@ -140,7 +140,7 @@ def main():
                                    QAbstractItemView, QMenu)
     from PySide6.QtCore import (QPoint, QPointF, QRectF, QEvent, Qt, QSettings,
                                 QTimer, QSize, QSizeF, QEventLoop)
-    from PySide6.QtGui import QColor, QImage, QMouseEvent, QIcon
+    from PySide6.QtGui import QColor, QImage, QMouseEvent, QIcon, QKeySequence
     import icons
     import theme
     from main_window import (MainWindow, AboutDialog, PdfSecurityDialog,
@@ -148,6 +148,7 @@ def main():
     from document_view import DocumentView, ReplaceTextDialog, AddWatermarkDialog
     from sign_dialog import (save_signature, list_signatures, qimage_to_png_bytes,
                              DrawingCanvas, SignatureDialog,
+                             SignatureLibraryDialog,
                              SignatureFontComboBox,
                              text_to_signature_image)
 
@@ -177,6 +178,11 @@ def main():
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     QSettings.setPath(QSettings.Format.IniFormat,
                       QSettings.Scope.UserScope, settings_dir)
+    # Windows 上 QSettings(org, app) 显式构造仍读写注册表（setPath 对显式
+    # 构造不生效）。临时把组织名指向测试专用注册表键，避免断言依赖用户
+    # 历史设置或污染用户数据（进程退出即恢复，无需写回）。
+    import app_config as _cfg
+    _cfg.ORG_NAME = "DOEditorSmokeTest"
 
     for name in icons.ICONS:
         assert not icons.get(name).isNull(), name
@@ -236,6 +242,95 @@ def main():
     assert view.doc is not None
     assert view.page_view.page_count() == 5
     assert view.thumb_list.count() == 5
+    # 每个文档独立维护撤销历史；菜单动作与 Ctrl+Z 使用同一入口。
+    assert win.act["undo"].shortcut() == QKeySequence.StandardKey.Undo
+    assert win.act["undo"] in win._m_edit.actions()
+    assert not view.can_undo()
+    assert not win.act["undo"].isEnabled()
+    view._add_text_object("撤销测试", 0, QPointF(90, 90))
+    assert view.can_undo() and win.act["undo"].isEnabled()
+    assert view.modified and len(view.objects) == 1
+    view.page_view.setFocus()
+    win.act["undo"].trigger()
+    assert not view.objects and not view.modified
+    assert not view.can_undo() and not win.act["undo"].isEnabled()
+
+    view._add_text_object("移动撤销", 0, QPointF(100, 100))
+    moving = view.objects[-1]
+    original_rect = QRectF(moving["rect"])
+    moved_rect = QRectF(original_rect).translated(45, 30)
+    view._on_object_changed(moving["id"], moved_rect)
+    assert moving["rect"] == moved_rect
+    assert view.undo()
+    moving = view.objects[-1]
+    assert moving["rect"] == original_rect
+    assert view.undo()
+    assert not view.objects and not view.modified
+
+    assert view.delete_pages([4], confirm=False)
+    assert len(view.doc) == 4
+    assert view.undo()
+    assert len(view.doc) == 5 and view.thumb_list.count() == 5
+    assert not view.modified
+    print("[OK] Ctrl+Z 撤销对象编辑 + 页面操作")
+
+    # 阅读模式下，文字仍可滑动选择；页面空白与阅读区灰边使用抓手平移。
+    pan_view = DocumentView()
+    assert pan_view.load(sample)
+    pan_page = pan_view.page_view
+    blank_pos = QPointF(320, 420)
+    assert not pan_page._point_hits_text(blank_pos)
+    pan_deltas = []
+    pan_page.panRequested.connect(lambda delta: pan_deltas.append(QPointF(delta)))
+    blank_press = QMouseEvent(
+        QEvent.Type.MouseButtonPress, blank_pos, QPointF(100, 100),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier)
+    pan_page.mousePressEvent(blank_press)
+    assert pan_page._pan_last is not None
+    blank_move = QMouseEvent(
+        QEvent.Type.MouseMove, blank_pos + QPointF(24, 18),
+        QPointF(124, 118),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier)
+    pan_page.mouseMoveEvent(blank_move)
+    assert pan_deltas and pan_deltas[-1] == QPointF(24, 18)
+    blank_release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease, blank_pos + QPointF(24, 18),
+        QPointF(124, 118),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier)
+    pan_page.mouseReleaseEvent(blank_release)
+    assert pan_page._pan_last is None
+
+    first_word = pan_view.doc[0].get_text("words")[0]
+    text_pos = QPointF(
+        (first_word[0] + first_word[2]) / 2 * pan_view.zoom,
+        pan_page._offsets[0] +
+        (first_word[1] + first_word[3]) / 2 * pan_view.zoom)
+    assert pan_page._point_hits_text(text_pos)
+    text_press = QMouseEvent(
+        QEvent.Type.MouseButtonPress, text_pos, QPointF(200, 200),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier)
+    pan_page.mousePressEvent(text_press)
+    assert pan_page._selecting and pan_page._pan_last is None
+    pan_page.clear_selection()
+
+    margin_press = QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPointF(4, 4), QPointF(300, 300),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier)
+    assert pan_view.eventFilter(pan_view.scroll.viewport(), margin_press)
+    assert pan_view._viewport_pan_last is not None
+    margin_release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease, QPointF(4, 4), QPointF(300, 300),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier)
+    assert pan_view.eventFilter(pan_view.scroll.viewport(), margin_release)
+    assert pan_view._viewport_pan_last is None
+    pan_view.close_doc()
+    print("[OK] 阅读区空白抓手自由拖动 + 文字选择保留")
     first_thumb_icon = view.thumb_list.item(0).icon()
     normal_thumb = first_thumb_icon.pixmap(
         view.thumb_list.iconSize(), QIcon.Mode.Normal).toImage()
@@ -436,6 +531,12 @@ def main():
     security_view.set_pdf_encryption(
         "reader", "owner-secret",
         backend.pdf_permissions(True, False, True, True))
+    assert security_view.security_status() == "pending_encrypt"
+    assert security_view.undo()
+    assert security_view.security_status() == "plain"
+    security_view.set_pdf_encryption(
+        "reader", "owner-secret",
+        backend.pdf_permissions(True, False, True, True))
     security_view._save_to(security_output)
     assert security_view.security_status() == "encrypted"
     assert security_view._auth_level & 2
@@ -460,6 +561,9 @@ def main():
     assert win.act["copy_all"].isEnabled()
     security_view.remove_pdf_encryption()
     assert security_view.security_status() == "pending_remove"
+    assert security_view.undo()
+    assert security_view.security_status() == "encrypted"
+    security_view.remove_pdf_encryption()
     security_view._save_to(security_output)
     plain_check = backend.open_pdf(security_output)
     assert not plain_check._do_was_encrypted
@@ -743,6 +847,45 @@ def main():
     os.environ["APPDATA"] = tmp_dir
     save_signature(qimage_to_png_bytes(img), "测试签名")
     assert len(list_signatures()) == 1
+    original_signature = QImage(
+        317, 129, QImage.Format.Format_ARGB32_Premultiplied)
+    original_signature.fill(QColor(20, 60, 180, 220))
+    import_dialog = SignatureDialog()
+    import_dialog._set_imported_image(original_signature)
+    assert import_dialog.is_imported_image()
+    assert import_dialog.result_image().size() == QSize(317, 129)
+    assert import_dialog._preview.pixmap().size() != QSize(317, 129)
+    save_signature(
+        qimage_to_png_bytes(import_dialog.result_image()), "原尺寸签名")
+    saved_signature = QImage(dict(list_signatures())["原尺寸签名"])
+    assert saved_signature.size() == QSize(317, 129)
+
+    library = SignatureLibraryDialog()
+    library_item = next(
+        library._list.item(i) for i in range(library._list.count())
+        if library._list.item(i).text() == "原尺寸签名")
+    library._list.setCurrentItem(library_item)
+    library._confirm()
+    assert library.result_image().size() == QSize(317, 129)
+
+    signature_size_view = DocumentView()
+    assert signature_size_view.load(sample)
+    signature_image = library.result_image()
+    expected_width = signature_size_view._image_placement_width(
+        signature_image, 0)
+    _, _, direct_image_width = signature_size_view._default_image_placement(
+        signature_image)
+    assert abs(expected_width - direct_image_width) < 0.01
+    signature_size_view._prepare_sign(
+        signature_image, match_image_scale=True)
+    signature_size_view._on_point(0, QPointF(30, 30))
+    placed_signature = signature_size_view.objects[-1]
+    expected_height = expected_width * 129 / 317
+    assert abs(placed_signature["rect"].width() - expected_width) < 0.01
+    assert abs(placed_signature["rect"].height() - expected_height) < 0.01
+    signature_size_view._bake_objects()
+    signature_size_view.close_doc()
+    print("[OK] 导入图片签名 + 签名库原图存储与页面等比缩放")
     print("[OK] 签名库")
 
     view.modified = False

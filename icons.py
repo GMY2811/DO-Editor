@@ -21,6 +21,7 @@ _ACCENT_LIGHT = {
     "ink": "#6755b5", "color": "#d15d2f", "image": "#168068",
     "ocr": "#5368c9", "ocr_all": "#6757c8",
     "trash": "#cf4545", "select": "#3e63c7",
+    "slideshow": "#0e8a5f",
 }
 _ACCENT_DARK = {
     "open": "#69adff", "save": "#69adff", "fit_width": "#69adff",
@@ -32,6 +33,7 @@ _ACCENT_DARK = {
     "ink": "#b7a4ff", "color": "#ff9a66", "image": "#62d5af",
     "ocr": "#9caeff", "ocr_all": "#b7a5ff",
     "trash": "#ff746f", "select": "#91adff",
+    "slideshow": "#4ecf96",
 }
 _WIDE_ICONS = frozenset(_ACCENT_LIGHT)
 
@@ -66,6 +68,30 @@ def _build(draw, s=24):
             pixmap.setDevicePixelRatio(dpr)
             icon.addPixmap(pixmap, QIcon.Mode.Normal, state)
             icon.addPixmap(pixmap, QIcon.Mode.Active, state)
+    # 禁用状态：使用中灰色 + 半透明描边，强制所有图标在 disabled 时
+    # 视觉一致地灰度化，避免彩色图标（尤其绿/青色调）看起来仍鲜艳。
+    disabled_color = QColor(170, 176, 184, 210)
+    for state in (QIcon.State.Off, QIcon.State.On):
+        for dpr in (1, 2, 3):
+            img = QImage(width * dpr, s * dpr,
+                         QImage.Format.Format_ARGB32)
+            img.fill(Qt.GlobalColor.transparent)
+            p = QPainter(img)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.scale(dpr, dpr)
+            p.setPen(QPen(disabled_color, 2.0, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap,
+                          Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if _CURRENT_WIDE:
+                p.translate(width / 2, s / 2)
+                p.scale(1.20, 1.0)
+                p.translate(-s / 2, -s / 2)
+            draw(p, s)
+            p.end()
+            pixmap = QPixmap.fromImage(img)
+            pixmap.setDevicePixelRatio(dpr)
+            icon.addPixmap(pixmap, QIcon.Mode.Disabled, state)
     return icon
 
 
@@ -409,6 +435,15 @@ def icon_sidebar():
     return _build(d)
 
 
+def icon_slideshow():
+    """幻灯片放映：播放三角 + 幕布底条。"""
+    def d(p, s):
+        p.drawPolygon([QPointF(7, 5), QPointF(18.5, 11.5),
+                       QPointF(7, 18)])
+        _line(p, 4.5, 20.5, 19.5, 20.5)
+    return _build(d)
+
+
 def icon_color():
     """调色板图标，用于编辑工具颜色选择。"""
     def d(p, s):
@@ -430,6 +465,7 @@ ICONS = {
     "zoom_out": icon_zoom_out,
     "fit_width": icon_fit_width,
     "sidebar": icon_sidebar,
+    "slideshow": icon_slideshow,
     "select": icon_select,
     "highlight": icon_highlight,
     "underline": icon_underline,

@@ -1,5 +1,6 @@
 """单个文档的视图：连续滚动页面 + 缩略图侧栏 + 编辑逻辑。"""
 import os
+import copy
 import pymupdf
 from PySide6.QtCore import (Qt, QSize, QRect, QRectF, QPointF, Signal, QEvent,
                             QTimer, QItemSelectionModel)
@@ -19,6 +20,7 @@ import i18n
 from page_view import PageView
 from sign_dialog import (SignatureDialog, SignatureLibraryDialog,
                          SignatureFontComboBox, qimage_to_png_bytes)
+from slide_show import SlideShowWindow
 
 MODE_DEFS = [
     ("view",         "选择",     "view",  "select"),
@@ -274,7 +276,9 @@ class DocumentView(QWidget):
     pageChanged = Signal(int, int)
     openRequested = Signal()
     securityChanged = Signal()
+    undoAvailableChanged = Signal(bool)
     ocrRequested = Signal(int)
+    pageOrientationChanged = Signal(float, float)   # (页面宽, 页面高)，供主窗口调整窗口方向
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -288,6 +292,7 @@ class DocumentView(QWidget):
         self._obj_counter = 0
         self.pending_image_qimg = None
         self.pending_sign_qimg = None
+        self.pending_sign_match_image_scale = False
         self.pending_paste_text = None
         self.pending_note_text = None
         self.mode_actions = {}
@@ -298,6 +303,22 @@ class DocumentView(QWidget):
         self._security_options = None
         self._open_password = None
         self._auth_level = 0
+        self._viewport_pan_last = None
+        self._undo_stack = []
+        self._undo_pdf_cache = None
+        self._undo_limit = 20
+        self._undo_memory_limit = 128 * 1024 * 1024
+        # 窗口尺寸变化时的整页适配节流定时器（保持阅读区完整显示）。
+        self._window_fit_timer = QTimer(self)
+        self._window_fit_timer.setSingleShot(True)
+        self._window_fit_timer.setInterval(150)
+        self._window_fit_timer.timeout.connect(
+            lambda: self.fit_page(preserve_position=True))
+        self._last_viewport_w = 0
+        self._last_viewport_h = 0
+        # 主窗口按文档方向调整自身大小时置位，抑制随后的 resizeEvent 适宽，
+        # 由主窗口在布局稳定后统一执行整页适配。
+        self._suppress_resize_fit = False
         self._build_ui()
 
     # ================= UI =================
@@ -449,7 +470,7 @@ class DocumentView(QWidget):
         self._sidebar_fit_timer.setSingleShot(True)
         self._sidebar_fit_timer.setInterval(32)
         self._sidebar_fit_timer.timeout.connect(
-            self._fit_width_after_sidebar_resize)
+            self._fit_page_after_sidebar_resize)
         self._splitter.splitterMoved.connect(
             lambda _pos, _index: self._schedule_content_fit())
 
@@ -465,7 +486,9 @@ class DocumentView(QWidget):
         self.page_view.objectSelected.connect(self._on_object_selected)
         self.page_view.objectDoubleClicked.connect(self._on_object_double_clicked)
         self.page_view.contextMenuRequested.connect(self._on_context_menu)
+        self.page_view.panRequested.connect(self._pan_document)
 
+        self.scroll.viewport().setMouseTracking(True)
         self.scroll.viewport().installEventFilter(self)
 
     # ================= 打开 / 保存 =================
@@ -488,14 +511,20 @@ class DocumentView(QWidget):
         self._security_options = None
         self._open_password = password
         self._auth_level = int(getattr(doc, "_do_auth_level", 0))
+        self._clear_undo_history()
         self.objects = []
         self._obj_counter = 0
         self.titleChanged.emit(os.path.basename(path))
         self.workspace_stack.setCurrentWidget(self.scroll)
         self._refresh()
         self._rebuild_thumbnails()
-        self.fit_width()
+        self.fit_page()
         self.set_mode("view")
+        try:
+            pw, ph = backend.page_size(doc, 0)
+        except Exception:
+            pw, ph = 595.0, 842.0
+        self.pageOrientationChanged.emit(float(pw), float(ph))
         self.securityChanged.emit()
         return True
 
@@ -509,6 +538,7 @@ class DocumentView(QWidget):
         self._obj_counter = 0
         self.pending_image_qimg = None
         self.pending_sign_qimg = None
+        self.pending_sign_match_image_scale = False
         self.pending_paste_text = None
         self.pending_note_text = None
         self._source_encrypted = False
@@ -516,8 +546,11 @@ class DocumentView(QWidget):
         self._security_options = None
         self._open_password = None
         self._auth_level = 0
+        self._clear_undo_history()
         self.titleChanged.emit(i18n.tr("untitled"))
         self.page_view.set_document(None, 1.0, 1.0)
+        self._viewport_pan_last = None
+        self.scroll.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         self.thumb_list.clear()
         self.workspace_stack.setCurrentIndex(0)
         self.pageChanged.emit(0, 0)
@@ -570,6 +603,11 @@ class DocumentView(QWidget):
             self.doc = backend.open_pdf(path, reopen_password)
             self.file_path = path
             self.modified = False
+            # 保存后的当前状态成为新基准；撤销到任何历史状态都应重新
+            # 标记为“未保存”，否则关闭标签页时不会提示用户保存。
+            for state in self._undo_stack:
+                state["modified"] = True
+            self._undo_pdf_cache = None
             self._source_encrypted = bool(
                 getattr(self.doc, "_do_was_encrypted", False))
             self._security_mode = "keep" if self._source_encrypted else "none"
@@ -585,6 +623,7 @@ class DocumentView(QWidget):
             QMessageBox.critical(self, "错误", f"保存失败：\n{e}")
 
     def set_pdf_encryption(self, user_pw, owner_pw, permissions):
+        self.begin_undo_step()
         self._security_mode = "aes256"
         self._security_options = {
             "user_pw": user_pw,
@@ -595,6 +634,7 @@ class DocumentView(QWidget):
         self.securityChanged.emit()
 
     def remove_pdf_encryption(self):
+        self.begin_undo_step()
         self._security_mode = "none"
         self._security_options = None
         self.modified = True
@@ -625,6 +665,136 @@ class DocumentView(QWidget):
             return True
         self.statusMessage.emit(f"文档安全设置禁止{operation}", 4000)
         return False
+
+    # ================= 撤销 =================
+    @staticmethod
+    def _clone_undo_value(value):
+        """复制浮动编辑对象，显式处理 Qt 值类型以保持快照独立。"""
+        if isinstance(value, QRectF):
+            return QRectF(value)
+        if isinstance(value, QPointF):
+            return QPointF(value)
+        if isinstance(value, QColor):
+            return QColor(value)
+        if isinstance(value, QImage):
+            return value.copy()
+        if isinstance(value, dict):
+            return {k: DocumentView._clone_undo_value(v)
+                    for k, v in value.items()}
+        if isinstance(value, list):
+            return [DocumentView._clone_undo_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(DocumentView._clone_undo_value(v) for v in value)
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
+    def _clear_undo_history(self):
+        self._undo_stack = []
+        self._undo_pdf_cache = None
+        self.undoAvailableChanged.emit(False)
+
+    def can_undo(self):
+        return bool(self._undo_stack)
+
+    def _snapshot_pdf(self):
+        if self._undo_pdf_cache is None:
+            # 保留原加密设置。这样撤销不会意外把受保护文档变成明文。
+            self._undo_pdf_cache = self.doc.tobytes(
+                garbage=3, deflate=True,
+                encryption=pymupdf.PDF_ENCRYPT_KEEP)
+        return self._undo_pdf_cache
+
+    def _trim_undo_history(self):
+        while len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        while len(self._undo_stack) > 1:
+            unique = {}
+            for state in self._undo_stack:
+                blob = state["pdf"]
+                unique[id(blob)] = len(blob)
+            if sum(unique.values()) <= self._undo_memory_limit:
+                break
+            self._undo_stack.pop(0)
+
+    def begin_undo_step(self, document_change=False):
+        """在一次内容修改前记录状态；返回是否成功记录。"""
+        if self.doc is None:
+            return False
+        try:
+            state = {
+                "pdf": self._snapshot_pdf(),
+                "objects": self._clone_undo_value(self.objects),
+                "obj_counter": self._obj_counter,
+                "modified": self.modified,
+                "page": self.page_view.current_page(),
+                "security_mode": self._security_mode,
+                "security_options": self._clone_undo_value(
+                    self._security_options),
+                "source_encrypted": self._source_encrypted,
+                "open_password": self._open_password,
+                "auth_level": self._auth_level,
+            }
+        except Exception as exc:
+            self.statusMessage.emit(f"无法记录撤销状态：{exc}", 4000)
+            return False
+        self._undo_stack.append(state)
+        self._trim_undo_history()
+        if document_change:
+            # 后续操作会直接改写 PyMuPDF 文档，下一次快照必须重新生成。
+            self._undo_pdf_cache = None
+        self.undoAvailableChanged.emit(True)
+        return True
+
+    def undo(self):
+        if not self._undo_stack or self.doc is None:
+            self.statusMessage.emit(i18n.tr("nothing_to_undo"), 2000)
+            return False
+        state = self._undo_stack.pop()
+        try:
+            restored = pymupdf.open(stream=state["pdf"], filetype="pdf")
+            password = state.get("open_password")
+            if restored.needs_pass and password:
+                restored.authenticate(password)
+            self.doc.close()
+            self.doc = restored
+            self.objects = self._clone_undo_value(state["objects"])
+            self._obj_counter = int(state["obj_counter"])
+            self.modified = bool(state["modified"])
+            self._security_mode = state["security_mode"]
+            self._security_options = self._clone_undo_value(
+                state["security_options"])
+            self._source_encrypted = bool(state["source_encrypted"])
+            self._open_password = password
+            self._auth_level = int(state["auth_level"])
+            self._undo_pdf_cache = state["pdf"]
+            self.pending_image_qimg = None
+            self.pending_sign_qimg = None
+            self.pending_sign_match_image_scale = False
+            self.pending_paste_text = None
+            self.pending_note_text = None
+            self._search_results = []
+            self.page_view.clear_search_highlights()
+            self._close_inline_editor()
+            self.set_mode("view")
+            self._refresh()
+            self._rebuild_thumbnails()
+            target = max(0, min(int(state["page"]), len(self.doc) - 1))
+            self.show_page(target)
+            self.thumb_list.setCurrentRow(target)
+            self.pageChanged.emit(target, len(self.doc))
+            self.securityChanged.emit()
+            self.undoAvailableChanged.emit(bool(self._undo_stack))
+            self.statusMessage.emit(i18n.tr("undo_done"), 2500)
+            return True
+        except Exception as exc:
+            # 恢复失败时把快照放回，允许用户再次尝试且不丢历史。
+            self._undo_stack.append(state)
+            self.undoAvailableChanged.emit(True)
+            QMessageBox.warning(self, i18n.tr("undo"),
+                                f"{i18n.tr('undo_failed')}\n{exc}")
+            return False
 
     def _bake_objects(self):
         for obj in self.objects:
@@ -721,6 +891,23 @@ class DocumentView(QWidget):
             return
         self.scroll.verticalScrollBar().setValue(self.page_view.scroll_to_page(pno))
 
+    def start_slideshow(self):
+        """从当前页开始全屏幻灯片放映。"""
+        if self.doc is None:
+            self.statusMessage.emit(i18n.tr("slideshow_open_first"), 0)
+            return
+        self._slide_window = SlideShowWindow(
+            self.doc, self.page_view.current_page(), self.window())
+        self._slide_window.closed.connect(self._on_slideshow_closed)
+        self._slide_window.showFullScreen()
+        self._slide_window.activateWindow()
+
+    def _on_slideshow_closed(self):
+        win = getattr(self, "_slide_window", None)
+        if win is not None:
+            win.closed.disconnect(self._on_slideshow_closed)
+            self._slide_window = None
+
     def next_page(self):
         self.show_page(self.page_view.current_page() + 1)
 
@@ -733,6 +920,26 @@ class DocumentView(QWidget):
     def zoom_out(self):
         self._set_zoom(self.zoom / 1.25)
 
+    def fit_page(self, preserve_position=False):
+        """整页适配：使当前页完整显示在阅读区（宽度和高度都约束）。
+        页面顶部对齐视口顶部、底部填满视口，下一页完全在视口之外，
+        既无底部空隙横条，也不会露出下一页内容。"""
+        if self.doc is None:
+            return
+        keep = self.page_view.current_page()
+        page_offset = None
+        if preserve_position:
+            old_page_top = self.page_view.scroll_to_page(keep)
+            old_scroll = self.scroll.verticalScrollBar().value()
+            page_offset = max(0.0, old_scroll - old_page_top) / max(
+                0.1, self.zoom)
+        w, h = backend.page_size(self.doc, keep)
+        vw = max(200, self.scroll.viewport().width() - 40)
+        # 高度约束直接填满视口：页面底平齐视口底，下一页（在下方 18px
+        # 间距处）完全位于视口之外，不露出、也无底部空隙带。
+        vh = max(200, self.scroll.viewport().height())
+        self._set_zoom(min(vw / w, vh / h), page_offset)
+
     def fit_width(self, preserve_position=False):
         if self.doc is None:
             return
@@ -743,7 +950,8 @@ class DocumentView(QWidget):
             old_scroll = self.scroll.verticalScrollBar().value()
             page_offset = max(0.0, old_scroll - old_page_top) / max(
                 0.1, self.zoom)
-        w, _h = backend.page_size(self.doc, 0)
+        # 以当前页宽度为准，保证「当前页在阅读区完整显示」。
+        w, _h = backend.page_size(self.doc, keep)
         vw = max(200, self.scroll.viewport().width() - 40)
         self._set_zoom(vw / w, page_offset)
 
@@ -779,9 +987,9 @@ class DocumentView(QWidget):
             QTimer.singleShot(0, self._update_thumbnail_layout)
         if changed and self.doc is not None:
             # 0ms 处理当前布局，80ms 覆盖 Windows/高 DPI 下稍晚完成的
-            # splitter 尺寸更新，保证页面最终使用真实剩余宽度。
-            QTimer.singleShot(0, self.fit_width)
-            QTimer.singleShot(80, self.fit_width)
+            # splitter 尺寸更新，保证页面最终整页完整显示。
+            QTimer.singleShot(0, self.fit_page)
+            QTimer.singleShot(80, self.fit_page)
 
     def _set_sidebar_splitter_width(self, width):
         if self.side_tabs.isHidden():
@@ -804,15 +1012,30 @@ class DocumentView(QWidget):
         QTimer.singleShot(0, self._update_thumbnail_layout)
 
     def _schedule_content_fit(self):
-        """节流侧边栏拖动触发的正文适宽，兼顾实时反馈和渲染性能。"""
+        """节流侧边栏拖动触发的正文整页适配，兼顾实时反馈和渲染性能。"""
         if self.doc is None or self.side_tabs.isHidden():
             return
         if not self._sidebar_fit_timer.isActive():
             self._sidebar_fit_timer.start()
 
-    def _fit_width_after_sidebar_resize(self):
+    def _fit_page_after_sidebar_resize(self):
         if self.doc is not None and not self.side_tabs.isHidden():
-            self.fit_width(preserve_position=True)
+            self.fit_page(preserve_position=True)
+
+    def resizeEvent(self, event):
+        """窗口尺寸变化时整页适配（节流），保持当前页完整显示。
+        宽、高任一方向变化都会触发，支持单独拖拽窗口边缘。"""
+        super().resizeEvent(event)
+        if self.doc is None or self._suppress_resize_fit:
+            return
+        new_w = self.scroll.viewport().width()
+        new_h = self.scroll.viewport().height()
+        if abs(new_w - self._last_viewport_w) >= 24 or \
+                abs(new_h - self._last_viewport_h) >= 24:
+            self._last_viewport_w = new_w
+            self._last_viewport_h = new_h
+            if not self._window_fit_timer.isActive():
+                self._window_fit_timer.start()
 
     def _update_thumbnail_layout(self):
         """按侧边栏实际可用宽度等比例调整缩略图和项目网格。"""
@@ -936,6 +1159,7 @@ class DocumentView(QWidget):
         old_current = self.page_view.current_page()
         old_to_new = {old_page: new_page
                       for new_page, old_page in enumerate(order)}
+        self.begin_undo_step(document_change=True)
         try:
             self.doc.select(order)
         except Exception as exc:
@@ -1083,6 +1307,7 @@ class DocumentView(QWidget):
         y = max(page_rect.y0, min(page_rect.y1 - marker_size, pt.y()))
         note_color = QColor("#ff9f0a")
         image = self._note_marker_image(note_color)
+        self.begin_undo_step()
         self._obj_counter += 1
         self.objects.append({
             "id": self._obj_counter,
@@ -1183,6 +1408,7 @@ class DocumentView(QWidget):
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 text, fontsize, color, fontfamily, bold, italic = dlg.result()
                 if text.strip():
+                    self.begin_undo_step(document_change=True)
                     # 删除原文字
                     backend.redact_rect(self.doc[page], r)
                     # 创建可拖动的浮动文本对象（保存时烘焙进 PDF）
@@ -1254,6 +1480,7 @@ class DocumentView(QWidget):
                  (p.y() - rect.y()) / rect.height())
                 for p in points
             ]
+        self.begin_undo_step()
         self._obj_counter += 1
         self.objects.append({
             "id": self._obj_counter,
@@ -1286,8 +1513,13 @@ class DocumentView(QWidget):
             self._add_object(self.pending_image_qimg, "image", page, pt, 160.0)
             self.pending_image_qimg = None
         elif m == "sign" and self.pending_sign_qimg is not None:
-            self._add_object(self.pending_sign_qimg, "signature", page, pt, 180.0)
+            base_width = (
+                self._image_placement_width(self.pending_sign_qimg, page)
+                if self.pending_sign_match_image_scale else 180.0)
+            self._add_object(
+                self.pending_sign_qimg, "signature", page, pt, base_width)
             self.pending_sign_qimg = None
+            self.pending_sign_match_image_scale = False
         elif m == "note" and self.pending_note_text:
             self._add_note_at(self.pending_note_text, page, pt)
         elif m == "paste" and self.pending_paste_text:
@@ -1500,6 +1732,7 @@ class DocumentView(QWidget):
                     self.delete_object(oid)
                 return
             if existing is not None:
+                self.begin_undo_step()
                 existing["text"] = text
                 existing["fontfamily"] = family
                 existing["fontsize"] = size
@@ -1542,6 +1775,7 @@ class DocumentView(QWidget):
     def _add_object(self, img, kind, page, pt, base_w):
         aspect = img.height() / max(1, img.width())
         h = base_w * aspect
+        self.begin_undo_step()
         self._obj_counter += 1
         self.objects.append({
             "id": self._obj_counter, "page": page,
@@ -1557,6 +1791,7 @@ class DocumentView(QWidget):
                          bold=False, italic=False, keep_mode=False):
         rect = self._measure_text_rect(text, fontfamily, fontsize, bold, italic)
         rect.moveTo(pt.x(), pt.y())
+        self.begin_undo_step()
         self._obj_counter += 1
         self.objects.append({
             "id": self._obj_counter, "page": page,
@@ -1597,6 +1832,9 @@ class DocumentView(QWidget):
                 self.permission_allowed(pymupdf.PDF_PERM_ANNOTATE)):
             self.statusMessage.emit("文档安全设置禁止删除对象", 4000)
             return
+        if self._find_object(oid) is None:
+            return
+        self.begin_undo_step()
         self.objects = [o for o in self.objects if o["id"] != oid]
         self.modified = True
         self._refresh_objects()
@@ -1629,6 +1867,7 @@ class DocumentView(QWidget):
             obj.get("text", ""))
         text = text.strip()
         if ok and text:
+            self.begin_undo_step()
             obj["text"] = text
             self.modified = True
             self.page_view.select(oid)
@@ -1650,6 +1889,7 @@ class DocumentView(QWidget):
         c = QColorDialog.getColor(obj.get("color") or QColor(self.edit_color),
                                   self, "选择文字颜色")
         if c.isValid():
+            self.begin_undo_step()
             obj["color"] = c
             self.modified = True
             self._refresh_objects()
@@ -1665,6 +1905,7 @@ class DocumentView(QWidget):
         c = QColorDialog.getColor(obj.get("color") or QColor(self.edit_color),
                                   self, "选择标注颜色")
         if c.isValid():
+            self.begin_undo_step()
             obj["color"] = QColor(c)
             self.edit_color = QColor(c)
             self.modified = True
@@ -1675,16 +1916,27 @@ class DocumentView(QWidget):
     def _refresh_objects(self):
         self.page_view.set_objects(self._objects_for_current_page())
 
-    def _on_object_changed(self, oid, rect):
+    def _on_object_changed(self, oid, rect, old_rect=None):
         if not (self.permission_allowed(pymupdf.PDF_PERM_MODIFY) or
                 self.permission_allowed(pymupdf.PDF_PERM_ANNOTATE)):
             self.statusMessage.emit("文档安全设置禁止移动或缩放对象", 4000)
             self._refresh_objects()
             return
-        for o in self.objects:
-            if o["id"] == oid:
-                o["rect"] = rect
-                break
+        obj = self._find_object(oid)
+        if obj is None:
+            return
+        new_rect = QRectF(rect)
+        if old_rect is not None:
+            old_rect = QRectF(old_rect)
+            if old_rect == new_rect:
+                return
+            # PageView 与此处共享对象字典，鼠标拖动时对象已是新矩形。
+            # 临时恢复旧值后记录，保证撤销回到拖动开始的位置。
+            obj["rect"] = old_rect
+            self.begin_undo_step()
+        elif QRectF(obj["rect"]) != new_rect:
+            self.begin_undo_step()
+        obj["rect"] = new_rect
         self.modified = True
 
     def _on_object_selected(self, oid):
@@ -1805,6 +2057,7 @@ class DocumentView(QWidget):
 
     def _cancel_placement(self):
         self.pending_sign_qimg = None
+        self.pending_sign_match_image_scale = False
         self.pending_image_qimg = None
         self.pending_paste_text = None
         self.pending_note_text = None
@@ -1826,6 +2079,11 @@ class DocumentView(QWidget):
                 permission, operation):
             key = "view"
         self.current_mode = key
+        self._viewport_pan_last = None
+        self.scroll.viewport().setCursor(
+            Qt.CursorShape.OpenHandCursor
+            if key == "view" and self.doc is not None
+            else Qt.CursorShape.ArrowCursor)
         self._close_inline_editor()
         for k, act in self.mode_actions.items():
             act.setChecked(k == key)
@@ -1850,6 +2108,7 @@ class DocumentView(QWidget):
             oid = self.page_view.selected_id()
             obj = self._find_object(oid) if oid is not None else None
             if obj is not None and obj.get("kind") in ANNOTATION_OBJECT_KINDS:
+                self.begin_undo_step()
                 obj["color"] = QColor(c)
                 self.modified = True
                 self._refresh_objects()
@@ -1887,10 +2146,7 @@ class DocumentView(QWidget):
         page = max(0, min(self.page_view.current_page(), len(self.doc) - 1))
         page_rect = self.doc[page].rect
         aspect = img.height() / max(1, img.width())
-        width = min(160.0, page_rect.width * 0.42)
-        if aspect > 0:
-            width = min(width, page_rect.height * 0.46 / aspect)
-        width = max(24.0, width)
+        width = self._image_placement_width(img, page)
         height = width * aspect
         x = page_rect.x0 + max(0.0, (page_rect.width - width) / 2)
         # 工具栏和菜单插入时置于页面上部中央，既醒目又留出页边距。
@@ -1898,6 +2154,16 @@ class DocumentView(QWidget):
         y = min(page_rect.y1 - height,
                 page_rect.y0 + top_margin)
         return page, QPointF(x, y), width
+
+    def _image_placement_width(self, img, page):
+        """返回与“插入图片”一致的等比初始显示宽度。"""
+        page = max(0, min(int(page), len(self.doc) - 1))
+        page_rect = self.doc[page].rect
+        aspect = img.height() / max(1, img.width())
+        width = min(160.0, page_rect.width * 0.42)
+        if aspect > 0:
+            width = min(width, page_rect.height * 0.46 / aspect)
+        return max(24.0, width)
 
     def start_sign(self):
         if not self._require_permission(pymupdf.PDF_PERM_ANNOTATE, "添加签名"):
@@ -1908,7 +2174,7 @@ class DocumentView(QWidget):
         img = dlg.result_image()
         if img is None or img.isNull():
             return
-        self._prepare_sign(img)
+        self._prepare_sign(img, match_image_scale=dlg.is_imported_image())
 
     def open_sign_lib(self):
         if not self._require_permission(pymupdf.PDF_PERM_ANNOTATE, "添加签名"):
@@ -1919,10 +2185,12 @@ class DocumentView(QWidget):
         img = dlg.result_image()
         if img is None or img.isNull():
             return
-        self._prepare_sign(img)
+        # 签名库保存原图；放入页面时采用与“插入图片”相同的等比缩放。
+        self._prepare_sign(img, match_image_scale=True)
 
-    def _prepare_sign(self, img):
-        self.pending_sign_qimg = img
+    def _prepare_sign(self, img, match_image_scale=False):
+        self.pending_sign_qimg = img.copy()
+        self.pending_sign_match_image_scale = bool(match_image_scale)
         self.current_mode = "sign"
         self._check_none()
         self.page_view.set_mode("point")
@@ -1962,6 +2230,7 @@ class DocumentView(QWidget):
         current = self.page_view.current_page()
         target = current - sum(1 for p in page_set if p < current)
         target = max(0, min(target, len(self.doc) - len(page_set) - 1))
+        self.begin_undo_step(document_change=True)
         for pno in sorted(page_set, reverse=True):
             self.doc.delete_page(pno)
 
@@ -2023,13 +2292,49 @@ class DocumentView(QWidget):
             painter.end()
 
     # ================= 事件过滤器 =================
+    def _pan_document(self, delta):
+        """按抓手拖动方向同步平移水平和垂直滚动条。"""
+        if self.doc is None:
+            return
+        hbar = self.scroll.horizontalScrollBar()
+        vbar = self.scroll.verticalScrollBar()
+        hbar.setValue(hbar.value() - int(round(delta.x())))
+        vbar.setValue(vbar.value() - int(round(delta.y())))
+
     def eventFilter(self, obj, event):
-        if obj is self.scroll.viewport() and event.type() == QEvent.Type.Wheel:
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                delta = event.angleDelta().y()
-                if delta > 0:
-                    self.zoom_in()
-                else:
-                    self.zoom_out()
+        if obj is self.scroll.viewport():
+            if event.type() == QEvent.Type.Wheel:
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    delta = event.angleDelta().y()
+                    if delta > 0:
+                        self.zoom_in()
+                    else:
+                        self.zoom_out()
+                    return True
+            elif event.type() == QEvent.Type.MouseButtonPress and \
+                    event.button() == Qt.MouseButton.LeftButton and \
+                    self.doc is not None and self.current_mode == "view":
+                # PageView 之外的灰色边缘同样可以抓住拖动。
+                self._viewport_pan_last = QPointF(event.globalPosition())
+                self.scroll.viewport().setCursor(
+                    Qt.CursorShape.ClosedHandCursor)
+                return True
+            elif event.type() == QEvent.Type.MouseMove and \
+                    self._viewport_pan_last is not None:
+                if not (event.buttons() & Qt.MouseButton.LeftButton):
+                    self._viewport_pan_last = None
+                    self.scroll.viewport().setCursor(
+                        Qt.CursorShape.OpenHandCursor)
+                    return True
+                global_pos = QPointF(event.globalPosition())
+                self._pan_document(global_pos - self._viewport_pan_last)
+                self._viewport_pan_last = global_pos
+                return True
+            elif event.type() == QEvent.Type.MouseButtonRelease and \
+                    event.button() == Qt.MouseButton.LeftButton and \
+                    self._viewport_pan_last is not None:
+                self._viewport_pan_last = None
+                self.scroll.viewport().setCursor(
+                    Qt.CursorShape.OpenHandCursor)
                 return True
         return super().eventFilter(obj, event)

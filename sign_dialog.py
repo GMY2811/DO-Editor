@@ -222,6 +222,7 @@ class SignatureDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(i18n.tr("sign_title"))
         self._image = None
+        self._imported_image = False
         self._canvas = DrawingCanvas()
 
         self._preview = QLabel("（可手写、导入图片，或输入文字生成签名）")
@@ -339,6 +340,7 @@ class SignatureDialog(QDialog):
             bold=self._bold_check.isChecked(),
             italic=self._italic_check.isChecked())
         self._image = img
+        self._imported_image = False
         self._canvas.clear()
         self._show_preview(img)
 
@@ -361,6 +363,7 @@ class SignatureDialog(QDialog):
 
     def _clear_signature(self):
         self._image = None
+        self._imported_image = False
         self._canvas.clear()
         self._preview.setPixmap(QPixmap())
         self._preview.setText("（可手写、导入图片，或输入文字生成签名）")
@@ -381,8 +384,15 @@ class SignatureDialog(QDialog):
         if img.isNull():
             QMessageBox.warning(self, "提示", "无法读取该图片")
             return
-        self._image = img
-        self._show_preview(img)
+        self._set_imported_image(img)
+
+    def _set_imported_image(self, img):
+        """保留导入图的完整像素数据，界面只单独生成显示缩略图。"""
+        self._image = img.copy()
+        # 预览允许按界面缩小，但底层 QImage 始终保留导入文件的原始
+        # 像素宽高；确认或保存到签名库时不得使用预览缩略图替换原图。
+        self._imported_image = True
+        self._show_preview(self._image)
 
     def _save_to_library(self):
         img = self._current_image()
@@ -406,6 +416,10 @@ class SignatureDialog(QDialog):
 
     def result_image(self):
         return self._image
+
+    def is_imported_image(self):
+        """返回当前签名是否来自原始图片文件。"""
+        return bool(self._imported_image)
 
 
 class SignatureLibraryDialog(QDialog):

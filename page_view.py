@@ -18,10 +18,13 @@ class PageView(QWidget):
     lineSelected = Signal(int, QPointF, QPointF)    # (页, 两点)
     inkSelected = Signal(int, object)               # (页, list[QPointF])
     pointClicked = Signal(int, QPointF)             # (页, 点)
-    objectChanged = Signal(object, QRectF)
+    # 对象拖动/缩放完成后同时发送新旧矩形，让文档层能把整次鼠标操作
+    # 合并成一个可撤销步骤。
+    objectChanged = Signal(object, QRectF, QRectF)
     objectSelected = Signal(object)
     objectDoubleClicked = Signal(object)          # 双击对象（oid）
     contextMenuRequested = Signal(QPoint)
+    panRequested = Signal(QPointF)                # 空白处拖动增量（画布坐标）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -46,6 +49,7 @@ class PageView(QWidget):
         self._objects = []
         self._selected = None
         self._drag = None
+        self._pan_last = None
         self._hover_note_id = None
 
         self._note_preview = QLabel(self)
@@ -87,9 +91,11 @@ class PageView(QWidget):
         self._zoom = max(0.05, zoom)
         self._dpr = max(1.0, dpr)
         self._images = {}
+        self._text_words = {}
         self._objects = []
         self._selected = None
         self._drag = None
+        self._pan_last = None
         self._compute_layout()
 
     def set_zoom(self, zoom):
@@ -194,6 +200,22 @@ class PageView(QWidget):
         return page, QPointF(
             max(0.0, min(float(pw), pt.x())),
             max(0.0, min(float(ph), pt.y())))
+
+    def _point_hits_text(self, pos):
+        """点击处是否有可选择文字；空白区域用于抓手拖动。"""
+        if self._doc is None or not self._offsets:
+            return False
+        page, pt = self._pdf_point(QPointF(pos))
+        pw, ph = backend.page_size(self._doc, page)
+        if not (0 <= pt.x() <= pw and 0 <= pt.y() <= ph):
+            return False
+        if page not in self._text_words:
+            self._text_words[page] = self._doc[page].get_text("words")
+        tolerance = max(1.5, 3.0 / max(0.1, self._zoom))
+        return any(
+            (float(w[0]) - tolerance <= pt.x() <= float(w[2]) + tolerance and
+             float(w[1]) - tolerance <= pt.y() <= float(w[3]) + tolerance)
+            for w in self._text_words[page])
 
     def _widget_rect(self, page, r):
         return QRectF(r.x() * self._zoom,
@@ -463,12 +485,17 @@ class PageView(QWidget):
                     if self._selected is not None:
                         self._selected = None
                         self.objectSelected.emit(None)
-                    # 空白处：开始文本选择
-                    self._selecting = True
-                    self._sel_start = pos
-                    self._sel_cur = pos
-                    self._sel_words = []
-                    self._sel_page = self._page_at(pos.y())
+                    if self._point_hits_text(pos):
+                        # 从文字上按下仍保持原有滑动选择能力。
+                        self._selecting = True
+                        self._sel_start = pos
+                        self._sel_cur = pos
+                        self._sel_words = []
+                        self._sel_page = self._page_at(pos.y())
+                    else:
+                        # 页面空白、扫描件或页间区域使用抓手自由平移。
+                        self._pan_last = QPointF(e.globalPosition())
+                        self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.update()
         else:
             # point 模式（文本）：点手柄缩放、点对象拖动、点空白继续添加
@@ -542,6 +569,12 @@ class PageView(QWidget):
                         self._apply_rect(self._selected,
                                          QRectF(orig.x(), orig.y(), new_w, orig.height()))
             self.update()
+        elif self._pan_last is not None:
+            global_pos = QPointF(e.globalPosition())
+            delta = QPointF(global_pos - self._pan_last)
+            self._pan_last = global_pos
+            if not delta.isNull():
+                self.panRequested.emit(delta)
         elif self._selecting:
             self._sel_cur = pos
             self._compute_selection()
@@ -561,8 +594,14 @@ class PageView(QWidget):
             oid = self._selected
             obj = self._find(oid)
             if obj is not None:
-                self.objectChanged.emit(oid, QRectF(obj["rect"]))
+                self.objectChanged.emit(
+                    oid, QRectF(obj["rect"]), QRectF(self._drag[3]))
             self._drag = None
+            self.update()
+            return
+        if self._pan_last is not None:
+            self._pan_last = None
+            self._update_cursor(e.position())
             self.update()
             return
         if self._selecting:
@@ -679,10 +718,11 @@ class PageView(QWidget):
         self._drawing = False
         self._ink = []
         self._drag = None
+        self._pan_last = None
         self._selecting = False
         self._sel_words = []
         if mode == "view":
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
         else:
             self.setCursor(Qt.CursorShape.CrossCursor)
         self.update()
@@ -719,7 +759,9 @@ class PageView(QWidget):
                 self._hide_note_tooltip()
         else:
             if self._mode == "view":
-                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self.setCursor(Qt.CursorShape.IBeamCursor
+                               if self._point_hits_text(pos)
+                               else Qt.CursorShape.OpenHandCursor)
             else:
                 self.setCursor(Qt.CursorShape.CrossCursor)
             self._hide_note_tooltip()
