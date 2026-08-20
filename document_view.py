@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout, QSpli
                                QLabel, QLineEdit, QFileDialog, QMessageBox,
                                QInputDialog, QApplication, QMenu, QColorDialog,
                                QGraphicsDropShadowEffect, QAbstractItemView,
-                               QStyledItemDelegate, QStyleOptionViewItem, QStyle)
+                               QStyledItemDelegate, QStyleOptionViewItem, QStyle,
+                               QTreeWidget, QTreeWidgetItem)
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog
 
 import backend
@@ -327,9 +328,10 @@ class DocumentView(QWidget):
         self.side_tabs.setObjectName("sidePanel")
         # 高 DPI 下逻辑宽度会被成倍放大。首次打开使用紧凑宽度，之后
         # 允许用户拖动调整并在本次会话内记住该宽度。
-        self._sidebar_default_width = 104
+        # 最小/默认宽度须能容纳「页面/目录」两个页签（各约 54px，合计 ~112px）。
+        self._sidebar_default_width = 120
         self._sidebar_last_width = self._sidebar_default_width
-        self.side_tabs.setMinimumWidth(88)
+        self.side_tabs.setMinimumWidth(118)
         self.side_tabs.setMaximumWidth(180)
         self.side_tabs.setVisible(False)
 
@@ -367,6 +369,33 @@ class DocumentView(QWidget):
             self._delete_selected_thumbnails)
 
         self.side_tabs.addTab(self.thumb_list, i18n.tr("pages"))
+
+        # ---- 目录页签（PDF 自带书签/大纲）----
+        self._outline_page = QWidget()
+        self._outline_page.setObjectName("outlinePage")
+        outline_lay = QVBoxLayout(self._outline_page)
+        outline_lay.setContentsMargins(4, 4, 4, 4)
+        outline_lay.setSpacing(4)
+        self.outline_tree = QTreeWidget()
+        self.outline_tree.setObjectName("outlineTree")
+        self.outline_tree.setHeaderHidden(True)
+        self.outline_tree.setColumnCount(2)
+        self.outline_tree.setColumnWidth(0, 96)
+        self.outline_tree.setRootIsDecorated(True)
+        self.outline_tree.setIndentation(10)
+        self.outline_tree.setExpandsOnDoubleClick(False)
+        self.outline_tree.itemClicked.connect(self._on_outline_clicked)
+        self.outline_tree.itemDoubleClicked.connect(
+            self._on_outline_double_clicked)
+        outline_lay.addWidget(self.outline_tree, 1)
+        self.outline_hint = QLabel(i18n.tr("outline_empty"))
+        self.outline_hint.setObjectName("outlineHint")
+        self.outline_hint.setAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self.outline_hint.setWordWrap(True)
+        outline_lay.addWidget(self.outline_hint)
+        self.outline_hint.hide()
+        self.side_tabs.addTab(self._outline_page, i18n.tr("outline"))
         self.side_tabs.setTabBarAutoHide(True)
 
         self.page_view = PageView()
@@ -520,6 +549,7 @@ class DocumentView(QWidget):
         self._rebuild_thumbnails()
         self.fit_page()
         self.set_mode("view")
+        self._load_outline()
         try:
             pw, ph = backend.page_size(doc, 0)
         except Exception:
@@ -552,6 +582,8 @@ class DocumentView(QWidget):
         self._viewport_pan_last = None
         self.scroll.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         self.thumb_list.clear()
+        self.outline_tree.clear()
+        self.outline_hint.show()
         self.workspace_stack.setCurrentIndex(0)
         self.pageChanged.emit(0, 0)
         self.securityChanged.emit()
@@ -1067,38 +1099,105 @@ class DocumentView(QWidget):
     # ================= 侧边栏 =================
     def _rebuild_thumbnails(self):
         self.thumb_list.clear()
+        self._thumb_batch = 0
+        self._thumbnail_job_active = False
         if self.doc is None:
             return
         self._update_thumbnail_layout()
-        for i in range(len(self.doc)):
+        # 超大 PDF（数百页以上）一次性渲染所有缩略图会长时间冻结界面；
+        # 改为分批生成，每批让出事件循环，缩略图逐渐出现。
+        self._schedule_thumbnail_batch()
+
+    def _schedule_thumbnail_batch(self):
+        if getattr(self, "_thumbnail_job_active", False) or self.doc is None:
+            return
+        self._thumbnail_job_active = True
+        QTimer.singleShot(0, self._render_thumbnail_batch)
+
+    def _render_thumbnail_batch(self):
+        self._thumbnail_job_active = False
+        if self.doc is None or getattr(self, "_thumb_batch", 0) is None:
+            return
+        batch_size = 24
+        start = self._thumb_batch
+        end = min(start + batch_size, len(self.doc))
+        for i in range(start, end):
+            self._add_thumbnail_item(i)
+        self._thumb_batch = end
+        if end < len(self.doc):
+            QTimer.singleShot(0, self._render_thumbnail_batch)
+
+    def _add_thumbnail_item(self, i):
+        try:
             page = self.doc[i]
-            w = max(1.0, page.rect.width)
-            h = max(1.0, page.rect.height)
-            source_height = round(
-                self._thumbnail_source_width * self._thumbnail_aspect)
-            scale = min(self._thumbnail_source_width / w, source_height / h)
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale))
-            img = QImage(pix.samples, pix.width, pix.height, pix.stride,
-                         QImage.Format.Format_RGB888).copy()
-            # 明确为选中状态提供同一张原色图。若只传入普通 QIcon，
-            # Windows/Qt 会自动生成带蓝色蒙层的 Selected pixmap。
-            thumb_pixmap = QPixmap.fromImage(img)
-            thumb_icon = QIcon()
-            for mode in (QIcon.Mode.Normal, QIcon.Mode.Active,
-                         QIcon.Mode.Selected):
-                thumb_icon.addPixmap(
-                    thumb_pixmap, mode, QIcon.State.Off)
-                thumb_icon.addPixmap(
-                    thumb_pixmap, mode, QIcon.State.On)
-            item = QListWidgetItem(thumb_icon, f"{i + 1}")
-            item.setData(Qt.ItemDataRole.UserRole, i)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
-            self.thumb_list.addItem(item)
+        except Exception:
+            return
+        w = max(1.0, page.rect.width)
+        h = max(1.0, page.rect.height)
+        source_height = round(
+            self._thumbnail_source_width * self._thumbnail_aspect)
+        scale = min(self._thumbnail_source_width / w, source_height / h)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale))
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                     QImage.Format.Format_RGB888).copy()
+        # 明确为选中状态提供同一张原色图。若只传入普通 QIcon，
+        # Windows/Qt 会自动生成带蓝色蒙层的 Selected pixmap。
+        thumb_pixmap = QPixmap.fromImage(img)
+        thumb_icon = QIcon()
+        for mode in (QIcon.Mode.Normal, QIcon.Mode.Active,
+                     QIcon.Mode.Selected):
+            thumb_icon.addPixmap(
+                thumb_pixmap, mode, QIcon.State.Off)
+            thumb_icon.addPixmap(
+                thumb_pixmap, mode, QIcon.State.On)
+        item = QListWidgetItem(thumb_icon, f"{i + 1}")
+        item.setData(Qt.ItemDataRole.UserRole, i)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.thumb_list.addItem(item)
 
     def _on_thumb_clicked(self, item):
         pno = item.data(Qt.ItemDataRole.UserRole)
         if pno is not None:
             self.show_page(int(pno))
+
+    def _load_outline(self):
+        """加载 PDF 自带大纲到侧边栏目录树。"""
+        self.outline_tree.clear()
+        if self.doc is None:
+            self.outline_hint.show()
+            return
+        toc = backend.get_outline(self.doc)
+        if not toc:
+            self.outline_hint.show()
+            return
+        self.outline_hint.hide()
+        parents = {}   # level -> QTreeWidgetItem
+        for entry in toc:
+            level, title, page = entry[0], entry[1], entry[2]
+            item = QTreeWidgetItem([
+                str(title), i18n.tr("outline_page").format(p=page + 1)])
+            item.setData(0, Qt.ItemDataRole.UserRole, int(page))
+            if level <= 1 or (level - 1) not in parents:
+                self.outline_tree.addTopLevelItem(item)
+            else:
+                parents[level - 1].addChild(item)
+            parents[level] = item
+            for k in [k for k in parents if k > level]:
+                del parents[k]
+        self.outline_tree.expandAll()
+        # 第 2 列（页码）右对齐
+        header = self.outline_tree.header()
+        header.setSectionResizeMode(0, header.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, header.ResizeMode.ResizeToContents)
+
+    def _on_outline_clicked(self, item, _col):
+        page = item.data(0, Qt.ItemDataRole.UserRole)
+        if page is None or self.doc is None:
+            return
+        self.show_page(int(page))
+
+    def _on_outline_double_clicked(self, item, _col):
+        self._on_outline_clicked(item, _col)
 
     def _on_thumb_context_menu(self, pos):
         """缩略图右键菜单：单选删除本页，多选删除所有选中页。"""

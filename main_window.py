@@ -5,9 +5,10 @@ import json
 import ctypes
 import pymupdf
 from PySide6.QtCore import (Qt, QSize, QSettings, QEvent, Signal, QTimer,
-                            QThread, QPointF)
+                            QThread, QPointF, QUrl)
 from PySide6.QtGui import (QAction, QKeySequence, QActionGroup, QGuiApplication,
-                           QColor, QFont, QIcon, QShortcut, QPainter, QPen)
+                           QColor, QFont, QIcon, QShortcut, QPainter, QPen,
+                           QDesktopServices)
 from PySide6.QtWidgets import (QMainWindow, QDialog, QTabWidget, QToolBar,
                                QLabel, QLineEdit, QFileDialog, QMessageBox,
                                QApplication, QToolButton, QInputDialog, QMenu,
@@ -388,9 +389,19 @@ class AboutDialog(QDialog):
         ok_button.setDefault(True)
         ok_button.setFixedSize(92, 34)
         ok_button.clicked.connect(self.accept)
+        reward_button = QPushButton(i18n.tr("reward_title"), body)
+        reward_button.setObjectName("rewardButton")
+        reward_button.setFixedSize(112, 34)
+        reward_button.clicked.connect(self._show_reward)
+        footer.addWidget(reward_button)
         footer.addWidget(ok_button)
         body_layout.addLayout(footer)
         outer.addWidget(body)
+
+    def _show_reward(self):
+        from reward_dialog import RewardDialog
+        d = RewardDialog(self)
+        d.exec()
 
     @staticmethod
     def _apply_header_theme(title_bar, title_label, close_button, dark):
@@ -998,6 +1009,10 @@ class MainWindow(QMainWindow):
         mk("slideshow", "slideshow", "幻灯片", shortcut="F5",
            triggered=lambda: self.current_view().start_slideshow())
         mk("about", None, "关于", triggered=self.about)
+        mk("star_us", None, "给个 Star", triggered=self._open_repo_url)
+        mk("feedback", None, "反馈建议", triggered=self._open_feedback_url)
+        mk("check_update", None, "检查更新", triggered=self._check_update_now)
+        mk("reward", None, "支持作者", triggered=self._show_reward_from_menu)
 
         self.theme_group = QActionGroup(self)
         self.theme_group.setExclusive(True)
@@ -1385,6 +1400,12 @@ class MainWindow(QMainWindow):
         self._m_view.addAction(self.act["slideshow"])
 
         self._m_help = self.menuBar().addMenu(i18n.tr("menu_help"))
+        self._m_help.addAction(self.act["check_update"])
+        self._m_help.addSeparator()
+        self._m_help.addAction(self.act["star_us"])
+        self._m_help.addAction(self.act["feedback"])
+        self._m_help.addAction(self.act["reward"])
+        self._m_help.addSeparator()
         self._m_help.addAction(self.act["about"])
 
         self._lang_zh_act.setChecked(i18n.get_lang() == "zh")
@@ -1880,6 +1901,13 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._schedule_more_tools_visibility)
         QTimer.singleShot(120, self._schedule_more_tools_visibility)
         QTimer.singleShot(0, self._position_toolbar_seam_cover)
+        if not getattr(self, "_reward_posted", False):
+            self._reward_posted = True
+            QTimer.singleShot(1500, self._maybe_show_reward)
+        # 启动后异步检查更新（不阻塞 UI）
+        if not getattr(self, "_update_check_posted", False):
+            self._update_check_posted = True
+            QTimer.singleShot(2500, self._maybe_check_update)
         QTimer.singleShot(120, self._position_toolbar_seam_cover)
 
     def resizeEvent(self, e):
@@ -2189,6 +2217,37 @@ class MainWindow(QMainWindow):
     # ================= 关于 =================
     def about(self):
         AboutDialog(self).exec()
+
+    def _open_repo_url(self):
+        QDesktopServices.openUrl(QUrl("https://github.com/GMY2811/DO-Editor"))
+
+    def _open_feedback_url(self):
+        QDesktopServices.openUrl(
+            QUrl("https://github.com/GMY2811/DO-Editor/issues/new"))
+
+    def _check_update_now(self):
+        from update_checker import check_update_async
+        check_update_async(self, manual=True)
+
+    def _maybe_show_reward(self):
+        from reward_dialog import (bump_launch_count, is_reward_dismissed,
+                                   RewardDialog, SHOW_AT_LAUNCH)
+        if is_reward_dismissed():
+            return
+        # 第 N 次启动（默认 3）时才弹出，避免新用户一打开就被打扰。
+        if bump_launch_count() < SHOW_AT_LAUNCH:
+            return
+        d = RewardDialog(self)
+        d.exec()
+
+    def _show_reward_from_menu(self):
+        from reward_dialog import RewardDialog
+        RewardDialog(self).exec()
+
+    def _maybe_check_update(self):
+        """异步调用 update_checker，避免阻塞启动。"""
+        from update_checker import check_update_async
+        check_update_async(self)
 
     def _exec_themed_dialog(self, dialog):
         """显示对话框，并在 Windows 创建标题栏后同步当前主题。"""

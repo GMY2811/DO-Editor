@@ -87,6 +87,7 @@ QTabBar { background: #ededf0; border: none; outline: none; }
 QTabBar::tab { background: transparent; color: #6e6e73; font-size: 8pt; min-width: 62px; min-height: 16px; max-height: 16px; padding: 0 6px; margin: 1px 2px; border: 1px solid transparent; border-radius: 5px; }
 QTabBar::tab:selected { background: #ffffff; color: #0066cc; font-weight: 600; border: 1px solid #d2d2d7; }
 QTabBar::tab:hover:!selected { background: #e1e1e5; color: #1d1d1f; }
+QTabWidget#sidePanel QTabBar::tab { min-width: 40px; padding: 0 4px; }
 QToolButton#tabCloseButton { background: transparent; border: none; border-radius: 4px; padding: 0; margin: 0; }
 QToolButton#tabCloseButton:hover { background: #e3e8ee; }
 QToolButton#tabCloseButton:pressed { background: #d6dde5; }
@@ -219,6 +220,7 @@ QTabBar { background: #1c1c1e; border: none; outline: none; }
 QTabBar::tab { background: transparent; color: #8e8e93; font-size: 8pt; min-width: 62px; min-height: 16px; max-height: 16px; padding: 0 6px; margin: 1px 2px; border: 1px solid transparent; border-radius: 5px; }
 QTabBar::tab:selected { background: #2c2c2e; color: #ffffff; font-weight: 600; border: 1px solid #48484a; }
 QTabBar::tab:hover:!selected { background: #242426; color: #d1d1d6; }
+QTabWidget#sidePanel QTabBar::tab { min-width: 40px; padding: 0 4px; }
 QToolButton#tabCloseButton { background: transparent; border: none; border-radius: 4px; padding: 0; margin: 0; }
 QToolButton#tabCloseButton:hover { background: #363b42; }
 QToolButton#tabCloseButton:pressed { background: #40464e; }

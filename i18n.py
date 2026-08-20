@@ -34,6 +34,9 @@ _STRINGS = {
     "fit_width": ("适合宽度", "Fit Width"),
     "sidebar": ("侧边栏", "Sidebar"),
     "sidebar_default": ("启动时显示侧边栏", "Show Sidebar by Default"),
+    "outline": ("目录", "Contents"),
+    "outline_empty": ("（此 PDF 没有自带目录）", "(This PDF has no built-in outline)"),
+    "outline_page": ("第 {p} 页", "p. {p}"),
     "fullscreen": ("全屏", "Fullscreen"),
     "more_tools": ("更多工具", "More Tools"),
     "slideshow": ("幻灯片", "Slideshow"),
@@ -152,6 +155,23 @@ _STRINGS = {
     "delete_selected": ("删除选中", "Delete"),
     "use": ("使用", "Use"),
     "text_sign_placeholder": ("输入文字签名，如 BOSL TRUCKING", "Enter text, e.g. BOSL TRUCKING"),
+    # 打赏作者
+    "reward_title": ("支持作者", "Support the Author"),
+    "reward_message": ("感谢您使用DO编辑器!\n如用的顺手，可请作者喝杯咖啡。",
+                       "Thanks for using DO Editor!\nIf it helps, buy the author a coffee."),
+    "reward_dont_show": ("以后不再弹出", "Don't show this again"),
+    "reward_close": ("好的", "OK"),
+    "reward_image_missing": ("赞赏码图片缺失", "Reward QR image missing"),
+    "star_us": ("给个 Star", "Star Us"),
+    "feedback": ("反馈建议", "Send Feedback"),
+    "check_update": ("检查更新", "Check for Updates"),
+    "update_available": ("发现新版本 {ver}", "New version available: {ver}"),
+    "update_dialog_title": ("软件更新", "Update"),
+    "update_checking": ("正在检查更新…", "Checking for updates…"),
+    "update_none": ("已是最新版本", "You are up to date"),
+    "update_failed": ("检查更新失败：{err}", "Update check failed: {err}"),
+    "update_open_release": ("前往下载", "Open Release"),
+    "update_later": ("稍后", "Later"),
 }
 
 

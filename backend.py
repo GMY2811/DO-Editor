@@ -197,6 +197,26 @@ def page_size(doc, pno):
     return r.width, r.height
 
 
+def get_outline(doc):
+    """返回 PDF 自带大纲/书签：`[level, title, page, ...]` 的列表。
+    无大纲或解析失败时返回空列表。"""
+    try:
+        toc = doc.get_toc(simple=False)
+    except Exception:
+        return []
+    out = []
+    for entry in toc:
+        if not entry:
+            continue
+        level = int(entry[0]) if len(entry) > 0 else 1
+        title = entry[1] if len(entry) > 1 else ""
+        page = int(entry[2]) - 1 if len(entry) > 2 else 0   # PyMuPDF 页码 1-based → 0-based
+        if page < 0:
+            page = 0
+        out.append([level, str(title), page])
+    return out
+
+
 def extract_text(doc, pno, rect=None):
     """提取第 pno 页文字；rect 为 fitz.Rect 时仅提取该区域。"""
     page = doc[pno]

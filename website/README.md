@@ -7,4 +7,4 @@
 - `script.js`：导航、滚动动效和浅色/深色截图切换
 - `assets/`：软件图标，以及使用专用演示文档生成的中英文浅色、深色真实界面截图
 
-网页中的下载按钮指向 GitHub Releases：`https://github.com/GMY2811/DO-Editor/releases/download/v2.6.1/DO-Editor-Setup-v2.6.1.exe`。
+网页中的下载按钮指向 GitHub Releases：`https://github.com/GMY2811/DO-Editor/releases/download/v2.6.2/DO-Editor-Setup-v2.6.2.exe`。

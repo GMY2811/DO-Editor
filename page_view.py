@@ -137,11 +137,20 @@ class PageView(QWidget):
         buf = 400
         top = self._viewport_y - buf
         bottom = self._viewport_y + self._viewport_h + buf
+        # offsets 单调递增：二分定位首个可能可见的页，避免超大 PDF
+        # 每帧全量遍历所有页面（数千页时开销显著）。
+        import bisect
+        n = len(self._offsets)
+        lo = bisect.bisect_right(self._offsets, top) - 1
+        if lo < 0:
+            lo = 0
         visible = set()
-        for i in range(len(self._doc)):
+        for i in range(lo, n):
             o = self._offsets[i]
+            if o > bottom:
+                break
             ph = self._page_h[i]
-            if o + ph >= top and o <= bottom:
+            if o + ph >= top:
                 visible.add(i)
                 self._render_page(i)
         for i in list(self._images.keys()):

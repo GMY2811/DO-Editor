@@ -183,6 +183,11 @@ def main():
     # 历史设置或污染用户数据（进程退出即恢复，无需写回）。
     import app_config as _cfg
     _cfg.ORG_NAME = "DOEditorSmokeTest"
+    # 重置打赏弹窗状态，避免多次运行累积启动计数后弹窗阻塞测试。
+    from PySide6.QtCore import QSettings as _QS
+    _rs = _QS(_cfg.ORG_NAME, _cfg.APP_NAME)
+    _rs.remove("reward_dismissed")
+    _rs.remove("reward_launch_count")
 
     for name in icons.ICONS:
         assert not icons.get(name).isNull(), name
@@ -241,6 +246,11 @@ def main():
     view = win.current_view()
     assert view.doc is not None
     assert view.page_view.page_count() == 5
+    # 缩略图异步分批生成：驱动事件循环直到全部生成（超大 PDF 不冻结 UI）。
+    for _ in range(100):
+        app.processEvents()
+        if view.thumb_list.count() >= 5:
+            break
     assert view.thumb_list.count() == 5
     # 每个文档独立维护撤销历史；菜单动作与 Ctrl+Z 使用同一入口。
     assert win.act["undo"].shortcut() == QKeySequence.StandardKey.Undo
@@ -270,7 +280,13 @@ def main():
     assert view.delete_pages([4], confirm=False)
     assert len(view.doc) == 4
     assert view.undo()
-    assert len(view.doc) == 5 and view.thumb_list.count() == 5
+    assert len(view.doc) == 5
+    # 缩略图异步分批生成，等待其追平页数。
+    for _ in range(100):
+        app.processEvents()
+        if view.thumb_list.count() >= len(view.doc):
+            break
+    assert view.thumb_list.count() == 5
     assert not view.modified
     print("[OK] Ctrl+Z 撤销对象编辑 + 页面操作")
 
@@ -337,13 +353,13 @@ def main():
     selected_thumb = first_thumb_icon.pixmap(
         view.thumb_list.iconSize(), QIcon.Mode.Selected).toImage()
     assert normal_thumb == selected_thumb
-    assert view._sidebar_default_width == 104
+    assert view._sidebar_default_width == 120
     assert view.thumb_list.objectName() == "thumbnailList"
     assert view.scroll.objectName() == "documentScroll"
     assert view._splitter.handleWidth() == 1
     assert view._sidebar_fit_timer.isSingleShot()
     assert view._sidebar_fit_timer.interval() == 32
-    assert view.side_tabs.minimumWidth() == 88
+    assert view.side_tabs.minimumWidth() == 118
     assert view.side_tabs.maximumWidth() == 180
     narrow_icon, narrow_grid = view._thumbnail_layout_for_width(90)
     wide_icon, wide_grid = view._thumbnail_layout_for_width(160)
@@ -397,6 +413,10 @@ def main():
     assert reorder_view._reorder_pages([1, 0, 2, 3, 4])
     assert "page 2" in backend.extract_text(reorder_view.doc, 0)
     assert reorder_view.objects[0]["page"] == 1
+    for _ in range(100):
+        app.processEvents()
+        if reorder_view.thumb_list.count() >= 5:
+            break
     assert [reorder_view.thumb_list.item(i).text() for i in range(5)] == \
         ["1", "2", "3", "4", "5"]
     reorder_view.close_doc()
@@ -478,6 +498,10 @@ def main():
     note_view.close_doc()
     delete_view = DocumentView()
     assert delete_view.load(sample)
+    for _ in range(100):
+        app.processEvents()
+        if delete_view.thumb_list.count() >= 5:
+            break
     delete_view.thumb_list.clearSelection()
     delete_view.thumb_list.item(1).setSelected(True)
     delete_view.thumb_list.item(3).setSelected(True)
@@ -485,6 +509,10 @@ def main():
         Qt.ShortcutContext.WidgetWithChildrenShortcut
     assert delete_view._delete_selected_thumbnails(confirm=False)
     assert len(delete_view.doc) == 3
+    for _ in range(100):
+        app.processEvents()
+        if delete_view.thumb_list.count() >= 3:
+            break
     assert delete_view.thumb_list.count() == 3
     assert delete_view.modified
     delete_view.close_doc()
