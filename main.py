@@ -28,13 +28,15 @@ def main():
     app.setOrganizationName(cfg.ORG_NAME)
     remove_default_signatures()
     win = MainWindow()
-    win.show()
 
-    # 从命令行打开文档（支持“打开方式”关联）
+    # 从命令行打开文档（支持“打开方式”关联）。
+    # 在窗口显示前加载：方向调整直接生效，窗口首次出现即目标形态，
+    # 避免先显示横屏默认窗口再切换成竖屏的瞬间跳变。
     if len(sys.argv) > 1:
         for arg in sys.argv[1:]:
             if arg.lower().endswith((".pdf", ".docx", ".doc")):
                 win.open_file(arg)
+    win.show()
 
     sys.exit(app.exec())
 
