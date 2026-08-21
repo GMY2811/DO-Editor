@@ -409,7 +409,14 @@ class PageView(QWidget):
                         for i in range(len(points) - 1):
                             p.drawLine(points[i], points[i + 1])
                 else:
-                    p.drawImage(wr, obj["img"])
+                    opacity = float(obj.get("opacity", 1.0))
+                    if opacity >= 1.0:
+                        p.drawImage(wr, obj["img"])
+                    else:
+                        prev = p.opacity()
+                        p.setOpacity(opacity)
+                        p.drawImage(wr, obj["img"])
+                        p.setOpacity(prev)
 
             if self._selected is not None:
                 obj = self._find(self._selected)
@@ -649,7 +656,8 @@ class PageView(QWidget):
         if self._mode not in ("view", "point"):
             return
         obj = self._object_at(e.position())
-        if obj is not None and obj.get("kind") in ({"text", "note"} | _ANNOTATION_KINDS):
+        if obj is not None and obj.get("kind") in (
+                {"text", "note", "image"} | _ANNOTATION_KINDS):
             self._selected = obj["id"]
             self._drag = None
             self._drawing = False

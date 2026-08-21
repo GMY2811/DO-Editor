@@ -140,17 +140,40 @@ class AddWatermarkDialog(QDialog):
         self.setWindowTitle(i18n.tr("add_watermark"))
         from PySide6.QtWidgets import (QPushButton, QHBoxLayout, QVBoxLayout,
                                       QSpinBox, QSlider, QCheckBox, QComboBox,
-                                      QFileDialog)
+                                      QFileDialog, QToolButton)
         self._color = QColor(0.5, 0.5, 0.5)
         self._opacity = 0.3
         self._image_path = ""
 
-        # 水印类型：0 文字 / 1 图片
+        # 水印类型：0 文字 / 1 图片（下拉三角号由主题全局 QSS 提供）
         self._type_combo = QComboBox()
+        self._type_combo.setObjectName("watermarkTypeCombo")
         self._type_combo.addItem(i18n.tr("watermark_type_text"))
         self._type_combo.addItem(i18n.tr("watermark_type_image"))
         self._type_combo.currentIndexChanged.connect(self._on_type_changed)
+        # 下拉三角号：QComboBox::down-arrow 图像在真实 Windows 窗口下不可靠，
+        # 改用 QToolButton 子控件绝对定位在选择框内部右侧（Qt 原生 DownArrow）。
+        self._type_combo.setStyleSheet(
+            "QComboBox::drop-down { border: none; width: 0; }"
+            "QComboBox { padding-right: 24px; }")
+        self._type_arrow = QToolButton(self._type_combo)
+        self._type_arrow.setObjectName("watermarkTypeArrow")
+        self._type_arrow.setArrowType(Qt.ArrowType.DownArrow)
+        self._type_arrow.setAutoRaise(True)
+        self._type_arrow.setFixedSize(24, 24)
+        self._type_arrow.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._type_arrow.clicked.connect(self._type_combo.showPopup)
+        self._type_arrow.setToolTip(i18n.tr("watermark_type"))
 
+        def _relocate_arrow():
+            self._type_arrow.move(
+                self._type_combo.width() - 26,
+                (self._type_combo.height() - 24) // 2)
+            self._type_arrow.raise_()
+
+        self._type_combo.resizeEvent = lambda e: (
+            QComboBox.resizeEvent(self._type_combo, e) or _relocate_arrow())
+        _relocate_arrow()
         self._text_edit = QLineEdit(i18n.tr("watermark_default"))
 
         self._size_spin = QSpinBox()
@@ -164,6 +187,13 @@ class AddWatermarkDialog(QDialog):
         self._opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self._opacity_slider.setRange(5, 100)
         self._opacity_slider.setValue(30)
+        self._opacity_label = QLabel("30%")
+        self._opacity_label.setObjectName("opacityValueLabel")
+        self._opacity_label.setMinimumWidth(44)
+        self._opacity_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._opacity_slider.valueChanged.connect(
+            lambda v: self._opacity_label.setText(f"{v}%"))
 
         self._tiled_check = QCheckBox(i18n.tr("tiled"))
         self._tiled_check.setChecked(True)
@@ -212,6 +242,7 @@ class AddWatermarkDialog(QDialog):
         row4 = QHBoxLayout()
         row4.addWidget(QLabel(i18n.tr("watermark_opacity")))
         row4.addWidget(self._opacity_slider, 1)
+        row4.addWidget(self._opacity_label)
         row4.addWidget(self._tiled_check)
         row5 = QHBoxLayout()
         row5.addStretch(1)
@@ -260,7 +291,7 @@ class AddWatermarkDialog(QDialog):
         from PySide6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(
             self, i18n.tr("watermark_image"), "",
-            "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
+            i18n.tr("image_file_filter"))
         if path:
             self._image_path = path
             import os as _os
@@ -938,7 +969,11 @@ class DocumentView(QWidget):
                     bold=bool(obj.get("bold", False)),
                     italic=bool(obj.get("italic", False)))
             else:
-                page.insert_image(fr, stream=obj["png"])
+                opacity = obj.get("opacity", 1.0)
+                if opacity >= 1.0:
+                    page.insert_image(fr, stream=obj["png"])
+                else:
+                    page.insert_image(fr, stream=obj["png"], alpha=opacity)
         self.objects = []
         self._obj_counter = 0
 
@@ -1439,7 +1474,7 @@ class DocumentView(QWidget):
         self.pending_paste_text = None
         self._add_text_object(text, int(page), QPointF(pt))
         self.statusMessage.emit(
-            f"已在第 {int(page) + 1} 页粘贴文字", 3000)
+            i18n.tr("paste_text_done").format(p=int(page) + 1), 3000)
 
     def start_note(self, page=None, pt=None):
         """输入便笺内容；有坐标时直接添加，否则进入页面定位模式。"""
@@ -1491,7 +1526,7 @@ class DocumentView(QWidget):
         self._refresh_objects()
         self.page_view.select(self._obj_counter)
         self.statusMessage.emit(
-            f"已在第 {page + 1} 页添加批注，可拖动调整位置", 4000)
+            i18n.tr("note_added").format(p=page + 1), 4000)
         return True
 
     @staticmethod
@@ -1948,6 +1983,7 @@ class DocumentView(QWidget):
             "id": self._obj_counter, "page": page,
             "rect": QRectF(pt.x(), pt.y(), base_w, h),
             "img": img, "png": qimage_to_png_bytes(img), "kind": kind,
+            "opacity": 1.0,
         })
         self.modified = True
         self.set_mode("view")
@@ -2017,10 +2053,43 @@ class DocumentView(QWidget):
         if obj.get("kind") in ANNOTATION_OBJECT_KINDS:
             self._change_annotation_color(oid)
             return
+        if obj.get("kind") == "image":
+            self._edit_image_object(oid)
+            return
         if obj.get("kind") != "text":
             return
         self._start_inline_text(
             obj["page"], QPointF(obj["rect"].x(), obj["rect"].y()), oid)
+
+    def _edit_image_object(self, oid):
+        from edit_image_dialog import EditImageDialog
+        obj = self._find_object(oid)
+        if obj is None or obj.get("kind") != "image":
+            return
+        initial_opacity = float(obj.get("opacity", 1.0))
+        dlg = EditImageDialog(obj, self)
+
+        def _live_apply(opacity):
+            # 拖动透明度时直接在页面呈现效果（不落 undo，取消时回滚）
+            obj["opacity"] = float(opacity)
+            self.page_view.update()
+
+        dlg.opacityChanged.connect(_live_apply)
+        dlg.exec()
+        res = dlg.result()
+        if not res:
+            # 取消：恢复初始透明度
+            obj["opacity"] = initial_opacity
+            self.page_view.update()
+            return
+        # ("ok", opacity)
+        _, new_opacity = res
+        self.begin_undo_step()
+        obj["opacity"] = float(new_opacity)
+        self.modified = True
+        self.page_view.select(oid)
+        self._refresh_objects()
+        self.statusMessage.emit(i18n.tr("image_edited"), 3000)
 
     def _edit_note_object(self, oid):
         obj = self._find_object(oid)
@@ -2038,7 +2107,7 @@ class DocumentView(QWidget):
             obj["text"] = text
             self.modified = True
             self.page_view.select(oid)
-            self.statusMessage.emit("批注内容已更新", 3000)
+            self.statusMessage.emit(i18n.tr("note_updated"), 3000)
 
     def _edit_text_object(self, oid):
         obj = self._find_object(oid)
@@ -2292,12 +2361,13 @@ class DocumentView(QWidget):
             return False
         img = QImage(path)
         if img.isNull():
-            QMessageBox.warning(self, "提示", "无法读取该图片")
+            QMessageBox.warning(self, i18n.tr("hint"),
+                                i18n.tr("image_read_failed"))
             return False
         if page is not None and pt is not None:
             self._add_object(img, "image", int(page), QPointF(pt), 160.0)
             self.statusMessage.emit(
-                f"已在第 {int(page) + 1} 页插入图片", 3000)
+                i18n.tr("image_inserted").format(p=int(page) + 1), 3000)
             return True
 
         page, position, width = self._default_image_placement(img)
@@ -2420,7 +2490,8 @@ class DocumentView(QWidget):
     # ================= 打印 =================
     def print_pdf(self):
         if self.doc is None:
-            QMessageBox.information(self, "提示", "请先打开一个 PDF 文件")
+            QMessageBox.information(self, i18n.tr("hint"),
+                                    i18n.tr("need_open_pdf"))
             return
         if not self._require_permission(pymupdf.PDF_PERM_PRINT, "打印"):
             return

@@ -75,7 +75,9 @@ QWidget#inlineTextBar QPushButton#inlineTextCancel { background: #f1f1f4; color:
 QWidget#inlineTextBar QPushButton#inlineTextCancel:hover { background: #e5e5ea; }
 QWidget#inlineTextBar QPushButton#inlineTextColor { border: 2px solid #ffffff; }
 QWidget#inlineTextBar QCheckBox#inlineTextToggle { color: #3a3a3c; spacing: 6px; }
-QComboBox::drop-down { border: none; width: 24px; }
+QComboBox { padding-right: 26px; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; border: none; width: 24px; }
+QComboBox::down-arrow { image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAAe0lEQVR42mPw8vJioAZmGNQGsUExsZpR1CML/ofiQyIMMURSz4bLIBDmxGMIJ5paNnSvRSBJfsdj0HckdRG4ArsBSdF5LIacR5JvIBRry5EULydCHG/0o9tMyKV409F3tEDFG3YMJMQO3tgkJb0YUppFiErxDCMj91OEAeItSmw6U9O8AAAAAElFTkSuQmCC); width: 12px; height: 12px; }
 QComboBox QAbstractItemView { background: #ffffff; border: 1px solid #d8e0ea; selection-background-color: #e7efff; }
 QListWidget, QTreeWidget { background: #f6f6f8; border: none; outline: none; }
 QListWidget::item { border-radius: 8px; margin: 4px 8px; padding: 5px; color: #64748b; }
@@ -208,7 +210,9 @@ QWidget#inlineTextBar QPushButton#inlineTextCancel { background: #3a3a3c; color:
 QWidget#inlineTextBar QPushButton#inlineTextCancel:hover { background: #48484a; }
 QWidget#inlineTextBar QPushButton#inlineTextColor { border: 2px solid #636366; }
 QWidget#inlineTextBar QCheckBox#inlineTextToggle { color: #d1d1d6; spacing: 6px; }
-QComboBox::drop-down { border: none; width: 24px; }
+QComboBox { padding-right: 26px; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; border: none; width: 24px; }
+QComboBox::down-arrow { image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAAfElEQVR42mM4cPQcAzUww6A2iA2KidWMoh5Z8D8UGxJhiCGSejZcBoEwJx5DONHUsqF7LQJJ8sjseg74jqYvAFdgNSIrOYzHkPJJ8A6FYW46keDkR4nijH91mQi7Fm46+owUq3rBjICF28MYmKenFkNIsQlSKZxgZuZ8iDACO5iKekIywnQAAAABJRU5ErkJggg==); width: 12px; height: 12px; }
 QComboBox QAbstractItemView { background: #2c2c2e; border: 1px solid #48484a; selection-background-color: #0a5fad; }
 QListWidget, QTreeWidget { background: #1c1c1e; border: none; outline: none; }
 QListWidget::item { border-radius: 8px; margin: 4px 8px; padding: 5px; color: #a1a1a6; }

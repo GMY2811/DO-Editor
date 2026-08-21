@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DO编辑器 · 宣传长图</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    background: #eef1f7;
+    display: flex; justify-content: center; padding: 24px 0;
+  }
+  #canvas {
+    width: 750px; min-height: 2000px; background: #f6f8fc;
+    position: relative; overflow: hidden;
+  }
+  /* 顶部装饰 */
+  .hero {
+    background: linear-gradient(135deg, #173a6e 0%, #2d6bd8 78%, #3f8ef0 100%);
+    padding: 64px 56px 56px; color: #fff; position: relative;
+  }
+  .hero::after {
+    content: ""; position: absolute; right: -70px; top: -70px;
+    width: 260px; height: 260px; border-radius: 50%;
+    background: rgba(255,255,255,0.08);
+  }
+  .hero .logo-row { display: flex; align-items: center; gap: 14px; margin-bottom: 34px; }
+  .hero .logo-badge {
+    width: 56px; height: 56px; border-radius: 14px;
+    background: rgba(255,255,255,0.16); border: 1px solid rgba(255,255,255,0.28);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 26px; font-weight: 700; color: #fff;
+  }
+  .hero h1 { font-size: 52px; font-weight: 700; letter-spacing: 1px; line-height: 1.15; }
+  .hero .sub { font-size: 22px; margin-top: 14px; opacity: 0.92; line-height: 1.6; }
+  .hero .tagline { margin-top: 30px; display: inline-block; background: rgba(255,255,255,0.16); border: 1px solid rgba(255,255,255,0.3); padding: 10px 22px; border-radius: 40px; font-size: 19px; }
+  /* 免费承诺 */
+  .badges { display: flex; justify-content: space-between; padding: 30px 40px; gap: 12px; background: #fff; border-bottom: 1px solid #e6ebf4; }
+  .badge { flex: 1; text-align: center; padding: 12px 4px; background: #f2f6fd; border-radius: 14px; }
+  .badge .t { font-size: 21px; font-weight: 600; color: #1d3f7d; }
+  .badge .s { font-size: 14px; color: #7a8496; margin-top: 4px; }
+  /* 区块标题 */
+  .section { padding: 40px 40px 8px; }
+  .section-title { font-size: 30px; font-weight: 700; color: #14253f; }
+  .section-sub { font-size: 16px; color: #8a93a5; margin-top: 6px; }
+  /* 功能网格 */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 26px 40px 8px; }
+  .feature { background: #fff; border: 1px solid #e6ebf4; border-radius: 18px; padding: 22px 20px; box-shadow: 0 2px 10px rgba(30,60,120,0.04); }
+  .feature .ic { font-size: 30px; }
+  .feature .n { font-size: 20px; font-weight: 600; color: #14253f; margin-top: 10px; }
+  .feature .d { font-size: 15px; color: #7a8496; margin-top: 6px; line-height: 1.5; }
+  /* 性能条 */
+  .perf { margin: 26px 40px; background: #fff; border: 1px solid #e6ebf4; border-radius: 18px; padding: 24px 26px; display: flex; align-items: center; gap: 18px; }
+  .perf .ic { font-size: 34px; }
+  .perf .n { font-size: 21px; font-weight: 600; color: #14253f; }
+  .perf .d { font-size: 15px; color: #7a8496; margin-top: 4px; }
+  /* 下载卡 */
+  .download { margin: 14px 40px; background: #fff; border: 1px solid #e6ebf4; border-radius: 22px; padding: 30px; display: flex; align-items: center; gap: 26px; }
+  .download .qr-box { width: 148px; height: 148px; background: #fff; border: 1px solid #dce3ee; border-radius: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .download .info { flex: 1; }
+  .download .info .t { font-size: 24px; font-weight: 700; color: #14253f; }
+  .download .info .d { font-size: 15px; color: #7a8496; margin-top: 8px; line-height: 1.6; }
+  .download .info .btn { display: inline-block; margin-top: 14px; background: linear-gradient(90deg,#2d6bd8,#3f8ef0); color: #fff; font-size: 16px; font-weight: 600; padding: 10px 22px; border-radius: 26px; }
+  /* 赞赏 */
+  .reward { margin: 26px 40px 10px; background: linear-gradient(135deg,#fff7ef,#fff); border: 1px solid #f3e0c8; border-radius: 22px; padding: 26px 30px; display: flex; align-items: center; gap: 24px; }
+  .reward .qr { width: 132px; height: 132px; border: 1px solid #efe2d0; border-radius: 12px; flex-shrink: 0; overflow: hidden; }
+  .reward .qr img { width: 100%; height: 100%; object-fit: cover; }
+  .reward .info .t { font-size: 22px; font-weight: 700; color: #7a4a1f; }
+  .reward .info .d { font-size: 15px; color: #a07a4a; margin-top: 6px; line-height: 1.6; }
+  /* 脚注 */
+  .foot { text-align: center; padding: 22px 40px 40px; font-size: 14px; color: #9aa3b5; }
+  .toolbar { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; z-index: 99; }
+  .toolbar button { border: none; cursor: pointer; font-size: 15px; font-weight: 600; padding: 12px 26px; border-radius: 30px; box-shadow: 0 6px 18px rgba(20,40,80,0.25); }
+  .btn-png { background: #2d6bd8; color: #fff; }
+  .btn-link { background: #fff; color: #2d6bd8; }
+</style>
+</head>
+<body>
+  <div id="canvas">
+    <!-- Hero -->
+    <div class="hero">
+      <div class="logo-row">
+        <div class="logo-badge">DO</div>
+        <div style="font-size:22px;font-weight:600;letter-spacing:1px;">DO 编辑器</div>
+      </div>
+      <h1>免费，且够用的<br>PDF 工具</h1>
+      <div class="sub">读、改、标注、OCR、水印、加密、签名<br>一个软件全搞定</div>
+      <div class="tagline">下载即用 · 全功能开放 · 永久免费</div>
+    </div>
+
+    <!-- 免费承诺 -->
+    <div class="badges">
+      <div class="badge"><div class="t">无注册</div><div class="s">打开即用</div></div>
+      <div class="badge"><div class="t">无广告</div><div class="s">界面干净</div></div>
+      <div class="badge"><div class="t">无付费墙</div><div class="s">功能全开</div></div>
+      <div class="badge"><div class="t">无导出水印</div><div class="s">原样输出</div></div>
+    </div>
+
+    <!-- 功能 -->
+    <div class="section">
+      <div class="section-title">你能用它做什么</div>
+      <div class="section-sub">覆盖日常 90% 的 PDF 处理场景</div>
+    </div>
+    <div class="grid">
+      <div class="feature"><div class="ic">📖</div><div class="n">高效阅读</div><div class="d">连续滚动 · 整页适配 · 深色主题</div></div>
+      <div class="feature"><div class="ic">✏️</div><div class="n">直接编辑</div><div class="d">改文字 · 删页面 · 合并拆分</div></div>
+      <div class="feature"><div class="ic">🔍</div><div class="n">OCR 识别</div><div class="d">扫描件变可搜索文字层</div></div>
+      <div class="feature"><div class="ic">🖼️</div><div class="n">文字/图片水印</div><div class="d">透明度随意调 · 平铺或居中</div></div>
+      <div class="feature"><div class="ic">🔐</div><div class="n">加密保护</div><div class="d">AES-256 · 权限控制</div></div>
+      <div class="feature"><div class="ic">🖋️</div><div class="n">签名盖章</div><div class="d">手写 · 图片 · 文字都行</div></div>
+      <div class="feature"><div class="ic">🖍️</div><div class="n">注释批注</div><div class="d">高亮 · 下划线 · 绘图</div></div>
+      <div class="feature"><div class="ic">📑</div><div class="n">目录大纲</div><div class="d">一键跳转 · 幻灯片放映</div></div>
+    </div>
+
+    <!-- 性能 -->
+    <div class="perf">
+      <div class="ic">⚡</div>
+      <div>
+        <div class="n">超大 PDF 也不卡</div>
+        <div class="d">数百页文档秒开 · 缩略图分批加载 · 滚动流畅</div>
+      </div>
+    </div>
+
+    <!-- 下载 -->
+    <div class="download">
+      <div class="qr-box" id="qrcode"></div>
+      <div class="info">
+        <div class="t">免费下载 · Windows 10 / 11</div>
+        <div class="d">扫码直达官网，或访问：<br>gmy2811.github.io/DO-Editor</div>
+        <div class="btn">🚀 立即下载 v2.6.3</div>
+      </div>
+    </div>
+
+    <!-- 赞赏 -->
+    <div class="reward">
+      <div class="qr"><img src="assets/reward_qr.png" alt="赞赏码"></div>
+      <div class="info">
+        <div class="t">感谢您使用DO编辑器!</div>
+        <div class="d">如用的顺手，可请作者喝杯咖啡 ☕<br>自愿支持 · 不强制 · 谢谢您的认可</div>
+      </div>
+    </div>
+
+    <div class="foot">DO 编辑器 · 开发者 RAY · 永久免费 · 感谢每一位使用者</div>
+  </div>
+
+  <div class="toolbar">
+    <button class="btn-png" onclick="exportPNG()">⬇ 保存长图</button>
+    <button class="btn-link" onclick="window.open('https://gmy2811.github.io/DO-Editor/','_blank')">打开官网</button>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script>
+    new QRCode(document.getElementById("qrcode"), {
+      text: "https://gmy2811.github.io/DO-Editor/",
+      width: 132, height: 132,
+      colorDark: "#14253f", colorLight: "#ffffff"
+    });
+    function exportPNG() {
+      var btn = document.querySelector(".btn-png");
+      btn.textContent = "⏳ 生成中…";
+      html2canvas(document.getElementById("canvas"), { scale: 2, useCORS: true, backgroundColor: "#f6f8fc" })
+        .then(function (canvas) {
+          var a = document.createElement("a");
+          a.download = "DO编辑器-免费PDF工具.png";
+          a.href = canvas.toDataURL("image/png");
+          a.click();
+          btn.textContent = "✅ 已保存";
+          setTimeout(function(){ btn.textContent = "⬇ 保存长图"; }, 3000);
+        })
+        .catch(function (e) { alert("导出失败：" + e); btn.textContent = "⬇ 保存长图"; });
+    }
+  </script>
+</body>
+</html>
