@@ -973,7 +973,17 @@ class DocumentView(QWidget):
                 if opacity >= 1.0:
                     page.insert_image(fr, stream=obj["png"])
                 else:
-                    page.insert_image(fr, stream=obj["png"], alpha=opacity)
+                    # PyMuPDF 的 alpha 参数是 int(0/1 有无透明)，不是透明度值；
+                    # 把透明度固化到图像自身的 alpha 通道，保存/重开后依然生效。
+                    from PIL import Image as _PILImage
+                    from io import BytesIO as _BytesIO
+                    _img = _PILImage.open(_BytesIO(obj["png"])).convert("RGBA")
+                    _r, _g, _b, _a = _img.split()
+                    _a = _a.point(lambda v: int(v * opacity))
+                    _img = _PILImage.merge("RGBA", (_r, _g, _b, _a))
+                    _buf = _BytesIO()
+                    _img.save(_buf, format="PNG")
+                    page.insert_image(fr, stream=_buf.getvalue())
         self.objects = []
         self._obj_counter = 0
 
