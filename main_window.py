@@ -5,7 +5,8 @@ import json
 import ctypes
 import pymupdf
 from PySide6.QtCore import (Qt, QSize, QSettings, QEvent, Signal, QTimer,
-                            QThread, QPointF, QUrl)
+                            QThread, QPointF, QUrl, QRect, QPropertyAnimation,
+                            QEasingCurve)
 from PySide6.QtGui import (QAction, QKeySequence, QActionGroup, QGuiApplication,
                            QColor, QFont, QIcon, QShortcut, QPainter, QPen,
                            QDesktopServices)
@@ -685,9 +686,7 @@ class MainWindow(QMainWindow):
         # 程序主动调整窗口：抑制 resizeEvent 的宽度适配，布局稳定后
         # 统一执行整页适配，保证打开后页面完整显示。
         view._suppress_resize_fit = True
-        self.resize(w, h)
-        # 定位：横版窗口垂直居中；竖版窗口水平居中、垂直偏上（靠上打开），
-        # 底部不超出屏幕。之后用户可自由拖动，不再干预。
+        # 已显示的窗口：用动画平滑过渡窗口形态（横↔竖），避免瞬间跳变。
         if screen_geo is not None:
             x = screen_geo.x() + (screen_geo.width() - w) // 2
             if aspect < 1.0:
@@ -695,19 +694,40 @@ class MainWindow(QMainWindow):
                 y = min(y, screen_geo.y() + screen_geo.height() - h - 20)
             else:
                 y = screen_geo.y() + (screen_geo.height() - h) // 2
+            target = QRect(x, y, w, h)
+        else:
+            target = None
+
+        if (self.isVisible() and target is not None
+                and self.geometry() != target):
+            if getattr(self, "_orientation_anim", None) is not None:
+                self._orientation_anim.stop()
+            self._orientation_anim = QPropertyAnimation(
+                self, b"geometry", self)
+            self._orientation_anim.setDuration(220)
+            self._orientation_anim.setEasingCurve(
+                QEasingCurve.Type.OutCubic)
+            self._orientation_anim.setStartValue(self.geometry())
+            self._orientation_anim.setEndValue(target)
+            self._orientation_anim.finished.connect(
+                lambda v=view: self._after_orientation_change(v))
+            self._orientation_anim.start()
+            return
+        self.resize(w, h)
+        if target is not None:
             self.move(x, y)
+        QTimer.singleShot(60, lambda v=view: self._after_orientation_change(v))
 
-        def _after_resize():
-            view._suppress_resize_fit = False
-            # 停掉本次调整触发的适宽定时器，避免其随后覆盖整页适配。
-            view._window_fit_timer.stop()
-            if view.doc is not None:
-                view.fit_page()
-            # 同步视口尺寸基准，防止下一次 resizeEvent 重复触发适配。
-            view._last_viewport_w = view.scroll.viewport().width()
-            view._last_viewport_h = view.scroll.viewport().height()
-
-        QTimer.singleShot(60, _after_resize)
+    def _after_orientation_change(self, view):
+        """窗口形态调整完成后：恢复适配、统一整页显示。"""
+        view._suppress_resize_fit = False
+        # 停掉本次调整触发的适宽定时器，避免其随后覆盖整页适配。
+        view._window_fit_timer.stop()
+        if view.doc is not None:
+            view.fit_page()
+        # 同步视口尺寸基准，防止下一次 resizeEvent 重复触发适配。
+        view._last_viewport_w = view.scroll.viewport().width()
+        view._last_viewport_h = view.scroll.viewport().height()
 
     def _new_tab(self):
         view = DocumentView()
