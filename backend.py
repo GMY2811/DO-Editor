@@ -342,6 +342,57 @@ def add_watermark(doc, text, fontsize=50, color=(0.5, 0.5, 0.5), opacity=0.3,
                              color=color, fill_opacity=opacity, morph=(fp, mat))
 
 
+def add_image_watermark(doc, image_path, opacity=0.3, rotate=0, tiled=True,
+                        scale=0.5):
+    """给所有页面添加图片水印。
+
+    image_path: 图片文件路径；opacity: 0-1 透明度；rotate: 旋转角度；
+    tiled: True 平铺 / False 居中单张；scale: 水印图相对页面宽度的比例(0.05-1)。
+    """
+    from io import BytesIO
+    from PIL import Image as PILImage
+    try:
+        img = PILImage.open(image_path).convert("RGBA")
+    except Exception:
+        return False
+    # 应用透明度（直接把 alpha 通道按 opacity 压缩）。
+    r, g, b, a = img.split()
+    a = a.point(lambda v: int(v * opacity))
+    img = PILImage.merge("RGBA", (r, g, b, a))
+    if rotate:
+        # 真正旋转图片内容（expand 保留完整画幅，避免内容被裁切）。
+        img = img.rotate(rotate, expand=True, resample=PILImage.BICUBIC)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    pix = pymupdf.Pixmap(buf.getvalue())
+    iw, ih = pix.width, pix.height
+    if iw <= 0 or ih <= 0:
+        return False
+    for page in doc:
+        pr = page.rect
+        target_w = max(20.0, pr.width * max(0.05, min(1.0, scale)))
+        target_h = target_w * ih / iw
+        if tiled:
+            step_x = max(target_w * 2.0, target_w + 40)
+            step_y = max(target_h * 2.0, target_h + 40)
+            y = pr.y0 + step_y / 2
+            while y < pr.y1 - 10:
+                x = pr.x0 + step_x / 2
+                while x < pr.x1 - 10:
+                    page.insert_image(
+                        pymupdf.Rect(x, y, x + target_w, y + target_h),
+                        pixmap=pix, overlay=True)
+                    x += step_x
+                y += step_y
+        else:
+            cx, cy = pr.width / 2, pr.height / 2
+            page.insert_image(
+                pymupdf.Rect(cx - target_w / 2, cy - target_h / 2,
+                             cx + target_w / 2, cy + target_h / 2),
+                pixmap=pix, overlay=True)
+    return True
+
+
 # ---------------- 合并 / 拆分 ----------------
 
 def merge_pdfs(paths, out_path):

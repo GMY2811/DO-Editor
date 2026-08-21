@@ -83,6 +83,8 @@ class RewardDialog(QDialog):
 
         self._dont_show = QCheckBox(i18n.tr("reward_dont_show"))
         self._dont_show.setObjectName("rewardDontShow")
+        # 若用户之前勾选过"以后不再弹出"，手动再次打开时保持勾选状态。
+        self._dont_show.setChecked(is_reward_dismissed())
         lay.addWidget(self._dont_show, 0, Qt.AlignmentFlag.AlignHCenter)
 
         btn_row = QHBoxLayout()
@@ -97,8 +99,8 @@ class RewardDialog(QDialog):
         lay.addLayout(btn_row)
 
     def accept(self):
-        if self._dont_show.isChecked():
-            set_reward_dismissed(True)
+        # 勾选框状态即最终设置：勾选 → 不再弹出；取消勾选 → 恢复弹出。
+        set_reward_dismissed(self._dont_show.isChecked())
         super().accept()
 
     def reject(self):

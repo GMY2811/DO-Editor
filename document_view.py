@@ -131,15 +131,25 @@ class ReplaceTextDialog(QDialog):
 
 
 class AddWatermarkDialog(QDialog):
-    """添加水印对话框：文字 + 字号 + 颜色 + 透明度 + 旋转 + 平铺。"""
+    """添加水印对话框：文字/图片两种类型。
+    文字：文字 + 字号 + 颜色 + 透明度 + 旋转 + 平铺；
+    图片：图片文件 + 大小 + 透明度 + 旋转 + 平铺。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(i18n.tr("add_watermark"))
         from PySide6.QtWidgets import (QPushButton, QHBoxLayout, QVBoxLayout,
-                                      QSpinBox, QSlider, QCheckBox)
+                                      QSpinBox, QSlider, QCheckBox, QComboBox,
+                                      QFileDialog)
         self._color = QColor(0.5, 0.5, 0.5)
         self._opacity = 0.3
+        self._image_path = ""
+
+        # 水印类型：0 文字 / 1 图片
+        self._type_combo = QComboBox()
+        self._type_combo.addItem(i18n.tr("watermark_type_text"))
+        self._type_combo.addItem(i18n.tr("watermark_type_image"))
+        self._type_combo.currentIndexChanged.connect(self._on_type_changed)
 
         self._text_edit = QLineEdit(i18n.tr("watermark_default"))
 
@@ -163,35 +173,77 @@ class AddWatermarkDialog(QDialog):
         self._color_btn.clicked.connect(self._pick_color)
         self._style_color_btn()
 
+        # 图片水印控件
+        self._img_btn = QPushButton(i18n.tr("watermark_image"))
+        self._img_btn.clicked.connect(self._pick_image)
+        self._img_label = QLabel()
+        self._img_label.setStyleSheet("color:#7a828c;")
+        self._scale_spin = QSpinBox()
+        self._scale_spin.setRange(5, 100)
+        self._scale_spin.setValue(50)
+        self._scale_spin.setSuffix(" %")
+
         btn_ok = QPushButton(i18n.tr("confirm"))
         btn_cancel = QPushButton(i18n.tr("cancel"))
         btn_ok.clicked.connect(self.accept)
         btn_cancel.clicked.connect(self.reject)
 
+        row0 = QHBoxLayout()
+        row0.addWidget(QLabel(i18n.tr("watermark_type")))
+        row0.addWidget(self._type_combo)
+        row0.addStretch(1)
         row1 = QHBoxLayout()
         row1.addWidget(QLabel(i18n.tr("watermark_text")))
         row1.addWidget(self._text_edit, 1)
+        self._img_row = QHBoxLayout()
+        self._img_row.addWidget(QLabel(i18n.tr("watermark_image_label")))
+        self._img_row.addWidget(self._img_btn)
+        self._img_row.addWidget(self._img_label, 1)
         row2 = QHBoxLayout()
         row2.addWidget(QLabel(i18n.tr("font_size")))
         row2.addWidget(self._size_spin)
         row2.addWidget(QLabel(i18n.tr("watermark_rotate")))
         row2.addWidget(self._rotate_spin)
         row2.addWidget(self._color_btn)
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel(i18n.tr("watermark_opacity")))
-        row3.addWidget(self._opacity_slider, 1)
-        row3.addWidget(self._tiled_check)
+        self._scale_row = QHBoxLayout()
+        self._scale_row.addWidget(QLabel(i18n.tr("watermark_scale")))
+        self._scale_row.addWidget(self._scale_spin)
+        self._scale_row.addStretch(1)
         row4 = QHBoxLayout()
-        row4.addStretch(1)
-        row4.addWidget(btn_ok)
-        row4.addWidget(btn_cancel)
+        row4.addWidget(QLabel(i18n.tr("watermark_opacity")))
+        row4.addWidget(self._opacity_slider, 1)
+        row4.addWidget(self._tiled_check)
+        row5 = QHBoxLayout()
+        row5.addStretch(1)
+        row5.addWidget(btn_ok)
+        row5.addWidget(btn_cancel)
 
         lay = QVBoxLayout(self)
+        lay.addLayout(row0)
         lay.addLayout(row1)
+        self._img_widgets = (self._img_btn, self._img_label, self._scale_spin)
+        self._img_layouts = [self._img_row, self._scale_row]
+        lay.addLayout(self._img_row)
         lay.addLayout(row2)
-        lay.addLayout(row3)
+        lay.addLayout(self._scale_row)
         lay.addLayout(row4)
-        self.resize(460, 180)
+        lay.addLayout(row5)
+        self.resize(470, 220)
+        self._on_type_changed(0)
+
+    def _on_type_changed(self, idx):
+        is_text = idx == 0
+        self._text_edit.setVisible(is_text)
+        self._size_spin.setVisible(is_text)
+        self._color_btn.setVisible(is_text)
+        for w in self._img_widgets:
+            w.setVisible(not is_text)
+        for lay in self._img_layouts:
+            # 隐藏整个布局行
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                if item is not None and item.widget() is not None:
+                    item.widget().setVisible(not is_text)
 
     def _pick_color(self):
         c = QColorDialog.getColor(self._color, self, i18n.tr("color"))
@@ -204,8 +256,24 @@ class AddWatermarkDialog(QDialog):
             f"background:{self._color.name()};color:#ffffff;"
             f"border:1px solid #666;border-radius:4px;padding:2px 6px;")
 
+    def _pick_image(self):
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, i18n.tr("watermark_image"), "",
+            "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
+        if path:
+            self._image_path = path
+            import os as _os
+            self._img_label.setText(_os.path.basename(path))
+
     def result(self):
-        return (self._text_edit.text().strip(), self._size_spin.value(),
+        if self._type_combo.currentIndex() == 1:
+            return ("image", self._image_path,
+                    self._scale_spin.value() / 100.0,
+                    self._opacity_slider.value() / 100.0,
+                    self._rotate_spin.value(), self._tiled_check.isChecked())
+        return ("text", self._text_edit.text().strip(),
+                self._size_spin.value(),
                 (self._color.redF(), self._color.greenF(), self._color.blueF()),
                 self._opacity_slider.value() / 100.0,
                 self._rotate_spin.value(), self._tiled_check.isChecked())

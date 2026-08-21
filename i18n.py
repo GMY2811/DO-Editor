@@ -129,6 +129,13 @@ _STRINGS = {
     "watermark_default": ("机密", "CONFIDENTIAL"),
     "watermark_empty": ("水印文字不能为空", "Watermark text cannot be empty."),
     "watermark_added": ("已添加水印", "Watermark added"),
+    "watermark_type_text": ("文字水印", "Text Watermark"),
+    "watermark_type_image": ("图片水印", "Image Watermark"),
+    "watermark_image": ("选择图片…", "Choose Image…"),
+    "watermark_image_label": ("水印图片：", "Watermark Image: "),
+    "watermark_scale": ("大小(占页宽)：", "Size (% of page width): "),
+    "watermark_image_empty": ("请先选择水印图片", "Please choose a watermark image first."),
+    "watermark_image_invalid": ("无法读取该图片", "Cannot read this image."),
     # OCR
     "menu_ocr": ("OCR 文字识别", "OCR Text Recognition"),
     "ocr_current": ("识别当前页面", "Recognize Current Page"),

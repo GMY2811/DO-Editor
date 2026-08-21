@@ -13,6 +13,7 @@ a = Analysis(
     datas=[
         ('icon.ico', '.'),
         ('app-icon.png', '.'),
+        ('assets/reward_qr.png', 'assets'),
     ] + _ocr_datas,
     hiddenimports=[
         'win32com', 'win32com.client', 'pythoncom', 'pywintypes',

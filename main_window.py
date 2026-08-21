@@ -2076,14 +2076,34 @@ class MainWindow(QMainWindow):
         dlg = AddWatermarkDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        text, fontsize, color, opacity, rotate, tiled = dlg.result()
-        if not text:
-            QMessageBox.information(
-                self, i18n.tr("hint"), i18n.tr("watermark_empty"))
-            return
+        res = dlg.result()
+        if res[0] == "image":
+            _, img_path, scale, opacity, rotate, tiled = res
+            if not img_path:
+                QMessageBox.information(
+                    self, i18n.tr("hint"),
+                    i18n.tr("watermark_image_empty"))
+                return
+        else:
+            _, text, fontsize, color, opacity, rotate, tiled = res
+            if not text:
+                QMessageBox.information(
+                    self, i18n.tr("hint"), i18n.tr("watermark_empty"))
+                return
+        # 校验通过后再记录撤销状态，避免失败操作污染撤销历史。
         view.begin_undo_step(document_change=True)
-        backend.add_watermark(view.doc, text, fontsize=fontsize, color=color,
-                              opacity=opacity, rotate=rotate, tiled=tiled)
+        if res[0] == "image":
+            if not backend.add_image_watermark(
+                    view.doc, img_path, opacity=opacity,
+                    rotate=rotate, tiled=tiled, scale=scale):
+                QMessageBox.information(
+                    self, i18n.tr("hint"),
+                    i18n.tr("watermark_image_invalid"))
+                return
+        else:
+            backend.add_watermark(view.doc, text, fontsize=fontsize,
+                                  color=color, opacity=opacity,
+                                  rotate=rotate, tiled=tiled)
         view.modified = True
         view._refresh()
         self.statusBar().showMessage(i18n.tr("watermark_added"), 3000)
