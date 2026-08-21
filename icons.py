@@ -496,7 +496,16 @@ ICONS = {
 }
 
 
+_ICON_CACHE = {}
+
+
 def get(name, color=None):
+    color_key = color if isinstance(color, str) else (
+        color.name() if color is not None else None)
+    key = (name, color_key)
+    cached = _ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
     global _CURRENT_COLOR, _CURRENT_WIDE
     base = QColor(color if color is not None else _GRAY)
     # 传入的主题基色较亮表示当前为深色背景。
@@ -504,7 +513,11 @@ def get(name, color=None):
     palette = _ACCENT_DARK if dark_background else _ACCENT_LIGHT
     _CURRENT_COLOR = QColor(palette.get(name, base.name()))
     _CURRENT_WIDE = name in _WIDE_ICONS
-    return ICONS[name]() if name in ICONS else QIcon()
+    icon = ICONS[name]() if name in ICONS else QIcon()
+    # 相同 name+color 只生成一次，显著减少启动时重复绘制
+    # （36 个图标 x 浅/深 2 色 = 上限 72 项）。
+    _ICON_CACHE[key] = icon
+    return icon
 
 
 def icon_color_for_dark(dark):
