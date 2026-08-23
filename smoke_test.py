@@ -214,6 +214,9 @@ def main():
     assert win.windowTitle() == "DO Editor"
     assert win.tabs.tabText(0) == "Untitled"
     assert win.current_view().side_tabs.tabText(0) == "Pages"
+    assert win.current_view().side_tabs.tabText(1) == "Contents"
+    assert win.current_view().outline_hint.text() == \
+        "(This PDF has no built-in outline)"
     assert win.current_view().start_title.text() == "DO Editor"
     assert win.current_view().start_open_btn.text() == "Open Document"
     assert win.act["watermark"].text() == "Add Watermark"
@@ -224,6 +227,7 @@ def main():
     assert watermark_dialog._tiled_check.text() == "Tiled"
     assert watermark_dialog._text_edit.text() == "CONFIDENTIAL"
     english_about = AboutDialog(win)
+    assert english_about.width() == 550
     assert english_about.windowTitle() == "About DO Editor"
     assert english_about.findChild(QLabel, "aboutTitleText").text() == \
         "About DO Editor"
@@ -236,7 +240,24 @@ def main():
     assert {label.text() for label in english_about.findChildren(
         QLabel, "aboutMetaLabel")} == {"Developer", "Email", "Framework"}
     assert english_about.findChild(QWidget, "primaryButton").text() == "OK"
+    english_reward = english_about.findChild(QWidget, "rewardButton")
+    assert english_reward.text() == "Support the Author"
+    assert english_reward.minimumWidth() >= \
+        english_reward.fontMetrics().horizontalAdvance(
+            english_reward.text()) + 34
+    english_about.show()
+    app.processEvents()
+    english_ok = english_about.findChild(QWidget, "primaryButton")
+    assert english_reward.geometry().right() < english_ok.geometry().left()
+    assert [action.text() for action in win._m_help.actions()
+            if not action.isSeparator()] == [
+                "Check for Updates", "Star Us", "Send Feedback",
+                "Support the Author", "About"]
     win.set_language("zh")
+    assert win.current_view().side_tabs.tabText(0) == "页面"
+    assert win.current_view().side_tabs.tabText(1) == "目录"
+    assert win.current_view().outline_hint.text() == \
+        "（此 PDF 没有自带目录）"
     assert win.act["sign"].text() == "签名设计"
     assert win.act["sidebar_default"].text() == "启动时显示侧边栏"
     assert win.act["copy_all"] not in win._m_edit.actions()

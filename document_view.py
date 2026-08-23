@@ -2489,6 +2489,12 @@ class DocumentView(QWidget):
     def apply_language(self):
         """同步文档视图中的静态文字，不重建文档或页面状态。"""
         self.side_tabs.setTabText(0, i18n.tr("pages"))
+        self.side_tabs.setTabText(1, i18n.tr("outline"))
+        self.outline_hint.setText(i18n.tr("outline_empty"))
+        # 已打开文档的目录页码也包含本地化文字（例如 p. 2 / 第 2 页），
+        # 切换语言时重新载入目录，避免树中继续保留旧语言。
+        if self.doc is not None:
+            self._load_outline()
         self.start_title.setText(i18n.tr("app_name"))
         self.start_subtitle.setText(i18n.tr("about_summary"))
         self.start_open_btn.setText(i18n.tr("start_open"))

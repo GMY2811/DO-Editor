@@ -272,6 +272,8 @@ _STRINGS = {
     "text_sign_placeholder": ("输入文字签名，如 BOSL TRUCKING", "Enter text, e.g. BOSL TRUCKING"),
     # 打赏作者
     "reward_title": ("支持作者", "Support the Author"),
+    # 帮助菜单 QAction 使用 reward 键；与弹窗标题保持同一译文。
+    "reward": ("支持作者", "Support the Author"),
     "reward_message": ("感谢您使用DO编辑器!\n如用的顺手，可请作者喝杯咖啡。",
                        "Thanks for using DO Editor!\nIf it helps, buy the author a coffee."),
     "reward_dont_show": ("以后不再弹出", "Don't show this again"),

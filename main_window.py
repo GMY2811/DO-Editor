@@ -267,7 +267,9 @@ class AboutDialog(QDialog):
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setModal(True)
-        self.setFixedWidth(460)
+        # 英文摘要和底部 "Support the Author" 均明显更长，给英文版
+        # 额外的横向空间；中文版继续保持原有紧凑宽度。
+        self.setFixedWidth(550 if i18n.get_lang() == "en" else 460)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, 1, 1, 1)
@@ -392,7 +394,13 @@ class AboutDialog(QDialog):
         ok_button.clicked.connect(self.accept)
         reward_button = QPushButton(i18n.tr("reward_title"), body)
         reward_button.setObjectName("rewardButton")
-        reward_button.setFixedSize(112, 34)
+        reward_button.setFixedHeight(34)
+        # 中英文长度差异较大，按实际字体宽度留出左右内边距，避免
+        # "Support the Author" 在高 DPI 或英文界面下被截断。
+        reward_button.setMinimumWidth(max(
+            112,
+            reward_button.fontMetrics().horizontalAdvance(
+                reward_button.text()) + 34))
         reward_button.clicked.connect(self._show_reward)
         footer.addWidget(reward_button)
         footer.addWidget(ok_button)
