@@ -2141,6 +2141,8 @@ class MainWindow(QMainWindow):
             out += ".pdf"
         ok, res = backend.merge_pdfs(paths, out)
         if ok:
+            # 打开合并结果：侧边栏显示其页面缩略图/大纲
+            self.open_file(out)
             QMessageBox.information(self, "完成", f"已合并 {len(paths)} 个文件：\n{res}")
         else:
             QMessageBox.critical(self, "错误", f"合并失败：{res}")

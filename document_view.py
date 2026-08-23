@@ -2,10 +2,11 @@
 import os
 import copy
 import pymupdf
-from PySide6.QtCore import (Qt, QSize, QRect, QRectF, QPointF, Signal, QEvent,
-                            QTimer, QItemSelectionModel)
-from PySide6.QtGui import (QImage, QPixmap, QIcon, QColor, QPainter, QPen, QFont,
-                           QShortcut, QKeySequence, QCursor)
+from PySide6.QtCore import (Qt, QSize, QRect, QRectF, QPointF, Signal,
+                            QEvent, QTimer, QItemSelectionModel)
+from PySide6.QtGui import (QIcon, QPixmap, QImage, QPainter, QColor, QPen,
+                           QFont, QTransform, QKeySequence, QShortcut,
+                           QCursor, QPageLayout)
 from PySide6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout, QSplitter,
                                QScrollArea, QListWidget, QListWidgetItem,
                                QTabWidget, QStackedWidget, QFrame, QPushButton,
@@ -314,25 +315,67 @@ class ThumbnailListWidget(QListWidget):
     """支持内部拖放并在落下后报告完整页面顺序的缩略图列表。"""
     orderChanged = Signal(object)
 
+    def dragEnterEvent(self, event):
+        # 内部拖放显式接受：避免个别环境显示"禁止"光标
+        if event.source() is self:
+            event.accept()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.source() is self:
+            event.accept()
+        else:
+            super().dragMoveEvent(event)
+
     def dropEvent(self, event):
+        # 仅处理本列表的内部拖放；外部拖放交给 Qt
+        if event.source() is not self:
+            super().dropEvent(event)
+            return
         before = [
             self.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(self.count())
         ]
-        super().dropEvent(event)
+        selected = self.selectedItems()
+        if len(selected) != 1:
+            # 多选拖动：交给 Qt 原生
+            super().dropEvent(event)
+            after = [
+                self.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self.count())
+            ]
+            if event.isAccepted() and after != before:
+                self.orderChanged.emit(after)
+            return
+        src_row = self.row(selected[0])
+        if not (0 <= src_row < self.count()):
+            return
+        target_item = self.itemAt(event.position().toPoint())
+        if target_item is None:
+            target_row = self.count() - 1       # 拖到空白 → 末尾
+        else:
+            target_row = self.row(target_item)
+        if target_row == src_row:
+            return
+        item = self.takeItem(src_row)
+        if src_row < target_row:
+            target_row -= 1                      # 移除后索引前移
+        self.insertItem(max(0, min(target_row, self.count())), item)
         after = [
             self.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(self.count())
         ]
-        if event.isAccepted() and after != before:
+        if after != before:
             self.orderChanged.emit(after)
+        event.acceptProposedAction()
 
 
 class ThumbnailDelegate(QStyledItemDelegate):
     """将页码以半透明标签覆盖在缩略图底部。"""
 
     PAGE_BAND_COLOR = QColor(248, 250, 252, 112)
-    PAGE_TEXT_COLOR = QColor(156, 163, 175, 255)
+    PAGE_TEXT_COLOR = QColor(75, 85, 99, 255)  # 深灰 #4b5563
 
     def paint(self, painter, option, index):
         opt = QStyleOptionViewItem(option)
@@ -358,15 +401,15 @@ class ThumbnailDelegate(QStyledItemDelegate):
                           icon_rect.width(), band_height)
 
         painter.save()
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self.PAGE_BAND_COLOR)
-        painter.drawRect(band_rect)
         font = painter.font()
         font.setPixelSize(max(14, min(18, round(actual.width() * 0.125))))
         font.setWeight(QFont.Weight.Bold)
         painter.setFont(font)
+        # 页码直接绘制，无底色无阴影
+        text_rect = QRect(icon_rect.left(), icon_rect.bottom() - band_height + 1,
+                          icon_rect.width(), band_height)
         painter.setPen(self.PAGE_TEXT_COLOR)
-        painter.drawText(band_rect, Qt.AlignmentFlag.AlignCenter, page_number)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, page_number)
         painter.restore()
 
 
@@ -430,7 +473,7 @@ class DocumentView(QWidget):
         # 最小/默认宽度须能容纳「页面/目录」两个页签（各约 54px，合计 ~112px）。
         self._sidebar_default_width = 120
         self._sidebar_last_width = self._sidebar_default_width
-        self.side_tabs.setMinimumWidth(118)
+        self.side_tabs.setMinimumWidth(130)
         self.side_tabs.setMaximumWidth(180)
         self.side_tabs.setVisible(False)
 
@@ -445,6 +488,7 @@ class DocumentView(QWidget):
         self.thumb_list.setIconSize(QSize(64, 91))
         self.thumb_list.setGridSize(QSize(86, 105))
         self.thumb_list.setItemDelegate(ThumbnailDelegate(self.thumb_list))
+        # Qt 原生拖放排序（InternalMove + Snap 是原始可用配置）
         self.thumb_list.setMovement(QListWidget.Movement.Snap)
         self.thumb_list.setDragEnabled(True)
         self.thumb_list.setAcceptDrops(True)
@@ -587,6 +631,8 @@ class DocumentView(QWidget):
         self._splitter = QSplitter()
         self._splitter.setObjectName("documentSplitter")
         self._splitter.setHandleWidth(1)
+        # 禁止拖 splitter 时把侧边栏折叠到 0（否则侧边栏"消失"）
+        self._splitter.setChildrenCollapsible(False)
         self._splitter.addWidget(self.side_tabs)
         self._splitter.addWidget(self.workspace_stack)
         self._splitter.setStretchFactor(0, 0)
@@ -1200,8 +1246,9 @@ class DocumentView(QWidget):
         """返回指定可用宽度下的等比例缩略图尺寸与项目尺寸。"""
 
         # 为滚动条及左右留白预留空间；源图宽度也是清晰度上限。
+        # 下限 40：侧边栏拖到最窄时缩略图仍可见（不消失）。
         icon_width = max(
-            52, min(self._thumbnail_source_width, viewport_width - 14))
+            40, min(self._thumbnail_source_width, viewport_width - 14))
         icon_height = max(1, round(icon_width * self._thumbnail_aspect))
         grid_width = max(icon_width + 8, viewport_width)
         # 页码覆盖在缩略图内部，只需给选中框和项目上下留少量空间。
@@ -1216,6 +1263,15 @@ class DocumentView(QWidget):
         self._thumbnail_job_active = False
         if self.doc is None:
             return
+        # 缩略图比例跟随文档方向：横向文档用矮缩略图，
+        # 避免固定竖版比例导致横向页面上下留白、间距过大。
+        if len(self.doc) > 0:
+            try:
+                p0 = self.doc[0]
+                aspect = p0.rect.height / max(1.0, p0.rect.width)
+                self._thumbnail_aspect = max(0.5, min(1.8, aspect))
+            except Exception:
+                self._thumbnail_aspect = 1.414
         self._update_thumbnail_layout()
         # 超大 PDF（数百页以上）一次性渲染所有缩略图会长时间冻结界面；
         # 改为分批生成，每批让出事件循环，缩略图逐渐出现。
@@ -1313,9 +1369,16 @@ class DocumentView(QWidget):
         self._on_outline_clicked(item, _col)
 
     def _on_thumb_context_menu(self, pos):
-        """缩略图右键菜单：单选删除本页，多选删除所有选中页。"""
+        """缩略图右键菜单：空白处可添加 PDF；缩略图项支持删除。"""
         item = self.thumb_list.itemAt(pos)
-        if item is None or self.doc is None:
+        if item is None:
+            # 空白处：仅提供"添加 PDF 文件"入口
+            menu = QMenu(self.thumb_list)
+            menu.addAction(i18n.tr("insert_pdf_file"),
+                           self._on_add_pdf_empty)
+            menu.exec(self.thumb_list.viewport().mapToGlobal(pos))
+            return
+        if self.doc is None:
             return
         # 右键点到未选页时按常见文件列表行为改为仅选中该页；右键点到
         # 已选集合中的任一页则保留整个多选集合。
@@ -1330,7 +1393,91 @@ class DocumentView(QWidget):
         label = (i18n.tr("delete_this_page") if len(pages) == 1 else
                  i18n.tr("delete_selected_pages"))
         menu.addAction(label, lambda checked=False, p=pages: self.delete_pages(p))
+        # 上移/下移一页（拖动排序的可靠替代入口）
+        if len(pages) == 1:
+            menu.addAction(i18n.tr("move_up"),
+                           lambda checked=False: self._move_page(-1))
+            menu.addAction(i18n.tr("move_down"),
+                           lambda checked=False: self._move_page(1))
+        # 在选中页之前插入另一个 PDF 的页面
+        insert_at = min(pages)
+        menu.addAction(
+            i18n.tr("insert_pdf_file"),
+            lambda checked=False, at=insert_at: self._on_thumb_insert_pdf(at))
+        # 文档多时空白处难点到，缩略图项上也提供"插入到末尾"入口
+        menu.addAction(
+            i18n.tr("insert_pdf_to_end"),
+            lambda checked=False: self._on_add_pdf_empty())
         menu.exec(self.thumb_list.viewport().mapToGlobal(pos))
+
+    def _move_page(self, delta):
+        """上移/下移当前选中页一页（单选时可用）。"""
+        pages = self._selected_thumbnail_pages()
+        if len(pages) != 1 or self.doc is None:
+            return
+        old = pages[0]
+        new = old + delta
+        if not (0 <= new < len(self.doc)):
+            return
+        order = list(range(len(self.doc)))
+        order[old], order[new] = order[new], order[old]
+        self._reorder_pages(order)
+
+    def _on_add_pdf_empty(self):
+        """侧边栏空白处右键：选择 PDF 插入到当前页之后。"""
+        if self.doc is None:
+            return
+        at = len(self.doc)
+        self._on_thumb_insert_pdf(at)
+
+    def _on_thumb_insert_pdf(self, at_page):
+        """选择 PDF 并插入到 at_page（0-based）之前。"""
+        if self.doc is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, i18n.tr("insert_pdf_file"), "",
+            "PDF 文件 (*.pdf)")
+        if not path:
+            return
+        self.insert_pdf_pages(path, at_page)
+
+    def insert_pdf_pages(self, path, at_page):
+        """在 at_page（0-based）位置插入另一个 PDF 的全部页面。"""
+        if self.doc is None:
+            return False
+        if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
+            return False
+        at_page = max(0, min(at_page, len(self.doc)))
+        try:
+            src = backend.open_pdf(path)
+        except Exception as e:
+            QMessageBox.warning(self, i18n.tr("hint"),
+                                f"无法打开 {path}\n{e}")
+            return False
+        with src:
+            insert_count = len(src)
+            if insert_count == 0:
+                QMessageBox.information(self, i18n.tr("hint"),
+                                        i18n.tr("insert_empty"))
+                return False
+            self.begin_undo_step(document_change=True)
+            self.doc.insert_pdf(src, start_at=at_page)
+        # 调整已有页面对象的页码
+        shifted = []
+        for obj in self.objects:
+            if obj["page"] >= at_page:
+                obj = dict(obj)
+                obj["page"] = obj["page"] + insert_count
+            shifted.append(obj)
+        self.objects = shifted
+        self.modified = True
+        self._refresh()
+        self._rebuild_thumbnails()
+        self.show_page(at_page)
+        self.statusMessage.emit(
+            f"{i18n.tr('insert_done')} {insert_count} "
+            f"{i18n.tr('insert_pages_hint')}", 3000)
+        return True
 
     def _selected_thumbnail_pages(self):
         """返回侧边栏中选中的零基页码。"""
@@ -2498,44 +2645,137 @@ class DocumentView(QWidget):
         return True
 
     # ================= 打印 =================
+    def _render_print_page(self, page_no, zoom, rot=0, want_gray=False, doc=None):
+        """渲染单个 PDF 页为 QImage（打印用）。
+
+        边长上限 2000px：避免超大位图在部分打印机驱动
+        （如 EPSON GDI）下破坏打印流导致空白页。
+        返回 RGB32 格式 QImage（驱动兼容性最好）。
+        doc：外部 pymupdf Document（多文档拼版用）；默认当前 self.doc。
+        """
+        use_doc = doc if doc is not None else self.doc
+        page = use_doc[page_no]
+        pr_w = max(page.rect.width, page.rect.height)
+        if pr_w * zoom > 2000:
+            zoom *= 2000 / (pr_w * zoom)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom),
+                              alpha=False)
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                     QImage.Format.Format_RGB888).copy()
+        img = img.convertToFormat(QImage.Format.Format_RGB32)
+        if rot:
+            img = img.transformed(QTransform().rotate(rot))
+        if want_gray:
+            img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+            img = img.convertToFormat(QImage.Format.Format_RGB32)
+        return img
+
     def print_pdf(self):
+        """打印：同一个文档的多页按 N 页/张 排版（N-up），预览同步。"""
         if self.doc is None:
             QMessageBox.information(self, i18n.tr("hint"),
                                     i18n.tr("need_open_pdf"))
             return
-        if not self._require_permission(pymupdf.PDF_PERM_PRINT, "打印"):
+        if not self._require_permission(pymupdf.PDF_PERM_PRINT, i18n.tr("menu_print")):
             return
-        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        dialog = QPrintDialog(printer, self)
-        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+        from print_dialog import (PrintDialog, ALIGN_CENTER, ALIGN_TOP_CENTER,
+                                  ALIGN_BOTTOM_CENTER, _nup_grid,
+                                  SCALE_ACTUAL, SCALE_CUSTOM)
+        dlg = PrintDialog(self.doc, self)
+        if dlg.exec() != PrintDialog.DialogCode.Accepted:
             return
+        printer = dlg.result_printer()
+        if printer is None:
+            return
+
+        scale_mode = dlg.scale_mode()
+        custom_scale = dlg.scale_percent()
+        alignment = dlg.alignment()
+        nup = dlg.pages_per_sheet()   # 每张纸页数：1/2/4
+        rot = dlg.rotation()
+        want_gray = dlg.grayscale()
+
+        # 页面范围（自定义对话框决定）
+        total = len(self.doc)
+        if dlg.print_current_only():
+            cur = max(0, self.page_view.current_page())
+            from_page = to_page = min(cur, total - 1)
+        elif dlg.custom_range():
+            f, t = dlg.custom_range()
+            from_page = max(0, f - 1)
+            to_page = min(total - 1, t - 1)
+        else:
+            from_page, to_page = 0, total - 1
+        pages = list(range(from_page, to_page + 1))
+        if dlg.reverse_order():
+            pages.reverse()
+        copies = max(1, dlg.copies())
+        all_pages = []
+        for _ in range(copies):
+            all_pages.extend(pages)
+        if not all_pages:
+            return
+
         painter = QPainter()
         if not painter.begin(printer):
-            QMessageBox.critical(self, "错误", "无法启动打印")
+            QMessageBox.critical(self, i18n.tr("hint"),
+                                 i18n.tr("print_failed"))
             return
         try:
             page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
             res = max(72, printer.resolution())
-            total = len(self.doc)
-            from_page, to_page = 0, total - 1
-            if printer.printRange() == QPrinter.PrintRange.PageRange:
-                from_page = max(0, printer.fromPage() - 1)
-                to_page = min(total - 1, printer.toPage() - 1)
-            for i in range(from_page, to_page + 1):
-                if i > from_page:
+            cols, rows = _nup_grid(nup)
+            cell_w = page_rect.width() / cols
+            cell_h = page_rect.height() / rows
+
+            placed = 0
+            is_first_sheet = True
+            for page_no in all_pages:
+                # 每张纸的首个页面才 newPage（同一张纸内不 newPage）
+                if placed == 0 and not is_first_sheet:
                     printer.newPage()
-                page = self.doc[i]
-                zoom = res / 72.0
-                pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
-                img = QImage(pix.samples, pix.width, pix.height, pix.stride,
-                             QImage.Format.Format_RGB888).copy()
+                is_first_sheet = False
+
+                col = placed % cols
+                row = placed // cols
+                cell = QRectF(page_rect.x() + col * cell_w,
+                              page_rect.y() + row * cell_h,
+                              cell_w, cell_h)
+
+                img = self._render_print_page(
+                    page_no, res / 72.0, rot, want_gray)
                 iw, ih = img.width(), img.height()
-                scale = min(page_rect.width() / iw, page_rect.height() / ih)
-                dw, dh = iw * scale, ih * scale
-                x = page_rect.x() + (page_rect.width() - dw) / 2
-                y = page_rect.y() + (page_rect.height() - dh) / 2
-                painter.drawImage(QRectF(x, y, dw, dh), img)
-            self.statusMessage.emit("已发送打印任务", 3000)
+
+                # 缩放（多页时在单元格内生效）
+                if scale_mode == SCALE_ACTUAL:
+                    dw, dh = iw * 72.0 / res, ih * 72.0 / res
+                elif scale_mode == SCALE_CUSTOM:
+                    dw, dh = iw * 72.0 / res * custom_scale, \
+                        ih * 72.0 / res * custom_scale
+                else:
+                    scale = min(cell.width() / iw, cell.height() / ih)
+                    dw, dh = iw * scale, ih * scale
+
+                # 位置：水平居中，垂直按选择对齐（单元格内）
+                if alignment == ALIGN_TOP_CENTER:
+                    x = cell.x() + (cell.width() - dw) / 2
+                    y = cell.y()
+                elif alignment == ALIGN_BOTTOM_CENTER:
+                    x = cell.x() + (cell.width() - dw) / 2
+                    y = cell.y() + cell.height() - dh
+                else:
+                    x = cell.x() + (cell.width() - dw) / 2
+                    y = cell.y() + (cell.height() - dh) / 2
+
+                # QPixmap int 重载：Windows GDI 兼容
+                painter.drawPixmap(int(x), int(y), int(dw), int(dh),
+                                   QPixmap.fromImage(img))
+
+                placed += 1
+                if placed >= nup:
+                    placed = 0
+
+            self.statusMessage.emit(i18n.tr("print_job_sent"), 3000)
         finally:
             painter.end()
 

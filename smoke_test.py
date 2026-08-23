@@ -359,7 +359,7 @@ def main():
     assert view._splitter.handleWidth() == 1
     assert view._sidebar_fit_timer.isSingleShot()
     assert view._sidebar_fit_timer.interval() == 32
-    assert view.side_tabs.minimumWidth() == 118
+    assert view.side_tabs.minimumWidth() == 130
     assert view.side_tabs.maximumWidth() == 180
     narrow_icon, narrow_grid = view._thumbnail_layout_for_width(90)
     wide_icon, wide_grid = view._thumbnail_layout_for_width(160)
@@ -373,7 +373,7 @@ def main():
     assert view.thumb_list.itemDelegate().PAGE_BAND_COLOR == \
         QColor(248, 250, 252, 112)
     assert view.thumb_list.itemDelegate().PAGE_TEXT_COLOR == \
-        QColor(156, 163, 175, 255)
+        QColor(75, 85, 99, 255)
     QApplication.clipboard().setText("直接粘贴测试")
     object_count = len(view.objects)
     view.paste_text(0, QPointF(24, 36))
