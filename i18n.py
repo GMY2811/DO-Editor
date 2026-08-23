@@ -45,6 +45,7 @@ _STRINGS = {
     "delete_page": ("删除当前页", "Delete Page"),
     "delete_this_page": ("删除本页", "Delete This Page"),
     "delete_selected_pages": ("删除所选页", "Delete Selected Pages"),
+    "delete_page_confirm": ("确定删除第 {n} 页吗？", "Delete page {n}?"),
     "delete_selected_pages_confirm": ("确定删除所选的 {n} 页吗？", "Delete the {n} selected pages?"),
     "keep_one_page": ("文档至少需要保留一页，无法删除全部页面", "A document must keep at least one page."),
     "merge": ("合并 PDF", "Merge PDF"),

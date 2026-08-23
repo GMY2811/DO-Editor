@@ -226,6 +226,7 @@ def main():
     assert watermark_dialog.windowTitle() == "Add Watermark"
     assert watermark_dialog._tiled_check.text() == "Tiled"
     assert watermark_dialog._text_edit.text() == "CONFIDENTIAL"
+    assert i18n.tr("delete_page_confirm").format(n=3) == "Delete page 3?"
     english_about = AboutDialog(win)
     assert english_about.width() == 550
     assert english_about.windowTitle() == "About DO Editor"
@@ -260,6 +261,7 @@ def main():
         "（此 PDF 没有自带目录）"
     assert win.act["sign"].text() == "签名设计"
     assert win.act["sidebar_default"].text() == "启动时显示侧边栏"
+    assert i18n.tr("delete_page_confirm").format(n=3) == "确定删除第 3 页吗？"
     assert win.act["copy_all"] not in win._m_edit.actions()
     assert win.mode_actions["text_select"].text() == "快捷复制"
     assert i18n.tr("select_text") == "快捷复制"

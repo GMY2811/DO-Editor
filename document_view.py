@@ -2619,7 +2619,7 @@ class DocumentView(QWidget):
         if confirm:
             if len(page_set) == 1:
                 pno = next(iter(page_set))
-                prompt = f"确定删除第 {pno + 1} 页吗？"
+                prompt = i18n.tr("delete_page_confirm").format(n=pno + 1)
             else:
                 prompt = i18n.tr("delete_selected_pages_confirm").format(
                     n=len(page_set))
