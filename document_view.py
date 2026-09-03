@@ -1060,11 +1060,32 @@ class DocumentView(QWidget):
         embed 的 name 为注册名，file/buffer 为字体来源；基线取原行重建值，
         使新文字与原行处于同一垂直位置。文字只按单行从左往右排（不折行），
         宽度超出部分在保存时由调用方按字符数估算的对象宽度承担。
+
+        字形兜底：若新文本含原字体没有的字形（典型：把西文行改成中文，
+        Arial/Helvetica 等无中文字形，直接写回会渲染成方块），自动回退到
+        系统中文全量字体（对象原字族 → 雅黑/宋体/黑体/等线/楷体/仿宋），
+        保证保存后汉字正常显示；字号、颜色、基线保持不变。
         """
+        text = obj.get("text", "")
+        if not (text or "").strip():
+            return
         embed = obj.get("embed") or {}
         fname = embed.get("name")
         if not fname:
             raise RuntimeError("no embed font name")
+        # —— 字形覆盖检测：文本含非西文字符且原字体缺字形 → 换中文字体 ——
+        if any(ord(ch) > 0x2E7F for ch in text if not ch.isspace()):
+            try:
+                fo = None
+                if embed.get("file"):
+                    fo = pymupdf.Font(fontfile=embed["file"])
+                elif embed.get("buffer"):
+                    fo = pymupdf.Font(fontbuffer=embed["buffer"])
+                covered = fo is not None and self._font_covers(fo, text)
+            except Exception:
+                covered = False
+            if not covered:
+                fname, embed = self._fallback_cjk_font(obj, text)
         try:
             if embed.get("file"):
                 page.insert_font(fontname=fname, fontfile=embed["file"])
@@ -1077,15 +1098,54 @@ class DocumentView(QWidget):
             fonts = page.get_fonts(full=True)
             if not any(f[3] == fname or fname in (f[3] or "") for f in fonts):
                 raise
-        text = obj.get("text", "")
-        if not text.strip():
-            return
         size = max(4.0, float(obj.get("fontsize") or 10.0))
         base = obj.get("baseline")
         if base is None:
             base = fr.y1 - size * 0.15
         page.insert_text((fr.x0, float(base)), text, fontname=fname,
                          fontsize=size, color=rgb)
+
+    @staticmethod
+    def _font_covers(font, text):
+        """字体是否含文本全部非空白字符的字形（用于写回前兜底检测）。"""
+        try:
+            for ch in text:
+                if not ch.isspace() and not font.has_glyph(ord(ch)):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _fallback_cjk_font(self, obj, text):
+        """为含中文的新文本挑选能覆盖全部字形的系统字体。
+
+        依次尝试 对象原字族 → 微软雅黑 → 宋体 → 黑体 → 等线 → 楷体 →
+        仿宋，返回 (注册名, embed dict)；全部不覆盖则抛错，由调用方回退
+        htmlbox（内置 Droid Sans Fallback 仍能显示中文）。
+        """
+        import os as _os
+        import re as _re
+        fams = [obj.get("fontfamily") or "",
+                "Microsoft YaHei", "SimSun", "SimHei",
+                "DengXian", "KaiTi", "FangSong"]
+        seen = set()
+        for fam in fams:
+            if not fam or fam in seen:
+                continue
+            seen.add(fam)
+            p = self._system_font_file(fam)
+            if not p:
+                continue
+            try:
+                fo = pymupdf.Font(fontfile=p)
+            except Exception:
+                continue
+            if not self._font_covers(fo, text):
+                continue
+            # 注册名加 fb 前缀，避免与原嵌入资源/字族名撞名
+            clean = _re.sub(r"[^A-Za-z0-9]", "", fam)
+            return "fb" + (clean or "cjk"), {"name": "fb" + clean, "file": p}
+        raise RuntimeError("no font covers text glyphs")
 
     @staticmethod
     def _pdf_fontname(family):
