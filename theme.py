@@ -331,15 +331,17 @@ QLabel#noteHoverPreview {
     border-radius: 8px;
     padding: 8px 10px;
 }
-/* 格式编辑模块(FormatDialog)的加粗/斜体开关：固定 40x32 小按钮，
-   全局 QPushButton 的 padding:6px 16px + min-height:20 会把按钮挤得
-   又窄又矮，且样式不区分 checked 状态。这里只覆盖 background/border/
-   color, 不动 padding/min, 让 setFixedSize 控制的 40x32 几何生效。 */
+/* 格式编辑模块(FormatDialog)的加粗/斜体开关：14pt 大字面。
+   全局 QPushButton 的 padding:6px 16px 会上下各啃 6px, 把 B/I 字母
+   下半截裁没。这里 ID 规则用 padding:0 覆盖全局 padding, 让 14pt
+   字符完整显示; 不动 min-width/min-height, 让 sizeHint+fixedSize
+   一起把按钮撑到合理高度(34), 同行四控件对齐。 */
 QPushButton#textFormatToggle {
     background: #f2f6fb;
     color: #334155;
     border: 1px solid #c9d3e0;
     border-radius: 6px;
+    padding: 0px;
 }
 QPushButton#textFormatToggle:hover { background: #e6edf6; }
 QPushButton#textFormatToggle:pressed { background: #dbe4ef; }
@@ -426,12 +428,13 @@ QLabel#noteHoverPreview {
     border-radius: 8px;
     padding: 8px 10px;
 }
-/* 深色主题：格式编辑模块 B/I 开关（背景/边框区分 checked，不动几何） */
+/* 深色主题：格式编辑模块 B/I 开关（padding 归零防裁 14pt 字符） */
 QPushButton#textFormatToggle {
     background: #3a3a3c;
     color: #f2f2f7;
     border: 1px solid #545456;
     border-radius: 6px;
+    padding: 0px;
 }
 QPushButton#textFormatToggle:hover { background: #48484a; }
 QPushButton#textFormatToggle:pressed { background: #555558; }
