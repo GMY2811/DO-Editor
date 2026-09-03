@@ -429,6 +429,10 @@ class DocumentView(QWidget):
         self.doc = None
         self.file_path = None
         self.zoom = 1.4
+        # 当前视图适配模式："width"=适合宽度 / "page"=整页 / None=手动缩放。
+        # 「适合宽度」按钮据此在整页与适宽之间切换；手动缩放后回到 None，
+        # 下次点击总是先进入适合宽度。
+        self._fit_mode = None
         self.modified = False
         self.current_mode = "view"
         self.edit_color = QColor(200, 30, 30)
@@ -1156,9 +1160,11 @@ class DocumentView(QWidget):
         self.show_page(self.page_view.current_page() - 1)
 
     def zoom_in(self):
+        self._fit_mode = None
         self._set_zoom(self.zoom * 1.25)
 
     def zoom_out(self):
+        self._fit_mode = None
         self._set_zoom(self.zoom / 1.25)
 
     def fit_page(self, preserve_position=False):
@@ -1167,6 +1173,7 @@ class DocumentView(QWidget):
         既无底部空隙横条，也不会露出下一页内容。"""
         if self.doc is None:
             return
+        self._fit_mode = "page"
         keep = self.page_view.current_page()
         page_offset = None
         if preserve_position:
@@ -1184,6 +1191,7 @@ class DocumentView(QWidget):
     def fit_width(self, preserve_position=False):
         if self.doc is None:
             return
+        self._fit_mode = "width"
         keep = self.page_view.current_page()
         page_offset = None
         if preserve_position:
@@ -1195,6 +1203,19 @@ class DocumentView(QWidget):
         w, _h = backend.page_size(self.doc, keep)
         vw = max(200, self.scroll.viewport().width() - 40)
         self._set_zoom(vw / w, page_offset)
+
+    def toggle_fit(self):
+        """「适合宽度」按钮：整页显示与适合宽度之间来回切换。
+
+        文档打开默认是适合宽度（_fit_mode="width"），首次点击切到整页，
+        再次点击回到适合宽度；手动缩放后（_fit_mode=None）点击先适宽。
+        """
+        if self.doc is None:
+            return
+        if self._fit_mode == "width":
+            self.fit_page()
+        else:
+            self.fit_width()
 
     def _set_zoom(self, z, page_offset=None):
         keep = self.page_view.current_page()

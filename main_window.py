@@ -999,7 +999,7 @@ class MainWindow(QMainWindow):
         mk("zoom_out", "zoom_out", "缩小", shortcut=QKeySequence.StandardKey.ZoomOut,
            triggered=lambda: self.current_view().zoom_out())
         mk("fit_width", "fit_width", "适合宽度",
-           triggered=lambda: self.current_view().fit_width())
+           triggered=lambda: self.current_view().toggle_fit())
         mk("sidebar", "sidebar", "侧边栏", triggered=self._toggle_sidebar)
         mk("sidebar_default", None, "启动时显示侧边栏", checkable=True,
            toggled=self._set_sidebar_default)
