@@ -18,6 +18,8 @@ class PageView(QWidget):
     lineSelected = Signal(int, QPointF, QPointF)    # (页, 两点)
     inkSelected = Signal(int, object)               # (页, list[QPointF])
     pointClicked = Signal(int, QPointF)             # (页, 点)
+    # 整页文字编辑：点击某个文字行（line 为 {"rect","text"}，空白处为 None）
+    textLineClicked = Signal(int, object)           # (页, 行信息或 None)
     # 对象拖动/缩放完成后同时发送新旧矩形，让文档层能把整次鼠标操作
     # 合并成一个可撤销步骤。
     objectChanged = Signal(object, QRectF, QRectF)
@@ -78,6 +80,11 @@ class PageView(QWidget):
         self._search_all = {}        # page -> [rects]
         self._search_current = None  # (page, rect) 当前定位
 
+        # 整页文字框编辑（Acrobat 风格）：缓存的各行可编辑框
+        self._edit_overlay = False
+        self._edit_lines = {}        # page -> [{rect(QRectF), text}]
+        self._edit_hover = None      # (page, idx) 当前悬停的文字行
+
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -92,6 +99,8 @@ class PageView(QWidget):
         self._dpr = max(1.0, dpr)
         self._images = {}
         self._text_words = {}
+        self._edit_lines.clear()
+        self._edit_hover = None
         self._objects = []
         self._selected = None
         self._drag = None
@@ -236,6 +245,100 @@ class PageView(QWidget):
                       (wr.y() - self._offsets[page]) / self._zoom,
                       wr.width() / self._zoom, wr.height() / self._zoom)
 
+    # ---------------- 整页文字框编辑（Acrobat 风格） ----------------
+    def set_edit_overlay(self, active):
+        """开/关「修改文字」的可编辑文字行框（须配合 point 鼠标模式）。"""
+        active = bool(active)
+        if active == self._edit_overlay:
+            return
+        self._edit_overlay = active
+        self._edit_hover = None
+        if not active:
+            self._edit_lines.clear()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+        self.update()
+
+    def invalidate_edit_lines(self, page=None):
+        """PDF 内容变化后丢弃行框缓存，下一次绘制时自动重建。"""
+        if page is None:
+            self._edit_lines.clear()
+        else:
+            self._edit_lines.pop(page, None)
+        self._edit_hover = None
+        if self._edit_overlay:
+            self.update()
+
+    def _edit_line_hits(self, page):
+        """返回一页的可编辑文字行列表（按 PDF 坐标，缓存）。
+
+        每行除 rect/text 外附带 fmt（字体/字号/颜色/粗斜体，取该行
+        中文字最长 span 的格式），供就地编辑时还原视觉外观。
+        """
+        cached = self._edit_lines.get(page)
+        if cached is not None:
+            return cached
+        out = []
+        if self._doc is not None and 0 <= page < len(self._doc):
+            try:
+                data = self._doc[page].get_text("dict")
+            except Exception:
+                data = {}
+            for block in data.get("blocks", []):
+                if block.get("type") != 0:
+                    continue    # 只框出文字块，忽略图片
+                for line in block.get("lines", []) or []:
+                    spans = line.get("spans", []) or []
+                    if not spans:
+                        continue
+                    bb = line.get("bbox")
+                    if not bb or len(bb) != 4:
+                        continue
+                    text = "".join(s.get("text", "") for s in spans)
+                    if not text.strip():
+                        continue
+                    x0, y0, x1, y1 = (float(bb[0]), float(bb[1]),
+                                      float(bb[2]), float(bb[3]))
+                    if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+                        continue
+                    # 主 span = 该行中文字最长的一段，代表整行格式
+                    main = max(spans, key=lambda s: len(s.get("text", "")))
+                    col = int(main.get("color", 0)) & 0xFFFFFF
+                    flags = int(main.get("flags", 0))
+                    out.append({
+                        "rect": QRectF(x0, y0, x1 - x0, y1 - y0),
+                        "text": text,
+                        "fmt": {
+                            "font": str(main.get("font", "") or ""),
+                            "size": round(float(main.get("size", 10.0)), 1),
+                            "color": ((col >> 16) & 255,
+                                      (col >> 8) & 255, col & 255),
+                            "bold": bool(flags & 16),
+                            "italic": bool(flags & 2),
+                        },
+                    })
+        self._edit_lines[page] = out
+        return out
+
+    def _edit_line_at(self, pos):
+        """画布坐标 → 命中的文字行 (page, idx)，未命中返回 None。"""
+        if not self._edit_overlay or self._doc is None or not self._offsets:
+            return None
+        page = self._page_at(pos.y())
+        pt = self._pdf_point(pos)[1]
+        for idx, ln in enumerate(self._edit_line_hits(page)):
+            if ln["rect"].contains(pt):
+                return (page, idx)
+        return None
+
+    def hit_edit_line(self, page, pt):
+        """PDF 坐标命中测试：返回该行的 {rect, text} 或 None（供外部复用）。"""
+        for ln in self._edit_line_hits(int(page)):
+            if ln["rect"].contains(pt):
+                return ln
+        return None
+
     # ---------------- 对象 ----------------
     def set_objects(self, objects):
         self._hide_note_tooltip()
@@ -359,6 +462,26 @@ class PageView(QWidget):
                             (r.x1 - r.x0) * self._zoom,
                             (r.y1 - r.y0) * self._zoom)
                 p.fillRect(wr, QColor(255, 140, 0, 210))
+
+            # 整页文字编辑框：给可编辑文字行铺上轻量蓝框，悬停行加深
+            if self._edit_overlay and self._mode == "point":
+                hover = self._edit_hover
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                for pno in range(len(self._doc)):
+                    o = self._offsets[pno]
+                    ph = self._page_h[pno]
+                    if o + ph < top or o > bottom:
+                        continue
+                    for idx, ln in enumerate(self._edit_line_hits(pno)):
+                        wr = self._widget_rect(pno, ln["rect"])
+                        if (pno, idx) == hover:
+                            p.fillRect(wr, QColor(37, 99, 235, 66))
+                            p.setPen(QPen(QColor(37, 99, 235, 235), 1.5))
+                        else:
+                            p.fillRect(wr, QColor(37, 99, 235, 16))
+                            p.setPen(QPen(QColor(37, 99, 235, 140), 1.0))
+                        p.setBrush(Qt.BrushStyle.NoBrush)
+                        p.drawRect(wr)
 
             for obj in self._objects:
                 wr = self._widget_rect(obj["page"], obj["rect"])
@@ -601,7 +724,15 @@ class PageView(QWidget):
                 self._ink.append(pos)
             self.update()
         else:
+            prev_hover = self._edit_hover
+            self._edit_hover = None
+            if self._edit_overlay and self._mode == "point":
+                hit = self._edit_line_at(pos)
+                if hit is not None:
+                    self._edit_hover = hit
             self._update_cursor(pos)
+            if self._edit_hover != prev_hover:
+                self.update()
 
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
@@ -645,7 +776,18 @@ class PageView(QWidget):
         elif self._mode == "point":
             d = self._cur - self._start
             if abs(d.x()) + abs(d.y()) < 4:
-                self.pointClicked.emit(page, self._pdf_point(self._start)[1])
+                if self._edit_overlay:
+                    # 整页文字编辑：把命中的行交给文档层就地编辑，
+                    # 附带点击的 PDF 横坐标（用于定位光标）。
+                    hit = self._edit_line_at(self._start)
+                    if hit is not None:
+                        line = dict(self._edit_line_hits(hit[0])[hit[1]])
+                        line["cx"] = self._pdf_point(self._start)[1].x()
+                        self.textLineClicked.emit(page, line)
+                    else:
+                        self.textLineClicked.emit(page, None)
+                else:
+                    self.pointClicked.emit(page, self._pdf_point(self._start)[1])
         self.update()
 
     def mouseDoubleClickEvent(self, e):
@@ -738,6 +880,11 @@ class PageView(QWidget):
         self._pan_last = None
         self._selecting = False
         self._sel_words = []
+        self._edit_hover = None
+        if mode != "point":
+            # 行框编辑只在 point 类交互下有效，切走即整体隐藏
+            self._edit_overlay = False
+            self._edit_lines.clear()
         if mode == "view":
             self.setCursor(Qt.CursorShape.OpenHandCursor)
         else:
@@ -779,6 +926,11 @@ class PageView(QWidget):
                 self.setCursor(Qt.CursorShape.IBeamCursor
                                if self._point_hits_text(pos)
                                else Qt.CursorShape.OpenHandCursor)
+            elif self._edit_overlay:
+                hit = self._edit_line_at(pos)
+                self.setCursor(Qt.CursorShape.IBeamCursor
+                               if hit is not None
+                               else Qt.CursorShape.ArrowCursor)
             else:
                 self.setCursor(Qt.CursorShape.CrossCursor)
             self._hide_note_tooltip()
@@ -828,6 +980,9 @@ class PageView(QWidget):
 
     def leaveEvent(self, event):
         self._hide_note_tooltip()
+        if self._edit_hover is not None:
+            self._edit_hover = None
+            self.update()
         super().leaveEvent(event)
 
     @staticmethod

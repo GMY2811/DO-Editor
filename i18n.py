@@ -120,6 +120,13 @@ _STRINGS = {
     "font_size": ("字号：", "Font Size: "),
     "bold": ("加粗", "Bold"),
     "italic": ("斜体", "Italic"),
+    "color_btn": ("颜色", "Color"),
+    "replace_input_hint": ("输入新文字…", "Type new text…"),
+    "replace_text_hint": ("点击文字行即可就地修改；回车或点击他处保存，Esc 取消",
+                          "Click a text line to edit in place. Enter or click elsewhere saves; Esc cancels"),
+    "replace_no_text": ("点击处没有可编辑的文字行", "No editable text line here"),
+    "replace_done": ("已更新第 {p} 页的文字", "Text updated on page {p}"),
+    "replace_deleted": ("已删除第 {p} 页的一行文字", "A text line was removed on page {p}"),
     # 水印
     "watermark": ("添加水印", "Add Watermark"),
     "add_watermark": ("添加水印", "Add Watermark"),
