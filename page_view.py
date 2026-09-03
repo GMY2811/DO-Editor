@@ -305,17 +305,21 @@ class PageView(QWidget):
                     # 主 span = 该行中文字最长的一段，代表整行格式
                     main = max(spans, key=lambda s: len(s.get("text", "")))
                     col = int(main.get("color", 0)) & 0xFFFFFF
-                    flags = int(main.get("flags", 0))
+                    bold, italic = backend.font_style_flags(
+                        main.get("font", ""), int(main.get("flags", 0)))
                     out.append({
                         "rect": QRectF(x0, y0, x1 - x0, y1 - y0),
                         "text": text,
+                        "font": str(main.get("font", "") or ""),
+                        "span_bbox": [float(v) for v in
+                                      (main.get("bbox") or bb)],
                         "fmt": {
                             "font": str(main.get("font", "") or ""),
                             "size": round(float(main.get("size", 10.0)), 1),
                             "color": ((col >> 16) & 255,
                                       (col >> 8) & 255, col & 255),
-                            "bold": bool(flags & 16),
-                            "italic": bool(flags & 2),
+                            "bold": bold,
+                            "italic": italic,
                         },
                     })
         self._edit_lines[page] = out

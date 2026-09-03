@@ -555,6 +555,23 @@ def _css_font_family(family):
     return "sans-serif"
 
 
+def font_style_flags(fontname, flags=0):
+    """综合 PDF 字体名与 span flags 推断粗体/斜体。
+
+    部分 PDF 生产工具不写 bold/italic flags，而是把样式拼进字体名
+    （例如 Arial-BoldMT / SimSun,Italic），只查 flags 会漏判。
+    返回 (bold, italic)。
+    """
+    low = (fontname or "").lower()
+    bold = bool(flags & 16) or any(
+        k in low for k in ("bold", "black", "heavy", "demi", "semibold",
+                           "extrabold", "ultrabold"))
+    italic = bool(flags & 2) or any(
+        k in low for k in ("italic", "oblique", "kursiv"))
+    return bold, italic
+
+
+
 def insert_text_auto(page, rect, text, fontsize=12, color=(0, 0, 0), fontfamily="",
                      bold=False, italic=False):
     """插入文字，自动处理中英文字体。fontfamily 为系统字体名，映射为衬线/无衬线/等宽。"""

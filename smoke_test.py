@@ -708,9 +708,12 @@ def main():
                for button in toolbar_buttons)
     edit_keys = [action.property("do_key") for action in win.tb2.actions()
                  if action.property("do_key")]
+    # v4 默认：… text → replace_text → watermark → sign → sign_lib …
     replace_index = edit_keys.index("replace_text")
+    assert edit_keys[edit_keys.index("text") + 1] == "replace_text"
     assert edit_keys[replace_index + 1:replace_index + 3] == \
-        ["sign", "sign_lib"]
+        ["watermark", "sign"]
+    assert edit_keys[edit_keys.index("sign") + 1] == "sign_lib"
     assert win.act["watermark"] not in win.tb1.actions()
     assert win.act["merge"] not in win.tb1.actions()
     assert win.act["split_every"] not in win.tb1.actions()
@@ -719,11 +722,10 @@ def main():
     assert sum(action is win.act["watermark"]
                for toolbar in (win.tb1, win.tb2)
                for action in toolbar.actions()) == 1
-    assert edit_keys.index("watermark") + 1 == edit_keys.index("text")
     assert edit_keys.index("image") + 1 == edit_keys.index("annotation")
     assert edit_keys.index("annotation") + 1 == edit_keys.index("ocr_toolbar")
     print("[OK] 水印、批注与 OCR 功能区按钮位置")
-    print("[OK] 签名按钮位于修改文字之后")
+    print("[OK] 签名按钮位于添加水印之后")
     print("[OK] 功能区按钮尺寸统一")
     toolbar_actions = [a for a in win.tb1.actions() if a.property("do_key")]
     drag_action = toolbar_actions[-1]

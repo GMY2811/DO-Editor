@@ -727,12 +727,12 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(60, lambda v=view: self._after_orientation_change(v))
 
     def _after_orientation_change(self, view):
-        """窗口形态调整完成后：恢复适配、统一整页显示。"""
+        """窗口形态调整完成后：恢复适配、统一按宽度显示。"""
         view._suppress_resize_fit = False
-        # 停掉本次调整触发的适宽定时器，避免其随后覆盖整页适配。
+        # 停掉本次调整触发的适宽定时器，避免其随后重复适配。
         view._window_fit_timer.stop()
         if view.doc is not None:
-            view.fit_page()
+            view.fit_width()
         # 同步视口尺寸基准，防止下一次 resizeEvent 重复触发适配。
         view._last_viewport_w = view.scroll.viewport().width()
         view._last_viewport_h = view.scroll.viewport().height()
@@ -1088,14 +1088,17 @@ class MainWindow(QMainWindow):
 
     # ================= 工具栏 =================
     def _build_toolbars(self):
-        default_file = ["save", "fit_width", "sidebar", "slideshow"]
-        mode_keys = [k for k, _l, _vm, _i in MODE_DEFS[1:]]
-        insert_at = mode_keys.index("replace_text") + 1
-        default_edit = mode_keys[:insert_at] + ["sign", "sign_lib"] + \
-            mode_keys[insert_at:]
-        default_edit.insert(default_edit.index("text"), "watermark")
-        default_edit += ["edit_color", "image", "annotation",
-                         "ocr_toolbar", "delete_page"]
+        # 默认顺序（文件段 + 编辑段水平并排，整体即「快捷按钮栏」）：
+        # 保存 / 侧边栏 / 适合宽度 / 幻灯片 | 快捷复制 / 添加文字 / 修改文字 /
+        # 添加水印 / 签名设计 / 签名库 / 高亮 / 下划线 / 删除线 / 矩形 /
+        # 直线 / 手绘 / 编辑颜色 / 插入图片 / 批注 / OCR识别 / 删除当前页。
+        default_file = ["save", "sidebar", "fit_width", "slideshow"]
+        default_edit = [
+            "text_select", "text", "replace_text", "watermark",
+            "sign", "sign_lib",
+            "highlight", "underline", "strikeout", "rect", "line", "ink",
+            "edit_color", "image", "annotation", "ocr_toolbar", "delete_page",
+        ]
         saved_raw = self.settings.value("toolbar_order", None)
         saved = None
         if saved_raw:
@@ -1147,7 +1150,13 @@ class MainWindow(QMainWindow):
                 edit.append("annotation")
             saved["edit"] = edit
             migrated = True
-        self.settings.setValue("toolbar_order_version", 3)
+        # v4：快捷按钮栏默认排列整体调整。把此前保存的任意顺序
+        # 一次性重置为新默认，之后仍尊重用户拖动自定义。
+        if saved and order_version < 4:
+            saved["file"] = list(default_file)
+            saved["edit"] = list(default_edit)
+            migrated = True
+        self.settings.setValue("toolbar_order_version", 4)
         if migrated:
             self.settings.setValue("toolbar_order", json.dumps(saved))
 

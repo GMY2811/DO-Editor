@@ -91,7 +91,7 @@ _STRINGS = {
     "rect": ("矩形", "Rectangle"),
     "line": ("直线", "Line"),
     "ink": ("手绘", "Ink"),
-    "text": ("文本", "Text"),
+    "text": ("添加文字", "Add Text"),
     # 搜索
     "search_placeholder": ("搜索文字…", "Search text…"),
     "search": ("搜索", "Search"),
