@@ -305,9 +305,6 @@ QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QFontComboBox,
 QSpinBox, QDoubleSpinBox { background: #ffffff; color: #1f1f22; border-color: #c7c7cc; }
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus,
 QFontComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #2685df; }
-QWidget#inlineTextBar { background: #fafafd; border-color: #c7c7cc; }
-QWidget#inlineTextBar QLineEdit, QWidget#inlineTextBar QFontComboBox,
-QWidget#inlineTextBar QSpinBox { background: #ffffff; border-color: #c7c7cc; }
 QTabBar { background: #e7ebf0; }
 QTabBar::tab { color: #6e6e73; }
 QTabBar::tab:selected { background: #f8fafc; color: #1769aa; border-color: #d2d9e2; }
@@ -333,6 +330,25 @@ QLabel#noteHoverPreview {
     border: 1px solid #cbd8e6;
     border-radius: 8px;
     padding: 8px 10px;
+}
+/* 格式编辑模块(FormatDialog)的加粗/斜体开关：固定 34x30 小按钮，
+   全局 QPushButton 的 padding:6px 16px 会把 "B"/"I" 裁没，必须归零
+   padding/min 尺寸；:checked 用主题蓝高亮，开/关一眼可辨。 */
+QPushButton#textFormatToggle {
+    background: #f2f6fb;
+    color: #334155;
+    border: 1px solid #c9d3e0;
+    border-radius: 6px;
+    padding: 0px;
+    min-height: 0px;
+    min-width: 0px;
+}
+QPushButton#textFormatToggle:hover { background: #e6edf6; }
+QPushButton#textFormatToggle:pressed { background: #dbe4ef; }
+QPushButton#textFormatToggle:checked {
+    background: #007aff;
+    border-color: #0071e3;
+    color: #ffffff;
 }
 """
 
@@ -387,9 +403,6 @@ QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QFontComboBox,
 QSpinBox, QDoubleSpinBox { background: #29292d; color: #f2f2f7; border-color: #4a4a4f; }
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus,
 QFontComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #3f9bec; }
-QWidget#inlineTextBar { background: #2b2b2f; border-color: #505056; }
-QWidget#inlineTextBar QLineEdit, QWidget#inlineTextBar QFontComboBox,
-QWidget#inlineTextBar QSpinBox { background: #202023; border-color: #48484d; }
 QTabBar { background: #1d1f23; }
 QTabBar::tab { color: #989fa9; }
 QTabBar::tab:selected { background: #2b3036; color: #f3f5f7; border-color: #40464e; }
@@ -414,6 +427,23 @@ QLabel#noteHoverPreview {
     border: 1px solid #4a586a;
     border-radius: 8px;
     padding: 8px 10px;
+}
+/* 深色主题：格式编辑模块 B/I 开关（padding/min 归零防裁字） */
+QPushButton#textFormatToggle {
+    background: #3a3a3c;
+    color: #f2f2f7;
+    border: 1px solid #545456;
+    border-radius: 6px;
+    padding: 0px;
+    min-height: 0px;
+    min-width: 0px;
+}
+QPushButton#textFormatToggle:hover { background: #48484a; }
+QPushButton#textFormatToggle:pressed { background: #555558; }
+QPushButton#textFormatToggle:checked {
+    background: #0a84ff;
+    border-color: #0a84ff;
+    color: #ffffff;
 }
 """
 

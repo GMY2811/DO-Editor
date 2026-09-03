@@ -3274,8 +3274,6 @@ class DocumentView(QWidget):
                     lambda _checked=False, p=page:
                     self.ocrRequested.emit(int(p)))
             action.setEnabled(can_copy and can_modify and target is not None)
-            action = menu.addAction(i18n.tr("edit_color"), self.pick_edit_color)
-            action.setEnabled(can_modify or can_annotate)
             action = menu.addAction(i18n.tr("image"))
             if target is not None:
                 page, point = target
