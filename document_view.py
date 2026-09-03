@@ -2538,6 +2538,55 @@ class DocumentView(QWidget):
             return p
         return None
 
+    def _embed_for_style(self, family, size, bold, italic):
+        """按「系统字体族 + 粗斜档」生成写回 embed（全量变体字体文件）。
+
+        就地编辑产生的浮层对象带“原行样式”的 embed；用户在格式条里把
+        字族/字号/粗斜改成新值后，旧 embed 仍指向原样式的字体文件，
+        保存烘焙（_bake_text_original_font）会用旧字体直写，导致新斜体/
+        粗细被忽略。此处按新样式重建 embed；系统无该族/变体文件时返回
+        None（调用方改走 htmlbox，其粗斜由内置变体字体承载同样生效）。
+        """
+        import os as _os
+        import re as _re
+        try:
+            fpath = self._system_font_file(
+                family or "", bold=bold, italic=italic)
+            if not fpath or not _os.path.exists(fpath):
+                return None
+            clean = _re.sub(r"[^A-Za-z0-9]", "", family or "") or "txt"
+            suffix = self._style_suffix(bold, italic)
+            name = clean + suffix
+            return {"name": name, "file": fpath}
+        except Exception:
+            return None
+
+    def _sync_embed_after_restyle(self, obj, family, size, bold, italic):
+        """浮层文本对象被改过样式后，同步其 embed 指向新样式字体。
+
+        仅当 obj 已带 embed（即“就地编辑原 PDF 行”产生的对象）且样式相对
+        原值确有变化时处理：能重建系统变体字体 embed 就重建；不能则移除
+        embed 让保存走 htmlbox（避免继续用旧字体忽略用户设置）。返回
+        True 表示 embed 已被更新/移除。
+        """
+        if not obj.get("embed"):
+            return False
+        changed = (
+            (family or "") != (obj.get("fontfamily") or "")
+            or float(size) != float(obj.get("fontsize") or 0)
+            or bool(bold) != bool(obj.get("bold"))
+            or bool(italic) != bool(obj.get("italic")))
+        if not changed:
+            return False
+        new_embed = self._embed_for_style(family, size, bold, italic)
+        if new_embed is not None:
+            obj["embed"] = new_embed
+            obj["baseline"] = None
+        else:
+            obj.pop("embed", None)
+            obj.pop("baseline", None)
+        return True
+
     def _prepare_row_embed(self, page, span_font, span_size, span_bbox,
                            bold=False, italic=False):
         """为写回行准备字体嵌入载荷与基线，保证保存后观感贴近原文。
@@ -2776,6 +2825,11 @@ class DocumentView(QWidget):
                         color, bold, italic)
                 return
             if existing is not None:
+                # 样式(字族/字号/粗斜)相对原值有变 → 让 embed 跟随新样式，
+                # 否则保存烘焙沿用旧 embed（原行字体文件）会丢失新设置的
+                # 斜体/粗细/字体。置于字段更新前以便比对原值。
+                self._sync_embed_after_restyle(
+                    existing, family, size, bold, italic)
                 self.begin_undo_step()
                 existing["text"] = text
                 existing["fontfamily"] = family
