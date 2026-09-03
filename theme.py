@@ -65,16 +65,6 @@ QWidget#searchNavSpacer { background: transparent; border: none; }
 QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QFontComboBox, QSpinBox, QDoubleSpinBox { background: #ffffff; color: #1d1d1f; border: 1px solid #c7c7cc; border-radius: 7px; padding: 5px 9px; selection-background-color: #b8d9ff; selection-color: #1d1d1f; }
 QLineEdit:hover, QTextEdit:hover, QComboBox:hover, QSpinBox:hover { border-color: #b9c5d4; }
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QFontComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #4f7cff; }
-QWidget#inlineTextBar { background: #fbfbfd; border: 1px solid #c7c7cc; border-radius: 12px; }
-QWidget#inlineTextBar QLineEdit, QWidget#inlineTextBar QFontComboBox, QWidget#inlineTextBar QSpinBox { min-height: 28px; background: #ffffff; border: 1px solid #d1d1d6; border-radius: 7px; padding: 3px 8px; color: #1d1d1f; }
-QWidget#inlineTextBar QLineEdit:focus, QWidget#inlineTextBar QFontComboBox:focus, QWidget#inlineTextBar QSpinBox:focus { border-color: #007aff; }
-QWidget#inlineTextBar QPushButton { min-height: 28px; padding: 3px 10px; border-radius: 7px; }
-QWidget#inlineTextBar QPushButton#inlineTextOk { background: #007aff; color: #ffffff; border: 1px solid #0071e3; font-weight: 600; }
-QWidget#inlineTextBar QPushButton#inlineTextOk:hover { background: #0071e3; }
-QWidget#inlineTextBar QPushButton#inlineTextCancel { background: #f1f1f4; color: #3a3a3c; border: 1px solid #d1d1d6; }
-QWidget#inlineTextBar QPushButton#inlineTextCancel:hover { background: #e5e5ea; }
-QWidget#inlineTextBar QPushButton#inlineTextColor { border: 2px solid #ffffff; }
-QWidget#inlineTextBar QCheckBox#inlineTextToggle { color: #3a3a3c; spacing: 6px; }
 QComboBox { padding-right: 26px; }
 QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; border: none; width: 24px; }
 QComboBox::down-arrow { image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAAe0lEQVR42mPw8vJioAZmGNQGsUExsZpR1CML/ofiQyIMMURSz4bLIBDmxGMIJ5paNnSvRSBJfsdj0HckdRG4ArsBSdF5LIacR5JvIBRry5EULydCHG/0o9tMyKV409F3tEDFG3YMJMQO3tgkJb0YUppFiErxDCMj91OEAeItSmw6U9O8AAAAAElFTkSuQmCC); width: 12px; height: 12px; }
@@ -200,16 +190,6 @@ QWidget#searchNavSpacer { background: transparent; border: none; }
 QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QFontComboBox, QSpinBox, QDoubleSpinBox { background: #2c2c2e; color: #f2f2f7; border: 1px solid #48484a; border-radius: 7px; padding: 5px 9px; selection-background-color: #0a5fad; }
 QLineEdit:hover, QTextEdit:hover, QComboBox:hover, QSpinBox:hover { border-color: #636366; }
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QFontComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #0a84ff; }
-QWidget#inlineTextBar { background: #2c2c2e; border: 1px solid #545456; border-radius: 12px; }
-QWidget#inlineTextBar QLineEdit, QWidget#inlineTextBar QFontComboBox, QWidget#inlineTextBar QSpinBox { min-height: 28px; background: #1c1c1e; border: 1px solid #48484a; border-radius: 7px; padding: 3px 8px; color: #f2f2f7; }
-QWidget#inlineTextBar QLineEdit:focus, QWidget#inlineTextBar QFontComboBox:focus, QWidget#inlineTextBar QSpinBox:focus { border-color: #0a84ff; }
-QWidget#inlineTextBar QPushButton { min-height: 28px; padding: 3px 10px; border-radius: 7px; }
-QWidget#inlineTextBar QPushButton#inlineTextOk { background: #0a84ff; color: #ffffff; border: 1px solid #409cff; font-weight: 600; }
-QWidget#inlineTextBar QPushButton#inlineTextOk:hover { background: #0077ed; }
-QWidget#inlineTextBar QPushButton#inlineTextCancel { background: #3a3a3c; color: #f2f2f7; border: 1px solid #545456; }
-QWidget#inlineTextBar QPushButton#inlineTextCancel:hover { background: #48484a; }
-QWidget#inlineTextBar QPushButton#inlineTextColor { border: 2px solid #636366; }
-QWidget#inlineTextBar QCheckBox#inlineTextToggle { color: #d1d1d6; spacing: 6px; }
 QComboBox { padding-right: 26px; }
 QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; border: none; width: 24px; }
 QComboBox::down-arrow { image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAAfElEQVR42mM4cPQcAzUww6A2iA2KidWMoh5Z8D8UGxJhiCGSejZcBoEwJx5DONHUsqF7LQJJ8sjseg74jqYvAFdgNSIrOYzHkPJJ8A6FYW46keDkR4nijH91mQi7Fm46+owUq3rBjICF28MYmKenFkNIsQlSKZxgZuZ8iDACO5iKekIywnQAAAABJRU5ErkJggg==); width: 12px; height: 12px; }

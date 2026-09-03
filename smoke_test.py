@@ -847,22 +847,8 @@ def main():
     assert view.objects[0]["fontsize"] == 18
     view._bake_objects()  # 含中文 + 字体烘焙不崩溃
     assert len(view.objects) == 0
-    # inline 文本编辑器
+    # 双击文字对象 → 就地编辑（已取消 620px 大编辑条）
     view.set_mode("text")
-    view._start_inline_text(0, _QPF(80, 80))
-    assert view._inline_box is not None
-    assert view._inline_box.width() == 620
-    assert view._inline_box.styleSheet() == ""
-    assert view._inline_box.layout().count() == 2
-    for object_name in ("inlineTextInput", "inlineTextFont",
-                        "inlineTextSize", "inlineTextColor",
-                        "inlineTextOk", "inlineTextCancel"):
-        assert view._inline_box.findChild(QWidget, object_name) is not None
-    assert view._inline_box.findChild(
-        SignatureFontComboBox, "inlineTextFont") is not None
-    view._close_inline_editor()
-    assert view._inline_box is None
-    # 文本工具保持激活时，双击刚确认的文本仍应重新进入编辑。
     view._add_text_object("双击修改", 0, _QPF(100, 100), keep_mode=True)
     text_obj = view.objects[-1]
     view.set_mode("text")
@@ -874,10 +860,35 @@ def main():
         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier)
     pv.mouseDoubleClickEvent(double_click)
-    assert view._inline_oid == text_obj["id"]
-    assert view._inline_edit.text() == "双击修改"
-    view._close_inline_editor()
-    print("[OK] 文本选择 + 字体 + inline 编辑器")
+    assert view._obj_edit is not None, "双击文字对象应进入就地编辑"
+    assert view._obj_edit_oid == text_obj["id"]
+    assert view._obj_edit.text() == "双击修改"
+    # 就地改文字并回车提交 → 对象更新
+    view._obj_edit.setText("双击改后")
+    view._finish_object_edit()
+    app.processEvents()
+    updated = view.objects[-1]
+    assert updated["id"] == text_obj["id"]
+    assert updated["text"] == "双击改后"
+    # 无改动提交不产生新对象/撤销记录（重开走与双击信号相同的入口）
+    view.set_mode("text")
+    view._on_object_double_clicked(updated["id"])
+    app.processEvents()
+    assert view._obj_edit is not None
+    n_objs = len(view.objects)
+    view._commit_object_edit(commit=True)
+    assert len(view.objects) == n_objs
+    # 独立「格式编辑」模块字段齐备（字体/粗细/斜体/字号/颜色）
+    from rich_text import FormatDialog
+    fd = FormatDialog({"family": "Arial", "size": 14.0,
+                       "color": QColor(255, 0, 0), "bold": True,
+                       "italic": False})
+    rf = fd.result_format()
+    assert rf["family"] == "Arial"          # 字族字符串自维护，不回退 Sans Serif
+    assert abs(rf["size"] - 14.0) < 0.01
+    assert rf["color"].name() == "#ff0000" and rf["bold"] is True
+    fd.close()
+    print("[OK] 文本选择 + 字体 + 文字对象就地编辑")
 
     win.set_theme("dark")
     assert win.theme_mode == "dark"

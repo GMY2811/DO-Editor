@@ -38,7 +38,7 @@ assert "KaiTi" in fonts, f"KaiTi font lost in saved PDF: {fonts}"
 print("FONT_FIDELITY_OK  saved_fonts=", fonts)
 re.close()
 
-# 2) toolbar 不被裁切：在页面右下放对象，双击 toolbar 应完全在视口内
+# 2) 双击文字对象 → 就地编辑框在对象原位置且不超出页面（不再弹大编辑条）
 view2 = DocumentView(); view2.resize(1000, 700); view2.show(); app.processEvents()
 assert view2.load("sample.pdf"); app.processEvents()
 view2.set_mode("text"); app.processEvents()
@@ -47,13 +47,16 @@ for tag, pt in [("tr", QPointF(450, 60)), ("br", QPointF(450, 720))]:
     view2._inplace_edit.setText(f"测试{tag}")
     view2._commit_inplace_text(commit=True); app.processEvents()
 view2.set_mode("view"); app.processEvents()
-vp = view2.scroll.viewport()
+content_w = view2.page_view.width()
 for oid in [o["id"] for o in view2.objects[-2:]]:
     view2._on_object_double_clicked(oid); app.processEvents()
-    g = view2._inline_box.geometry()
-    inside = (0 <= g.x() and g.x()+g.width() <= vp.width() and
-              0 <= g.y() and g.y()+g.height() <= vp.height())
-    assert inside, f"oid={oid} toolbar clipped: {g.x()},{g.y()} {g.width()}x{g.height()} vp={vp.width()}x{vp.height()}"
-    view2._close_inline_editor(); app.processEvents()
-print("TOOLBAR_NOCLIP_OK")
+    edit = getattr(view2, "_obj_edit", None)
+    assert edit is not None, "双击文字对象应进入就地编辑（编辑条已取消）"
+    g = edit.geometry()
+    assert g.width() > 10 and g.height() > 10, g
+    assert g.x() >= 0 and g.right() <= content_w + 2, (
+        f"oid={oid} box out of page: {g.x()},{g.y()} {g.width()}x{g.height()} "
+        f"content_w={content_w}")
+    view2._commit_object_edit(commit=True); app.processEvents()
+print("EDIT_OBJECT_INLINE_OK")
 print("FONT_CLIP_ALL_OK")

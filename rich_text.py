@@ -8,35 +8,24 @@
 
 RichEditBox：仿 QLineEdit 的单行就地编辑控件，内容却是富文本：
 - 可以用鼠标拖动选中部分字符（局部高亮）；
-- 右键菜单在系统标准项之上提供「格式设置」（粗体/斜体/字体/字号/颜色），
-  仅作用于选中的字符，实现字符级混排；
+- 右键菜单保持干净（系统标准项 + 顶部一个「格式编辑…」入口），点入口
+  才弹出独立的格式编辑模块（字体/粗细/斜体/字号/颜色 五项），结果只
+  作用于右键时选中的字符（无选中则作用于光标处的后续输入），实现字符级混排；
 - 回车 = 提交（submitRequested）、Esc = 取消（cancelRequested）；
 - 粘贴自动过滤换行，控件始终保持单行。
 """
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QTextCharFormat, QTextCursor
-from PySide6.QtWidgets import QColorDialog, QFrame, QMenu, QTextEdit
+from PySide6.QtWidgets import (QColorDialog, QDialog, QDoubleSpinBox,
+                               QFontComboBox, QFrame, QHBoxLayout, QLabel,
+                               QMenu, QPushButton, QTextEdit, QVBoxLayout)
 
 # Qt 中 1pt 按逻辑 DPI(96) 渲染为 4/3 逻辑像素。编辑器以「pt*scale
 # 逻辑像素」精确显示（与页面位图文字等大），故写入字符格式的点阵值 =
 # 目标像素 / (96/72)；读回时再乘回。scale 由 set_scale 传入（=页面 zoom
 # 或带 1.08 输入放大系数）。
 _PX_PER_PT = 96.0 / 72.0
-
-# 右键菜单常用的字体/字号/颜色候选
-_POP_FONTS = [
-    "Microsoft YaHei", "SimSun", "SimHei", "KaiTi", "FangSong", "DengXian",
-    "Arial", "Times New Roman", "Courier New", "Segoe UI",
-]
-_POP_SIZES = [6, 7, 8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 22,
-              24, 26, 28, 32, 36, 48, 60, 72]
-_POP_COLORS = [
-    ("黑色", (0, 0, 0)), ("灰色", (90, 90, 90)), ("白色", (255, 255, 255)),
-    ("红色", (192, 0, 0)), ("深红", (136, 0, 21)), ("橙色", (191, 90, 10)),
-    ("黄色", (191, 144, 0)), ("绿色", (0, 97, 0)), ("青色", (0, 115, 115)),
-    ("蓝色", (0, 40, 158)), ("紫色", (104, 33, 122)),
-]
 
 
 # --------------------------------------------------------------------------
@@ -304,9 +293,12 @@ class RichEditBox(QTextEdit):
 
     def _char_format(self, run):
         cf = QTextCharFormat()
-        family = run.get("family") or ""
-        if family:
-            cf.setFontFamilies([family])
+        # 空字族会生成「无字体」fragment，后续 fontFamily()/fontFamilies()
+        # 读取在本机 PySide/Qt 上触发原生访问违例（不可被 try 捕获），
+        # 故一律兜底为非空字族。
+        family = (run.get("family") or self._base_fmt.get("family")
+                  or "Microsoft YaHei")
+        cf.setFontFamilies([family])
         # 存点阵值 = 目标像素 / (96/72)，使 Qt 渲染像素 ≈ pt*scale
         size = float(run.get("size") or 12.0)
         pt = max(1.0, size * self._scale / _PX_PER_PT)
@@ -347,93 +339,88 @@ class RichEditBox(QTextEdit):
         # 无选区时并入当前字符格式——均同步为后续输入样式，不会整体替换
         self.mergeCurrentCharFormat(cf)
 
-    # -- 右键格式菜单 -------------------------------------------------------
+    # -- 右键「格式编辑…」独立模块 --------------------------------------
 
-    def _menu_font_submenu(self, parent, cur_family):
-        m = QMenu("字体", parent)
-        fams = list(_POP_FONTS)
-        if cur_family and cur_family not in fams:
-            fams.insert(0, cur_family)
-        for fam in fams:
-            act = m.addAction(fam)
-            act.setCheckable(True)
-            act.setChecked((cur_family or "").lower() == fam.lower())
-            act.triggered.connect(
-                lambda _c=False, f=fam: self._apply_char(family=f))
-        return m
+    def _format_at_position(self, pos):
+        """取文档 pos 处字符格式为 {family,size,color,bold,italic}。"""
+        doc = self.document()
+        last = max(0, doc.characterCount() - 1)
+        tc = QTextCursor(doc)
+        tc.setPosition(min(max(0, int(pos)), last))
+        cf = tc.charFormat()
+        return {
+            "family": self._fmt_family(cf),
+            "size": self._fmt_size_pt(cf),
+            "color": QColor(cf.foreground().color()),
+            "bold": self._fmt_bold(cf),
+            "italic": bool(cf.fontItalic()),
+        }
 
-    def _menu_size_submenu(self, parent, cur_size):
-        m = QMenu("字号", parent)
-        sizes = list(_POP_SIZES)
-        if cur_size and not any(abs(s - cur_size) < 0.01 for s in sizes):
-            sizes = sorted(sizes + [float(cur_size)])
-        for s in sizes:
-            label = ("%g" % s) + (" pt" if s == sizes[0] else "")
-            act = m.addAction("%g" % s)
-            act.setCheckable(True)
-            act.setChecked(abs(float(s) - float(cur_size)) < 0.01)
-            act.triggered.connect(
-                lambda _c=False, sz=s: self._apply_char(size_pt=float(sz)))
-        return m
+    def _open_format_editor(self, anchor, end, had_selection):
+        """弹出独立「格式编辑」模块；确认后应用到右键时的选区/光标。
 
-    def _menu_color_submenu(self, parent, cur_color):
-        m = QMenu("颜色", parent)
-        cur_rgb = (cur_color.red(), cur_color.green(), cur_color.blue())
-        for name, rgb in _POP_COLORS:
-            act = m.addAction(name)
-            act.setCheckable(True)
-            act.setChecked(rgb == cur_rgb)
-            act.triggered.connect(
-                lambda _c=False, t=rgb: self._apply_char(color=QColor(*t)))
-        m.addSeparator()
-        act = m.addAction("自定义…")
-        act.triggered.connect(self._pick_custom_color)
-        return m
-
-    def _pick_custom_color(self):
-        cur = self._selection_char_format()
-        c = QColorDialog.getColor(cur.foreground().color(), self, "选择文字颜色")
-        if c.isValid():
-            self._apply_char(color=c)
+        anchor/end/had_selection 在弹出右键菜单时捕获。菜单与对话框
+        exec 期间编辑框会失焦，调用方须保证 _suppress_focusout 生效，
+        避免上层把编辑提交关掉导致改动无处可落。
+        """
+        snap = self._format_at_position(anchor)
+        dlg = FormatDialog(snap, self.window())
+        self._suppress_focusout += 1
+        try:
+            ok = dlg.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._suppress_focusout -= 1
+        if not ok:
+            return
+        fmt = dlg.result_format()
+        # 对话框可能改变了光标/选区，重新按右键时的范围恢复，确保只
+        # 作用在那段字符上（字符级混排的关键）。
+        doc = self.document()
+        last = max(0, doc.characterCount() - 1)
+        a = min(max(0, int(anchor)), last)
+        b = min(max(0, int(end)), last)
+        tc = QTextCursor(doc)
+        if had_selection and b > a:
+            tc.setPosition(a)
+            tc.setPosition(b, QTextCursor.MoveMode.KeepAnchor)
+        else:
+            tc.setPosition(a)
+        self.setTextCursor(tc)
+        self._apply_char(bold=fmt["bold"], italic=fmt["italic"],
+                         family=fmt["family"] or None,
+                         size_pt=fmt["size"], color=fmt["color"])
+        self.setFocus()
 
     def contextMenuEvent(self, event):
-        menu = self.createStandardContextMenu()
+        # 记录右键时选区，供「格式编辑…」确认后精确恢复。
         cur = self.textCursor()
-        # 仅当确实选中了字符才提供「格式设置」入口（符合常规编辑习惯）
-        if cur.hasSelection() and cur.selectedText():
-            self._suppress_focusout += 1
-            try:
-                first = self._selection_char_format()
-                fmt_menu = QMenu("格式设置", menu)
-                act = fmt_menu.addAction("粗体")
-                act.setCheckable(True)
-                act.setChecked(self._fmt_bold(first))
-                act.triggered.connect(
-                    lambda _c=False: self._apply_char(
-                        bold=not self._fmt_bold(
-                            self._selection_char_format())))
-                act = fmt_menu.addAction("斜体")
-                act.setCheckable(True)
-                act.setChecked(first.fontItalic())
-                act.triggered.connect(
-                    lambda _c=False: self._apply_char(
-                        italic=not self._selection_char_format().fontItalic()))
-                fmt_menu.addSeparator()
-                fmt_menu.addMenu(self._menu_font_submenu(
-                    fmt_menu, self._fmt_family(first)))
-                fmt_menu.addMenu(self._menu_size_submenu(
-                    fmt_menu, self._fmt_size_pt(first)))
-                fmt_menu.addMenu(self._menu_color_submenu(
-                    fmt_menu, QColor(first.foreground().color())))
-                if menu.actions():
-                    menu.insertMenu(menu.actions()[0], fmt_menu)
-                    menu.insertSeparator(menu.actions()[1])
-                else:
-                    menu.addMenu(fmt_menu)
-            finally:
-                self._suppress_focusout -= 1
-        menu.exec(event.globalPos())
+        had_sel = bool(cur.hasSelection() and cur.selectedText())
+        anchor = cur.selectionStart() if had_sel else cur.position()
+        end = cur.selectionEnd() if had_sel else cur.position()
+
+        menu = self.createStandardContextMenu()
+        act_edit = menu.addAction("格式编辑…")
+        act_edit.setToolTip("打开独立的格式编辑模块（字体/粗细/斜体/字号/颜色）")
+        first = menu.actions()
+        if first and first[0] is not act_edit:
+            menu.insertAction(first[0], act_edit)
+            menu.insertSeparator(first[0])
+        act_edit.triggered.connect(
+            lambda _c=False: self._on_format_edit_action(menu, anchor,
+                                                         end, had_sel))
+        # 关键：菜单 exec 全程保持失焦抑制（旧实现提前释放，菜单弹出时
+        # 编辑框 FocusOut 会把本次编辑提交关掉，导致后续格式应用落空）。
+        self._suppress_focusout += 1
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            self._suppress_focusout -= 1
         menu.deleteLater()
+
+    def _on_format_edit_action(self, menu, anchor, end, had_sel):
+        """点「格式编辑…」：先收起菜单，再打开独立编辑模块。"""
+        menu.close()
+        self._open_format_editor(anchor, end, had_sel)
 
     # -- 鼠标 / 键盘 --------------------------------------------------------
 
@@ -471,3 +458,148 @@ class RichEditBox(QTextEdit):
             self.insertPlainText(txt)
         else:
             super().insertFromMimeData(source)
+
+
+class FormatDialog(QDialog):
+    """独立的「格式编辑」模块：仅含 字体/粗细/斜体/字号/颜色 五项。
+
+    由 RichEditBox 右键菜单「格式编辑…」入口打开，结果只应用到打开时
+    选中的字符（无选中则作用于光标处的后续输入）。不混入下划线、上下标
+    等重复或无关功能，保持交互聚焦。
+    """
+
+    def __init__(self, fmt, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("格式编辑")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+        fmt = fmt or {}
+        self._color = fmt.get("color")
+        if not isinstance(self._color, QColor):
+            self._color = QColor(0, 0, 0)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(10)
+
+        # 第一行：字体
+        row_font = QHBoxLayout()
+        row_font.setSpacing(8)
+        lbl_font = QLabel("字体")
+        row_font.addWidget(lbl_font)
+        self.font_combo = QFontComboBox()
+        self.font_combo.setObjectName("textFormatFont")
+        self.font_combo.setEditable(True)
+        fam = (fmt.get("family") or "").strip()
+        # 自维护字族字符串：QFontComboBox 在系统注册名不匹配（如英文环境
+        # 下的中文字体）时会回退成 "Sans Serif"，必须保留用户请求/选择
+        # 的原字族名，避免格式模块悄悄丢掉字体。
+        if fam:
+            idx = self.font_combo.findText(fam)
+            if idx >= 0:
+                self.font_combo.setCurrentIndex(idx)
+            else:
+                self.font_combo.setCurrentText(fam)
+        self._family = fam or self.font_combo.currentText().strip() \
+            or "Microsoft YaHei"
+        self.font_combo.editTextChanged.connect(self._sync_family)
+        self.font_combo.currentFontChanged.connect(
+            lambda f: self._sync_family(f.family()))
+        row_font.addWidget(self.font_combo, 1)
+        lay.addLayout(row_font)
+
+        # 第二行：字号 + 加粗/斜体 + 颜色
+        row_fmt = QHBoxLayout()
+        row_fmt.setSpacing(8)
+        lbl_size = QLabel("字号")
+        row_fmt.addWidget(lbl_size)
+        self.size_spin = QDoubleSpinBox()
+        self.size_spin.setObjectName("textFormatSize")
+        self.size_spin.setRange(1.0, 400.0)
+        self.size_spin.setDecimals(1)
+        self.size_spin.setSingleStep(0.5)
+        self.size_spin.setValue(float(fmt.get("size") or 12.0))
+        self.size_spin.setSuffix(" pt")
+        self.size_spin.setFixedWidth(84)
+        row_fmt.addWidget(self.size_spin)
+        row_fmt.addSpacing(6)
+
+        self.bold_btn = QPushButton("B")
+        self.bold_btn.setObjectName("textFormatToggle")
+        self.bold_btn.setCheckable(True)
+        self.bold_btn.setChecked(bool(fmt.get("bold", False)))
+        self.bold_btn.setToolTip("加粗")
+        self.bold_btn.setFixedSize(34, 30)
+        bold_f = QFont(self.bold_btn.font())
+        bold_f.setBold(True)
+        self.bold_btn.setFont(bold_f)
+        row_fmt.addWidget(self.bold_btn)
+
+        self.italic_btn = QPushButton("I")
+        self.italic_btn.setObjectName("textFormatToggle")
+        self.italic_btn.setCheckable(True)
+        self.italic_btn.setChecked(bool(fmt.get("italic", False)))
+        self.italic_btn.setToolTip("斜体")
+        self.italic_btn.setFixedSize(34, 30)
+        italic_f = QFont(self.italic_btn.font())
+        italic_f.setItalic(True)
+        self.italic_btn.setFont(italic_f)
+        row_fmt.addWidget(self.italic_btn)
+
+        self.color_btn = QPushButton("颜色")
+        self.color_btn.setObjectName("textFormatColor")
+        self.color_btn.setFixedWidth(92)
+        self.color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        row_fmt.addWidget(self.color_btn)
+        row_fmt.addStretch(1)
+        lay.addLayout(row_fmt)
+        self._style_color_button()
+
+        # 按钮行
+        row_btn = QHBoxLayout()
+        row_btn.addStretch(1)
+        self.ok_btn = QPushButton("确定")
+        self.ok_btn.setObjectName("textFormatOk")
+        self.ok_btn.setDefault(True)
+        self.ok_btn.setFixedWidth(88)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setObjectName("textFormatCancel")
+        self.cancel_btn.setFixedWidth(88)
+        row_btn.addWidget(self.ok_btn)
+        row_btn.addWidget(self.cancel_btn)
+        lay.addLayout(row_btn)
+
+        self.color_btn.clicked.connect(self._pick_color)
+        self.ok_btn.clicked.connect(self.accept)
+        self.cancel_btn.clicked.connect(self.reject)
+
+    def _style_color_button(self):
+        r, g, b = (self._color.red(), self._color.green(), self._color.blue())
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        fg = "#101014" if lum > 170 else "#ffffff"
+        self.color_btn.setStyleSheet(
+            "QPushButton#textFormatColor{"
+            "background: rgb(%d,%d,%d); color: %s;"
+            "border: 1px solid #b0b0b8; border-radius: 6px;"
+            "padding: 3px 6px;}" % (r, g, b, fg))
+
+    def _sync_family(self, *_):
+        txt = (self.font_combo.currentText() or "").strip()
+        if txt:
+            self._family = txt
+
+    def _pick_color(self):
+        c = QColorDialog.getColor(self._color, self, "选择文字颜色")
+        if c.isValid():
+            self._color = QColor(c)
+            self._style_color_button()
+
+    def result_format(self):
+        """返回 {family,size,color,bold,italic}，供调用方应用到选区。"""
+        return {
+            "family": self._family or "Microsoft YaHei",
+            "size": round(self.size_spin.value(), 2),
+            "color": QColor(self._color),
+            "bold": self.bold_btn.isChecked(),
+            "italic": self.italic_btn.isChecked(),
+        }

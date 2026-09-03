@@ -23,7 +23,7 @@ assert view._inplace_edit is None
 view._begin_inplace_text(0, QPointF(180, 260))
 app.processEvents()
 assert view._inplace_edit is not None, "text 工具应就地打开输入框"
-assert view._inline_box is None, "不应再弹 620px 操作条"
+assert getattr(view, "_inline_box", None) is None, "不应再弹 620px 操作条"
 edit = view._inplace_edit
 assert edit.text() == "", "新输入框应预置空"
 

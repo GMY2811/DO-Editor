@@ -30,8 +30,8 @@ print("editing line text:", repr(old_text))
 view._on_text_line_clicked(0, ln)
 app.processEvents()
 assert view._row_edit is not None, "点击文字行应在原位置就地打开编辑框"
-assert view._inline_box is None, "就地编辑不得再弹出工具条/弹窗"
-assert view._inline_edit is None
+assert getattr(view, "_inline_box", None) is None, "就地编辑不得再弹出工具条/弹窗"
+assert getattr(view, "_inline_edit", None) is None
 assert view._row_edit.text() == old_text, "就地编辑框应预填原行文字"
 assert view._row_edit_meta is not None
 
@@ -41,7 +41,7 @@ view._row_edit.setText(new_text)
 view._commit_row_edit(commit=True)      # 等价于 returnPressed 提交
 app.processEvents()
 assert view._row_edit is None, "提交后编辑框应关闭"
-assert view._inline_box is None
+assert getattr(view, "_inline_box", None) is None
 assert view.objects and view.objects[-1]["kind"] == "text"
 assert view.objects[-1]["text"] == new_text
 assert view.can_undo()
@@ -59,7 +59,7 @@ assert len(view.objects) == before, "Esc 取消不应产生撤销记录"
 # 5) 点击空白处：不弹编辑框、不报错（未在编辑时给出提示由状态栏承载）
 view._on_text_line_clicked(0, None)
 assert view._row_edit is None
-assert view._inline_box is None
+assert getattr(view, "_inline_box", None) is None
 
 # 6) 保存后再打开，新文字确实写入 PDF
 print("new text:", repr(new_text))
