@@ -7,7 +7,7 @@ from PySide6.QtCore import (Qt, QSize, QRect, QRectF, QPointF, Signal,
                             QEvent, QTimer, QItemSelectionModel)
 from PySide6.QtGui import (QIcon, QPixmap, QImage, QPainter, QColor, QPen,
                            QFont, QTransform, QKeySequence, QShortcut,
-                           QCursor, QPageLayout)
+                           QCursor, QPageLayout, QTextCursor)
 from PySide6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout, QSplitter,
                                QScrollArea, QListWidget, QListWidgetItem,
                                QTabWidget, QStackedWidget, QFrame, QPushButton,
@@ -21,6 +21,8 @@ from PySide6.QtPrintSupport import QPrinter, QPrintDialog
 import backend
 import i18n
 from page_view import PageView
+from rich_text import (RichEditBox, merge_runs, runs_text, single_run,
+                       runs_all_same_style)
 from sign_dialog import (SignatureDialog, SignatureLibraryDialog,
                          SignatureFontComboBox, qimage_to_png_bytes)
 from slide_show import SlideShowWindow
@@ -1029,6 +1031,11 @@ class DocumentView(QWidget):
                     elif kind == "ink" and len(points) >= 2:
                         backend.add_ink(page, points, rgb)
             elif kind == "text":
+                runs = obj.get("runs")
+                if runs and not runs_all_same_style(runs):
+                    # 字符级混排对象：逐段按 span 写回，保留局部粗斜/颜色/字体
+                    backend.insert_rich_text_auto(page, fr, runs)
+                    continue
                 c = obj.get("color")
                 rgb = (c.redF(), c.greenF(), c.blueF()) if c else (0, 0, 0)
                 embed = obj.get("embed")
@@ -2054,16 +2061,16 @@ class DocumentView(QWidget):
         self._begin_row_edit(int(page), line)
 
     def _begin_row_edit(self, page, line):
-        """在文字行原位置就地打开单行编辑框（无弹窗）。
+        """在文字行原位置就地打开单行富文本编辑框（无弹窗）。
 
-        编辑器紧贴该行文字框，字号/颜色/字体还原原文样式；输入框中
-        预填原行文字但不全选——光标定位到鼠标点击的字符处，点哪改哪，
-        避免误操作整行被替换；回车或点击其它处提交，Esc 取消。
+        编辑器紧贴该行文字框，按行内各 span 的字体/字号/颜色/粗斜预填
+        （保留行内原本的字符级格式差异），光标定位到鼠标点击的字符处；
+        框内可拖动选中部分字符 → 右键「格式设置」只改选中字符，实现
+        字符级混排。回车或点击其它处提交，Esc 取消。
         """
         if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
             return
-        from PySide6.QtWidgets import QLineEdit
-        from PySide6.QtGui import QFont
+        from PySide6.QtGui import QTextCursor
         self._close_inline_editor()
 
         # 编辑框是页面画布的子控件：page_view 就是滚动内容本身
@@ -2104,24 +2111,49 @@ class DocumentView(QWidget):
         box_w = max(ww + 6.0, min(180.0, avail_w))
         box_w = min(box_w, avail_w)
 
-        edit = QLineEdit(str(line.get("text", "")), canvas)
+        # 初始富文本：按行内各 span 预填（行内原本有混排时保留原样），
+        # 仅当行无 span 明细时才退化为单段整行格式。
+        init_runs = []
+        for s in (line.get("spans") or []):
+            st = str(s.get("text", ""))
+            if not st:
+                continue
+            fam = self._map_pdf_font(s.get("font", "")) or family
+            sc = s.get("color") or c
+            init_runs.append({
+                "text": st, "family": fam,
+                "size": float(s.get("size") or size),
+                "color": QColor(int(sc[0]), int(sc[1]), int(sc[2])),
+                "bold": bool(s.get("bold", bold)),
+                "italic": bool(s.get("italic", italic)),
+            })
+        if not init_runs:
+            init_runs = single_run(
+                str(line.get("text", "")), family, size, color, bold, italic)
+
+        edit = RichEditBox(canvas)
         edit.setObjectName("rowEditInline")
-        font = QFont(family)
-        font.setPixelSize(int(round(font_px)))
-        font.setBold(bold)
-        font.setItalic(italic)
-        edit.setFont(font)
+        edit.set_scale(zoom)
+        # 控件级字体像素与页面一致（逐字符渲染由 RichEditBox 的字符格式
+        # 以 pt*zoom 映射点阵控制，二者数值一致）
+        from PySide6.QtGui import QFont as _QFont
+        _wf = _QFont(family)
+        _wf.setPixelSize(int(round(font_px)))
+        _wf.setBold(bold)
+        _wf.setItalic(italic)
+        edit.setFont(_wf)
         # 编辑器覆盖在页面上，采用近纸色半透明底 + 主题蓝细框，
         # 文字尽量沿用原颜色（过浅则压暗以保证在白底上可读）。
         text_color = color.name() if luminance > 225 else (
             "#1c1c1e" if luminance > 200 else color.name())
         edit.setStyleSheet(
-            "QLineEdit#rowEditInline{"
+            "QTextEdit#rowEditInline{"
             "background-color: rgba(255,255,255,0.92);"
             "border: 1px solid #0a84ff; border-radius: 2px;"
             "padding: 0 2px; color: %s;"
             "selection-background-color: #b6d7ff;"
             "selection-color: #101418;}" % text_color)
+        edit.set_runs(init_runs)
         edit.setGeometry(bx, by, int(box_w), int(box_h))
         edit.raise_()
         edit.show()
@@ -2129,12 +2161,14 @@ class DocumentView(QWidget):
         # 点击进入不默认全选：光标定位到鼠标点击处的字符，便于点哪改哪。
         # 鼠标不在框内（键盘/程序触发）则把光标放到行尾，避免误替换整行。
         click_pos = edit.mapFromGlobal(QCursor.pos())
-        char_idx = edit.cursorPositionAt(click_pos)
-        if char_idx < 0:
-            char_idx = len(edit.text())
-        QTimer.singleShot(
-            0, lambda e=edit, i=char_idx: e.setCursorPosition(i))
-        edit.returnPressed.connect(self._finish_row_edit)
+        cur = edit.textCursor()
+        if edit.rect().contains(click_pos):
+            cur = edit.cursorForPosition(click_pos)
+        else:
+            cur.movePosition(QTextCursor.MoveOperation.End)
+        edit.setTextCursor(cur)
+        edit.sync_typing_format_from_cursor()
+        edit.submitRequested.connect(self._finish_row_edit)
         edit.installEventFilter(self)
         self._row_edit = edit
         self._row_edit_meta = {
@@ -2151,6 +2185,8 @@ class DocumentView(QWidget):
             "fmt": dict(line.get("fmt") or {}),
             "span_bbox": list(line.get("span_bbox") or
                               [r.x(), r.y(), r.right(), r.bottom()]),
+            # 初始富文本（行内原有样式），用于判定用户是否改了格式
+            "init_runs": init_runs,
         }
 
     def _finish_row_edit(self):
@@ -2162,6 +2198,12 @@ class DocumentView(QWidget):
     def _commit_row_edit(self, commit=True):
         """关闭就地行编辑框。commit=True 时把改动写回 PDF。
 
+        提交前把框内富文本合并成样式段：
+        - 单段统一格式 → 走原单样式写回路径（未改样式时用点击行原字体
+          embed 精确写回；用户整段改过样式则按新样式重建系统变体字体）；
+        - 多段（用户做了字符级混排）→ 生成带 runs 的浮层对象，保存时
+          逐段写回。
+
         返回是否曾处于行编辑状态（用于点击空白的提示决策）。
         """
         edit = self._row_edit
@@ -2170,29 +2212,52 @@ class DocumentView(QWidget):
         meta = self._row_edit_meta or {}
         page = int(meta.get("page", 0))
         rect = meta.get("rect")
-        new_text = edit.text()
+        new_runs = merge_runs(edit.to_runs())
+        new_text = runs_text(new_runs)
         self._close_inline_editor()
         if not commit or rect is None:
             return True
         old_text = meta.get("text", "")
-        if new_text == old_text:
-            return True                     # 未改动，不产生撤销记录
-        family = ""
-        size = 10.0
-        color = QColor(0, 0, 0)
-        bold = italic = False
+        init_runs = meta.get("init_runs") or []
+        # 内容与整行样式都没动 → 不产生撤销记录
+        if new_text == old_text and not self._runs_style_diff(
+                new_runs, init_runs):
+            return True
+        er = meta.get("erase")
+        erase_rect = (QRectF(er[0], er[1], er[2] - er[0], er[3] - er[1])
+                      if er and len(er) == 4 else None)
+
+        # ---- 多段混排：富文本对象 ----
+        if len(new_runs) > 1:
+            self._commit_edited_line(
+                page, rect, new_text, "", 10.0, QColor(0, 0, 0),
+                False, False, runs=new_runs, erase=erase_rect)
+            return True
+
+        # ---- 单段：恢复整行样式参数 ----
+        try:
+            r0 = new_runs[0]
+            family = (r0.get("family") or
+                      self._map_pdf_font((meta.get("fmt") or {}).get("font", "")) or
+                      "Microsoft YaHei")
+            size = round(float(r0.get("size") or 10.0), 1)
+            color = r0.get("color")
+            if not isinstance(color, QColor):
+                color = QColor(0, 0, 0)
+            bold = bool(r0.get("bold"))
+            italic = bool(r0.get("italic"))
+        except Exception:
+            family, size, color, bold, italic = "Microsoft YaHei", 10.0, \
+                QColor(0, 0, 0), False, False
+
         embed = None
         baseline = None
         fmt = meta.get("fmt") or {}
-        if fmt:
-            # 主路径：直接使用点击命中行的格式（表格文档中同一水平带
-            # 常有多行上下交叠，按 y 二次定位会误中相邻行，导致字号、
-            # 颜色被串成其它行的值）。embed/baseline 由命中行主 span
-            # 的字体与矩形重建，保证保存后观感与点击行一致。
+        style_changed = self._runs_style_diff(new_runs, init_runs)
+        if fmt and not style_changed:
+            # 样式未变（只改文字）：沿用点击行的原字体与基线精确写回
             try:
                 pdf_font = str(fmt.get("font") or "")
-                family = (self._map_pdf_font(pdf_font) or
-                          "Microsoft YaHei")
                 size = round(float(fmt.get("size") or 10.0), 1)
                 cc = fmt.get("color") or (0, 0, 0)
                 color = QColor(int(cc[0]), int(cc[1]), int(cc[2]))
@@ -2206,63 +2271,34 @@ class DocumentView(QWidget):
             except Exception:
                 embed = None
                 baseline = None
-        else:
-            try:
-                # 兜底：meta 无 fmt（理论不会走到）→ 才按位置就近找行。
-                p = self.doc[page]
-                lines = []
-                for block in p.get_text("dict").get("blocks", []):
-                    if block.get("type") != 0:
-                        continue
-                    lines.extend(block.get("lines", []) or [])
-                cx = meta.get("cx", rect.center().x())
-                target = None
-                if lines:
-                    cy = rect.center().y()
-                    cands = []
-                    for ln in lines:
-                        b0 = ln.get("bbox")
-                        if not b0:
-                            continue
-                        if (b0[1] - 2 <= cy <= b0[3] + 2):
-                            cands.append(ln)
-                    if not cands:
-                        cands = [min(lines, key=lambda ln: abs(
-                            (ln["bbox"][1] + ln["bbox"][3]) / 2.0 - cy))]
-                    # 同带多行时按横坐标就近取真正被点击的行
-                    target = min(cands, key=lambda ln: abs(
-                        (ln["bbox"][0] + ln["bbox"][2]) / 2.0 - cx))
-                if target is not None:
-                    span = max(target["spans"],
-                               key=lambda s: len(s.get("text", "")))
-                    fam = self._map_pdf_font(span.get("font", ""))
-                    family = fam or "Microsoft YaHei"
-                    size = round(float(span.get("size", 10.0)), 1)
-                    col = int(span.get("color", 0)) & 0xFFFFFF
-                    color = QColor((col >> 16) & 255,
-                                   (col >> 8) & 255, col & 255)
-                    bold, italic = backend.font_style_flags(
-                        span.get("font", ""), int(span.get("flags", 0)))
-                    embed, baseline = self._prepare_row_embed(
-                        p, span.get("font", ""), span.get("size", 10.0),
-                        span.get("bbox"), bold=bold, italic=italic)
-            except Exception:
-                embed = None
-                baseline = None
-        er = meta.get("erase")
-        erase_rect = (QRectF(er[0], er[1], er[2] - er[0], er[3] - er[1])
-                      if er and len(er) == 4 else None)
+        elif style_changed:
+            # 用户整段改了样式（字体/粗斜/字号…）：按新样式重建系统
+            # 变体字体 embed，保证写回保留新观感；系统缺该族/变体则
+            # 移除 embed 走 htmlbox。
+            embed = self._embed_for_style(family, size, bold, italic)
         self._commit_edited_line(page, rect, new_text, family, size,
                                  color, bold, italic, embed=embed,
                                  baseline=baseline, erase=erase_rect)
         return True
 
+    @staticmethod
+    def _runs_style_diff(runs_a, runs_b):
+        """runs 列表整体样式是否不同（忽略文本本身，仅比样式序列）。
+
+        用于判断用户是否在就地编辑中改动过格式。
+        """
+        from rich_text import _style_key
+        ka = [_style_key(r) for r in (runs_a or [])]
+        kb = [_style_key(r) for r in (runs_b or [])]
+        return ka != kb
+
     def _begin_inplace_text(self, page, pt):
         """「文本」工具点击处就地输入新文字（无弹窗工具条）。
 
-        点击位置直接出现单行输入框，预置点击处文字格式；输入完后
-        回车或点击页面其它处即在该处写入浮动文字对象，Esc 取消；
-        保持 text 模式可连续在其它位置继续添加。
+        点击位置直接出现单行富文本输入框，预置点击处文字格式（可选中
+        部分字符后右键「格式设置」实现字符级混排）；输入完后回车或点击
+        页面其它处即在该处写入浮动文字对象，Esc 取消；保持 text 模式可
+        连续在其它位置继续添加。
         """
         if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
             return
@@ -2294,26 +2330,26 @@ class DocumentView(QWidget):
         text_color = color.name() if lum > 225 else (
             "#1c1c1e" if lum > 200 else color.name())
         style = (
-            "QLineEdit#textEditInline{"
+            "QTextEdit#textEditInline{"
             "background-color: rgba(255,255,255,0.92);"
             "border: 1px dashed #0a84ff; border-radius: 2px;"
             "padding: 0 2px; color: %s;"
             "selection-background-color: #b6d7ff;"
             "selection-color: #101418;}" % text_color)
 
-        edit = QLineEdit("", canvas)
+        edit = RichEditBox(canvas)
         edit.setObjectName("textEditInline")
-        font = QFont(family)
-        font.setPixelSize(int(round(font_px)))
-        font.setBold(bold)
-        font.setItalic(italic)
-        edit.setFont(font)
+        edit.set_scale(zoom * 1.08)
+        edit.set_default_format({
+            "family": family, "size": size, "color": color,
+            "bold": bold, "italic": italic,
+        })
         edit.setStyleSheet(style)
         edit.setGeometry(int(wx), int(wy), int(box_w), int(box_h))
         edit.raise_()
         edit.show()
         edit.setFocus()
-        edit.returnPressed.connect(self._finish_inplace_text)
+        edit.submitRequested.connect(self._finish_inplace_text)
         edit.installEventFilter(self)
         self._inplace_edit = edit
         self._inplace_meta = {
@@ -2338,14 +2374,25 @@ class DocumentView(QWidget):
         if edit is None:
             return False
         meta = self._inplace_meta or {}
-        new_text = edit.text().strip()
+        runs = self._trim_runs(edit.to_runs())
+        new_text = runs_text(runs)
         self._close_inline_editor()
-        if commit and new_text:
-            self._add_text_object(
-                new_text, int(meta.get("page", 0)), meta["pt"],
-                meta.get("family", ""), meta.get("size", 10.0),
-                meta.get("color"), meta.get("bold", False),
-                meta.get("italic", False), keep_mode=True)
+        if commit and new_text.strip():
+            if runs and len(runs) > 1:
+                self._add_text_object(
+                    new_text, int(meta.get("page", 0)), meta["pt"],
+                    runs=runs, keep_mode=True)
+            else:
+                r0 = runs[0] if runs else {}
+                self._add_text_object(
+                    new_text, int(meta.get("page", 0)), meta["pt"],
+                    (r0.get("family") or meta.get("family", "")),
+                    (r0.get("size") or meta.get("size", 10.0)),
+                    (r0.get("color") if isinstance(r0.get("color"), QColor)
+                     else meta.get("color")),
+                    r0.get("bold", meta.get("bold", False)),
+                    r0.get("italic", meta.get("italic", False)),
+                    keep_mode=True)
         return True
 
     def _close_inline_editor(self):
@@ -2662,31 +2709,51 @@ class DocumentView(QWidget):
             return None, float(bb[3]) - size * 0.15
 
     def _start_inline_text(self, page, pt, oid=None, line=None):
-        """在页面位置显示 inline 文字输入框（字体/字号/颜色）。
-        oid 非空 = 编辑既有浮动文字对象；line 非空 = 就地修改 PDF 原有文字行。"""
+        """在页面位置显示 inline 富文本编辑条（字体/字号/颜色/粗斜）。
+
+        oid 非空 = 编辑既有浮动文字对象；line 非空 = 就地修改 PDF 原文
+        文字行。输入框为富文本：可选中部分字符后右键「格式设置」局部
+        修改；格式条控件同样作用于框内选区（无选区则作用于后续输入）。
+        """
         if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
             return
-        from PySide6.QtWidgets import (QTextEdit, QFontComboBox, QSpinBox,
-                                      QPushButton, QHBoxLayout, QVBoxLayout,
-                                      QCheckBox)
+        from PySide6.QtWidgets import (QSpinBox, QPushButton, QHBoxLayout,
+                                      QVBoxLayout, QCheckBox)
         from PySide6.QtGui import QFont
         self._close_inline_editor()
 
         existing = None
         line_target = None
         zoom = self.page_view._zoom
+        init_runs = []
         if oid is not None:
             existing = next((o for o in self.objects if o["id"] == oid), None)
         if existing is not None:
             wx = int(existing["rect"].x() * zoom)
             wy = int(self.page_view._offsets[page] +
                      existing["rect"].y() * zoom)
-            init_text = existing.get("text", "")
-            init_family = existing.get("fontfamily", "")
-            init_size = existing.get("fontsize", 10)
-            cur_color = existing.get("color") or QColor(self.edit_color)
-            init_bold = existing.get("bold", False)
-            init_italic = existing.get("italic", False)
+            ex_runs = existing.get("runs")
+            if ex_runs:
+                init_runs = merge_runs(ex_runs)
+            else:
+                init_runs = single_run(
+                    existing.get("text", ""),
+                    existing.get("fontfamily", ""),
+                    float(existing.get("fontsize") or 10),
+                    existing.get("color") or QColor(self.edit_color),
+                    bool(existing.get("bold", False)),
+                    bool(existing.get("italic", False)))
+            cur_color = (init_runs[0]["color"] if init_runs
+                         else existing.get("color")
+                         or QColor(self.edit_color))
+            init_family = (init_runs[0]["family"] if init_runs
+                           else existing.get("fontfamily", ""))
+            init_size = int(round(init_runs[0]["size"] if init_runs
+                                  else float(existing.get("fontsize") or 10)))
+            init_bold = bool(init_runs[0]["bold"] if init_runs
+                             else existing.get("bold", False))
+            init_italic = bool(init_runs[0]["italic"] if init_runs
+                               else existing.get("italic", False))
         elif line is not None:
             # 就地编辑 PDF 原文字行：编辑条尽量对准点击行的视觉位置
             lr = line["rect"]
@@ -2695,19 +2762,35 @@ class DocumentView(QWidget):
             lh = lr.height() * zoom
             wy = int(self.page_view._offsets[page] +
                      lr.y() * zoom + lh * 0.5 - 22)
-            init_text = str(line.get("text", ""))
             fmt = self._detect_format_at(page, pt)
-            init_family = fmt["family"] or ""
-            init_size = int(round(fmt["size"]))
-            cur_color = fmt["color"]
-            init_bold = fmt["bold"]
-            init_italic = fmt["italic"]
+            for s in (line.get("spans") or []):
+                st = str(s.get("text", ""))
+                if not st:
+                    continue
+                fam = self._map_pdf_font(s.get("font", "")) or fmt["family"]
+                sc = s.get("color") or (0, 0, 0)
+                init_runs.append({
+                    "text": st, "family": fam or "Microsoft YaHei",
+                    "size": float(s.get("size") or fmt["size"]),
+                    "color": QColor(int(sc[0]), int(sc[1]), int(sc[2])),
+                    "bold": bool(s.get("bold", fmt["bold"])),
+                    "italic": bool(s.get("italic", fmt["italic"])),
+                })
+            if not init_runs:
+                init_runs = single_run(str(line.get("text", "")),
+                                       fmt["family"] or "Microsoft YaHei",
+                                       fmt["size"], fmt["color"],
+                                       fmt["bold"], fmt["italic"])
+            cur_color = init_runs[0]["color"]
+            init_family = init_runs[0]["family"]
+            init_size = int(round(init_runs[0]["size"]))
+            init_bold = bool(init_runs[0]["bold"])
+            init_italic = bool(init_runs[0]["italic"])
         else:
             wx = int(pt.x() * zoom)
             wy = int(self.page_view._offsets[page] + pt.y() * zoom)
-            init_text = ""
             fmt = self._detect_format_at(page, pt)
-            init_family = fmt["family"]
+            init_family = fmt["family"] or "Microsoft YaHei"
             init_size = int(round(fmt["size"]))
             cur_color = fmt["color"]
             init_bold = fmt["bold"]
@@ -2730,10 +2813,11 @@ class DocumentView(QWidget):
 
         input_row = QHBoxLayout()
         input_row.setSpacing(7)
-        edit = QLineEdit(init_text)
+        edit = RichEditBox(box)
         edit.setObjectName("inlineTextInput")
-        edit.setPlaceholderText(i18n.tr("replace_input_hint"))
+        edit.set_scale(zoom)
         edit.setMinimumWidth(360)
+        edit.setFixedHeight(32)
         font_combo = SignatureFontComboBox()
         font_combo.setObjectName("inlineTextFont")
         font_combo.setFixedWidth(176)
@@ -2788,9 +2872,6 @@ class DocumentView(QWidget):
         box_w = box.width()
         box_h = box.height()
         # 把内容坐标 (wx, wy) 换算成视口像素坐标，并按视口尺寸 clamp。
-        # 当页面比窗口窄时，QScrollArea 居中对齐，page_view 之外有一段空白；
-        # 若 box 还按内容坐标定位 + 父级 = page_view，超出 page_view 宽度的右半
-        # 截会落在视口空白区里被裁掉。父级改为 viewport 后这里直接用视口像素。
         vp = self.scroll.viewport()
         h_off = self.scroll.horizontalScrollBar().value()
         v_off = self.scroll.verticalScrollBar().value()
@@ -2805,70 +2886,200 @@ class DocumentView(QWidget):
         box.move(vp_x, vp_y)
         box.show()
         edit.setFocus()
-        edit.selectAll()
 
+        # ---- 载入富文本内容（多段混排对象保留原样，整段文本沿用全选）----
+        has_multi = False
+        if init_runs:
+            init_runs = merge_runs(init_runs)
+            has_multi = len(init_runs) > 1
+            edit.set_runs(init_runs)
+        else:
+            edit.set_default_format({
+                "family": init_family, "size": init_size,
+                "color": cur_color, "bold": init_bold,
+                "italic": init_italic,
+            })
+        cur = edit.textCursor()
+        if has_multi:
+            cur.movePosition(QTextCursor.MoveOperation.Start)
+            edit.setTextCursor(cur)
+        else:
+            edit.selectAll()
+        edit.sync_typing_format_from_cursor()
+
+        # ---- 格式条控件：Word 风格——有选区作用于选区，否则影响后续输入 ----
+        def bar_apply():
+            edit._apply_char(
+                family=font_combo.currentFont().family(),
+                size_pt=float(size_spin.value()),
+                color=color_state["color"],
+                bold=bold_check.isChecked(),
+                italic=italic_check.isChecked())
+
+        def bar_sync():
+            """光标/选区变化后，让格式条控件反映选中（或光标处）字符的样式。"""
+            cf = edit._selection_char_format()
+            fam = edit._fmt_family(cf)
+            sz = max(size_spin.minimum(),
+                     min(size_spin.maximum(),
+                         int(round(edit._fmt_size_pt(cf)))))
+            bd = edit._fmt_bold(cf)
+            it = cf.fontItalic()
+            cc = QColor(cf.foreground().color())
+            for w in (font_combo, size_spin, bold_check,
+                      italic_check, btn_color):
+                w.blockSignals(True)
+            try:
+                font_combo.setCurrentFont(QFont(fam or init_family))
+                size_spin.setValue(sz)
+                bold_check.setChecked(bd)
+                italic_check.setChecked(it)
+                color_state["color"] = cc
+                self._style_color_btn(btn_color, cc)
+            finally:
+                for w in (font_combo, size_spin, bold_check,
+                          italic_check, btn_color):
+                    w.blockSignals(False)
+
+        font_combo.currentFontChanged.connect(
+            lambda _f: bar_apply() if font_combo.hasFocus() else None)
+        size_spin.valueChanged.connect(lambda _v: bar_apply())
+        bold_check.toggled.connect(lambda _c: bar_apply())
+        italic_check.toggled.connect(lambda _c: bar_apply())
+        btn_color.clicked.connect(lambda: bar_apply())
+        edit.cursorPositionChanged.connect(bar_sync)
+        edit.selectionChanged.connect(bar_sync)
+
+        # ---- 确定：把富文本写回对象 / 页面 ----
         def on_ok():
-            text = edit.text()
-            family = font_combo.currentFont().family()
-            size = size_spin.value()
-            color = color_state["color"]
-            bold = bold_check.isChecked()
-            italic = italic_check.isChecked()
             target = line_target
+            runs2 = merge_runs(edit.to_runs())
+            text2 = runs_text(runs2)
             self._close_inline_editor()
-            if not text.strip():
-                if existing is not None:
-                    self.delete_object(oid)
-                elif target is not None:
-                    self._commit_edited_line(
-                        target[0], target[1], "", family, size,
-                        color, bold, italic)
-                return
             if existing is not None:
-                # 样式(字族/字号/粗斜)相对原值有变 → 让 embed 跟随新样式，
-                # 否则保存烘焙沿用旧 embed（原行字体文件）会丢失新设置的
-                # 斜体/粗细/字体。置于字段更新前以便比对原值。
-                self._sync_embed_after_restyle(
-                    existing, family, size, bold, italic)
-                self.begin_undo_step()
-                existing["text"] = text
-                existing["fontfamily"] = family
-                existing["fontsize"] = size
-                existing["color"] = color
-                existing["bold"] = bold
-                existing["italic"] = italic
-                self.modified = True
-                self._refresh_objects()
-                self.page_view.select(oid)
-            elif target is not None:
+                if not text2.strip():
+                    self.delete_object(oid)
+                else:
+                    self._update_text_object(oid, runs2)
+                return
+            if not text2.strip():
+                if target is not None:
+                    self._commit_edited_line(
+                        target[0], target[1], "", "Microsoft YaHei", 10.0,
+                        QColor(0, 0, 0), False, False)
+                return
+            if len(runs2) > 1:
+                if target is not None:
+                    self._commit_edited_line(
+                        target[0], target[1], text2, "", 10.0,
+                        QColor(0, 0, 0), False, False, runs=runs2)
+                else:
+                    self._add_text_object(text2, page, pt, runs=runs2,
+                                          keep_mode=True)
+                return
+            r0 = runs2[0] if runs2 else {}
+            family = (r0.get("family") or init_family)
+            size = (float(r0.get("size") or init_size))
+            color = (r0.get("color") if isinstance(r0.get("color"), QColor)
+                     else cur_color)
+            bold = bool(r0.get("bold", init_bold))
+            italic = bool(r0.get("italic", init_italic))
+            if target is not None:
                 self._commit_edited_line(
-                    target[0], target[1], text, family, size,
+                    target[0], target[1], text2, family, size,
                     color, bold, italic)
             else:
-                self._add_text_object(text, page, pt, family, size, color, bold,
-                                      italic, keep_mode=True)
+                self._add_text_object(text2, page, pt, family, size,
+                                      color, bold, italic, keep_mode=True)
 
         btn_ok.clicked.connect(on_ok)
-        edit.returnPressed.connect(on_ok)
+        edit.submitRequested.connect(on_ok)
         edit.installEventFilter(self)
         btn_cancel.clicked.connect(self._close_inline_editor)
         self._inline_box = box
         self._inline_edit = edit
         self._inline_oid = oid
 
+    def _update_text_object(self, oid, runs):
+        """编辑条确定：用富文本 runs 更新既有文本对象。
+
+        多段（字符级混排）→ 对象带 runs、去掉 embed 走逐段写回；
+        单段 → 回到单一格式对象，样式相对原值有变时同步重建 embed。
+        """
+        obj = self._find_object(oid)
+        if obj is None:
+            return
+        runs = merge_runs(runs)
+        text = runs_text(runs)
+        if not text.strip():
+            self.delete_object(oid)
+            return
+        r0 = runs[0] if runs else {}
+        family = r0.get("family") or obj.get("fontfamily", "")
+        size = float(r0.get("size") or obj.get("fontsize") or 10)
+        color = (r0.get("color") if isinstance(r0.get("color"), QColor)
+                 else obj.get("color") or QColor(0, 0, 0))
+        bold = bool(r0.get("bold", obj.get("bold", False)))
+        italic = bool(r0.get("italic", obj.get("italic", False)))
+        if len(runs) > 1:
+            # 字符级混排：保存逐段写回，放弃单一原字体 embed
+            self.begin_undo_step()
+            obj["text"] = text
+            obj["fontfamily"] = family
+            obj["fontsize"] = size
+            obj["color"] = QColor(color)
+            obj["bold"] = bold
+            obj["italic"] = italic
+            obj["runs"] = runs
+            obj.pop("embed", None)
+            obj.pop("baseline", None)
+        else:
+            # 单段整条改过样式 → 让 embed 跟随新样式（否则保存会沿用
+            # 旧 embed 的原行字体文件，丢失用户新设的斜体/粗细/字体）。
+            # 注意：须先于字段覆盖调用，_sync 用对象原值判断样式是否变化。
+            self._sync_embed_after_restyle(obj, family, size, bold, italic)
+            self.begin_undo_step()
+            obj["text"] = text
+            obj["fontfamily"] = family
+            obj["fontsize"] = size
+            obj["color"] = QColor(color)
+            obj["bold"] = bold
+            obj["italic"] = italic
+            obj.pop("runs", None)
+        # 文字变长时自动加宽对象，避免保存排版折行
+        new_w = max(obj["rect"].width(), self._est_runs_width(runs))
+        obj["rect"].setWidth(new_w)
+        self.modified = True
+        self._refresh_objects()
+        self.page_view.select(oid)
+
     def _commit_edited_line(self, page, rect, text, fontfamily, fontsize, color,
                             bold, italic, embed=None, baseline=None,
-                            erase=None):
+                            erase=None, runs=None):
         """就地编辑结果写回 PDF：擦除原行文字，在相同位置叠加新文字浮层。
 
         embed/baseline 由 _prepare_row_embed 提供，用于保存时以原字体、
         原基线高度写回，保证最终 PDF 观感贴近原文；为空则走 htmlbox。
+
+        runs 非空（多段混排）时忽略 embed/baseline，对象带 runs 按段写回；
+        顶层样式字段取首段值，便于既有单样式渲染/编辑逻辑使用。
 
         erase 为字符级擦除矩形（不含字体上下行）。红act 删除与矩形
         相交的整段文本，PyMuPDF 行 bbox 含字体 ascent/descent，行距
         紧凑的文档中相邻行 bbox 互相交叠，直接用行 bbox 会误删相邻
         整行文字——必须用仅覆盖真实字形的 erase 矩形。
         """
+        if runs:
+            runs = merge_runs(runs)
+            text = runs_text(runs)
+            if runs:
+                r0 = runs[0]
+                fontfamily = r0.get("family") or fontfamily
+                fontsize = r0.get("size") or fontsize
+                color = r0.get("color") if isinstance(
+                    r0.get("color"), QColor) else color
+                bold = bool(r0.get("bold"))
+                italic = bool(r0.get("italic"))
         if erase is not None and not erase.isEmpty():
             fr = pymupdf.Rect(erase.x(), erase.y(),
                               erase.right(), erase.bottom())
@@ -2890,13 +3101,17 @@ class DocumentView(QWidget):
         # 新文字可能比原文更长：把对象矩形放宽到能容纳整行内容，
         # 否则保存（按矩形排版）时会把长句折成两行。按字符数估算宽度，
         # 东亚字约 1.0em、西文约 0.55em，与 Qt/PDF 设备无关，稳定可靠。
-        size_pt = max(4.0, float(fontsize or 10.0))
-        est_w = sum(
-            size_pt if ord(ch) > 0x2E80 else size_pt * 0.55
-            for ch in text) * 1.06 + 6.0
+        if runs and len(runs) > 1:
+            est_w = self._est_runs_width(runs)
+        else:
+            size_pt = max(4.0, float(fontsize or 10.0))
+            est_w = sum(
+                size_pt if ord(ch) > 0x2E80 else size_pt * 0.55
+                for ch in text) * 1.06 + 6.0
         obj_w = max(rect.width(), est_w)
+        size_pt = max(4.0, float(fontsize or 10.0))
         obj_h = max(rect.height(), size_pt * 1.3 + 2.0)
-        self.objects.append({
+        obj = {
             "id": self._obj_counter, "page": int(page),
             "rect": QRectF(rect.x(), rect.y(),
                            max(obj_w, 40.0), max(obj_h, 20.0)),
@@ -2904,12 +3119,43 @@ class DocumentView(QWidget):
             "color": color if color is not None else QColor(0, 0, 0),
             "fontsize": fontsize, "fontfamily": fontfamily,
             "bold": bold, "italic": italic, "kind": "text",
-            "embed": embed, "baseline": baseline,
-        })
+        }
+        if runs and len(runs) > 1:
+            obj["runs"] = runs
+            obj.pop("embed", None)
+            obj.pop("baseline", None)
+        else:
+            obj["embed"] = embed
+            obj["baseline"] = baseline
+        self.objects.append(obj)
         self._refresh()
         self.page_view.select(self._obj_counter)
         self.statusMessage.emit(
             i18n.tr("replace_done").format(p=int(page) + 1), 3000)
+
+    @staticmethod
+    def _est_runs_width(runs):
+        """按各段字号估算混排 runs 的总宽度（PDF pt，字符级近似）。
+
+        与单行估算同思路：东亚字约 1.0em、西文约 0.55em，按段字号累加，
+        不依赖系统字体度量，避免与保存排版宽度不一致导致折行。
+        """
+        total = 0.0
+        for r in (runs or []):
+            size = max(4.0, float(r.get("size") or 10.0))
+            for ch in r.get("text", ""):
+                total += size if ord(ch) > 0x2E80 else size * 0.55
+        return total * 1.06 + 6.0
+
+    @staticmethod
+    def _trim_runs(runs):
+        """去掉混排 runs 首尾的空白（首段去左侧、末段去右侧）。"""
+        runs = merge_runs(runs)
+        if not runs:
+            return []
+        runs[0]["text"] = (runs[0]["text"] or "").lstrip()
+        runs[-1]["text"] = (runs[-1]["text"] or "").rstrip()
+        return merge_runs(runs)
 
     @staticmethod
     def _style_color_btn(btn, color):
@@ -2942,18 +3188,39 @@ class DocumentView(QWidget):
         self.page_view.select(self._obj_counter)
 
     def _add_text_object(self, text, page, pt, fontfamily="", fontsize=12, color=None,
-                         bold=False, italic=False, keep_mode=False):
-        rect = self._measure_text_rect(text, fontfamily, fontsize, bold, italic)
+                         bold=False, italic=False, keep_mode=False, runs=None):
+        if runs:
+            runs = merge_runs(runs)
+            text = runs_text(runs)
+            if runs:
+                r0 = runs[0]
+                fontfamily = r0.get("family") or fontfamily
+                fontsize = r0.get("size") or fontsize
+                color = r0.get("color") if isinstance(
+                    r0.get("color"), QColor) else color
+                bold = bool(r0.get("bold"))
+                italic = bool(r0.get("italic"))
+            if len(runs) > 1:
+                rect = QRectF(0, 0, self._est_runs_width(runs),
+                              max(16.0, float(fontsize or 12.0) * 1.35 + 6.0))
+            else:
+                runs = None    # 单段统一格式 → 与既有对象模型一致
+        if not runs:
+            rect = self._measure_text_rect(text, fontfamily, fontsize,
+                                           bold, italic)
         rect.moveTo(pt.x(), pt.y())
         self.begin_undo_step()
         self._obj_counter += 1
-        self.objects.append({
+        obj = {
             "id": self._obj_counter, "page": page,
             "rect": rect,
             "text": text, "color": color if color is not None else QColor(0, 0, 0),
             "fontsize": fontsize, "fontfamily": fontfamily, "bold": bold,
             "italic": italic, "kind": "text",
-        })
+        }
+        if runs and len(runs) > 1:
+            obj["runs"] = runs
+        self.objects.append(obj)
         self.modified = True
         if not keep_mode:
             self.set_mode("view")
@@ -3610,6 +3877,9 @@ class DocumentView(QWidget):
                 self.page_view.setFocus()
                 return True
             if event.type() == QEvent.Type.FocusOut:
+                if getattr(obj, "_suppress_focusout", 0) > 0:
+                    # 正在弹出右键格式菜单：失焦交给菜单，不提交不关闭
+                    return False
                 # 点击页面其它处 / 其它行：把当前行改动提交写回；
                 # 置位标记避免随后 textLineClicked(None) 重复提示。
                 self._row_focus_pending = True
@@ -3629,6 +3899,8 @@ class DocumentView(QWidget):
                 self.page_view.setFocus()
                 return True
             if event.type() == QEvent.Type.FocusOut:
+                if getattr(obj, "_suppress_focusout", 0) > 0:
+                    return False
                 # 点击页面其它处 / 切换工具：把就地输入的内容写入文档
                 self._commit_inplace_text(commit=True)
                 return False

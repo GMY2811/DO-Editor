@@ -29,7 +29,7 @@ assert edit.text() == "", "新输入框应预置空"
 
 # 2) 输入后回车提交 → 生成浮动文字对象并保持在 text 模式
 edit.setText("就地新增文字")
-edit.returnPressed.emit()
+edit.submitRequested.emit()
 app.processEvents()
 assert view.objects and view.objects[-1]["kind"] == "text"
 assert view.objects[-1]["text"] == "就地新增文字", "回车后应写入对象"

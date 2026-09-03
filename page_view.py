@@ -2,10 +2,11 @@
 from html import escape
 
 from PySide6.QtCore import Qt, QRectF, QPointF, QPoint, Signal
-from PySide6.QtGui import QImage, QPainter, QPen, QColor, QBrush, QFont
+from PySide6.QtGui import QImage, QPainter, QPen, QColor, QBrush, QFont, QFontMetrics
 from PySide6.QtWidgets import QWidget, QLabel, QToolTip, QGraphicsDropShadowEffect
 
 import backend
+from rich_text import merge_runs, runs_all_same_style
 
 _ACCENT = QColor(37, 99, 235)
 _PLACEHOLDER = QColor(255, 0, 255)   # 文本定位框高对比色（洋红）
@@ -335,10 +336,31 @@ class PageView(QWidget):
                     col = int(main.get("color", 0)) & 0xFFFFFF
                     bold, italic = backend.font_style_flags(
                         main.get("font", ""), int(main.get("flags", 0)))
+                    # 行内各 span 的样式明细：就地编辑以富文本预填时
+                    # 保留行内原本的字符级格式差异（斜体词、变色字等），
+                    # 用户不改就不会被整行统一样式抹平。
+                    span_info = []
+                    for s in spans:
+                        st = _span_text(s)
+                        if not st:
+                            continue
+                        sc = int(s.get("color", 0)) & 0xFFFFFF
+                        sb, si = backend.font_style_flags(
+                            s.get("font", ""), int(s.get("flags", 0)))
+                        span_info.append({
+                            "text": st,
+                            "font": str(s.get("font", "") or ""),
+                            "size": round(float(s.get("size", 10.0)), 1),
+                            "color": ((sc >> 16) & 255,
+                                      (sc >> 8) & 255, sc & 255),
+                            "bold": sb,
+                            "italic": si,
+                        })
                     out.append({
                         "rect": QRectF(x0, y0, x1 - x0, y1 - y0),
                         "erase": erase,
                         "text": text,
+                        "spans": span_info,
                         "font": str(main.get("font", "") or ""),
                         "span_bbox": [float(v) for v in
                                       (main.get("bbox") or bb)],
@@ -523,15 +545,20 @@ class PageView(QWidget):
                     p.setPen(QPen(_PLACEHOLDER, 1.6, Qt.PenStyle.DashLine))
                     p.setBrush(Qt.BrushStyle.NoBrush)
                     p.drawRect(wr)
-                    family = obj.get("fontfamily") or "Microsoft YaHei UI"
-                    f = QFont(family)
-                    f.setPixelSize(max(10, int(obj.get("fontsize", 11) * self._zoom)))
-                    f.setBold(bool(obj.get("bold", False)))
-                    f.setItalic(bool(obj.get("italic", False)))
-                    p.setFont(f)
-                    p.setPen(obj.get("color") or QColor(0, 0, 0))
-                    p.drawText(wr, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-                               obj.get("text", ""))
+                    runs = obj.get("runs")
+                    mixed = bool(runs) and not runs_all_same_style(runs)
+                    if mixed:
+                        self._paint_text_runs(p, wr, runs)
+                    else:
+                        family = obj.get("fontfamily") or "Microsoft YaHei UI"
+                        f = QFont(family)
+                        f.setPixelSize(max(10, int(obj.get("fontsize", 11) * self._zoom)))
+                        f.setBold(bool(obj.get("bold", False)))
+                        f.setItalic(bool(obj.get("italic", False)))
+                        p.setFont(f)
+                        p.setPen(obj.get("color") or QColor(0, 0, 0))
+                        p.drawText(wr, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                                   obj.get("text", ""))
                 elif kind == "note":
                     self._paint_note_marker(
                         p, wr, QColor(obj.get("color") or QColor("#ff9f0a")))
@@ -604,6 +631,41 @@ class PageView(QWidget):
                     for i in range(len(pts) - 1):
                         p.drawLine(pts[i], pts[i + 1])
         p.end()
+
+    def _paint_text_runs(self, painter, wr, runs):
+        """按样式段逐段绘制混排文字（共用同一基线，观感贴近常规排版）。
+
+        wr 为对象矩形按当前 zoom 放大后的画布矩形；每段字号换算为
+        pt*zoom 的像素字号，与单样式文字路径一致。
+        """
+        runs = merge_runs(runs)
+        if not runs:
+            return
+        infos = []
+        for r in runs:
+            f = QFont(r.get("family") or "Microsoft YaHei UI")
+            f.setPixelSize(max(
+                2, int(round(float(r.get("size") or 12.0) * self._zoom))))
+            f.setBold(bool(r.get("bold")))
+            f.setItalic(bool(r.get("italic")))
+            infos.append((r, f, QFontMetrics(f)))
+        max_h = max((fm.height() for _, _, fm in infos), default=12.0)
+        max_asc = max((fm.ascent() for _, _, fm in infos),
+                      default=max_h * 0.8)
+        baseline = wr.top() + max(0.0, (wr.height() - max_h) / 2.0) + max_asc
+        x = wr.left()
+        for r, f, fm in infos:
+            w = fm.horizontalAdvance(r.get("text", ""))
+            painter.setFont(f)
+            c = r.get("color")
+            painter.setPen(c if isinstance(c, QColor) and c.isValid()
+                           else QColor(0, 0, 0))
+            top = baseline - fm.ascent()
+            painter.drawText(
+                QRectF(x, top, w, fm.height()),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                r.get("text", ""))
+            x += w
 
     @staticmethod
     def _paint_note_marker(painter, rect, color):

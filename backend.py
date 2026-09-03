@@ -586,6 +586,50 @@ def insert_text_auto(page, rect, text, fontsize=12, color=(0, 0, 0), fontfamily=
     page.insert_htmlbox(rect, safe, css=css)
 
 
+def _rgb255(color):
+    """颜色值(QColor 或 (r,g,b) 0..1 或 (r,g,b) 0..255)→ (r,g,b) 0..255。"""
+    if hasattr(color, "redF"):          # QColor / QColor-like
+        return (int(round(color.redF() * 255)),
+                int(round(color.greenF() * 255)),
+                int(round(color.blueF() * 255)))
+    try:
+        r, g, b = (float(c) for c in color[:3])
+    except Exception:
+        return 0, 0, 0
+    if max(r, g, b) <= 1.0001:
+        return int(round(r * 255)), int(round(g * 255)), int(round(b * 255))
+    return int(round(r)), int(round(g)), int(round(b))
+
+
+def insert_rich_text_auto(page, rect, runs):
+    """插入富文本（字符级混排）。runs 为样式段列表，每段含
+    text / family(系统字体名) / size(pt) / color / bold / italic。
+
+    逐段生成内联 span 后由 insert_htmlbox 排版；字号以 pt 语义
+    与 insert_text_auto 保持一致。
+    """
+    import html as _html
+    parts = []
+    for run in runs or []:
+        text = (run.get("text") or "")
+        if not text:
+            continue
+        safe = _html.escape(text).replace("\n", "<br>")
+        fam = _css_font_family(run.get("family") or "")
+        weight = "bold" if run.get("bold") else "normal"
+        style = "italic" if run.get("italic") else "normal"
+        size = max(1.0, float(run.get("size") or 12.0))
+        r, g, b = _rgb255(run.get("color") or (0, 0, 0))
+        parts.append(
+            f'<span style="font-family:{fam};font-size:{size}px;'
+            f'font-weight:{weight};font-style:{style};'
+            f'color:rgb({r},{g},{b});">{safe}</span>')
+    if not parts:
+        return
+    page.insert_htmlbox(rect, "".join(parts),
+                        css="*{margin:0;padding:0;}")
+
+
 def redact_rect(page, rect):
     """删除指定矩形区域内的原有内容（用于修改文字前清除原文）。"""
     page.add_redact_annot(rect)
