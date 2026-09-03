@@ -592,6 +592,70 @@ def redact_rect(page, rect):
     page.apply_redactions()
 
 
+def _safe_y_range(page, line_rect, self_cy=None):
+    """把行 bbox 的 y 范围钳制到不与任何其它文字行 bbox 相交。
+
+    PyMuPDF 行 bbox 含字体 ascend/descend，行距紧凑的文档（正文/表格）
+    相邻行 bbox 互相交叠；红act 会删除与矩形相交的整段文本，直接按
+    整行 bbox 擦除会把相邻整行文字一并吞掉。这里把 y 上/下界收缩到
+    最近邻行的内侧边缘（留 0.1pt 安全缝），红act 矩形即与其它行零
+    相交。返回 (y0, y1)；收缩过狠（不足半行高）时仍返回原范围由
+    调用方决定。
+    """
+    import pymupdf as _pym
+    y0, y1 = float(line_rect.y0), float(line_rect.y1)
+    h = y1 - y0
+    cy = float(self_cy) if self_cy is not None else (y0 + y1) / 2.0
+    eps = 0.1
+    above_bottom = None      # 上方最近的其它行底
+    below_top = None         # 下方最近的其它行顶
+    try:
+        data = page.get_text("dict")
+    except Exception:
+        data = {}
+    for b in data.get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        for ln in b.get("lines", []) or []:
+            bb = ln.get("bbox")
+            if not bb or len(bb) != 4:
+                continue
+            oy0, oy1 = float(bb[1]), float(bb[3])
+            ocy = (oy0 + oy1) / 2.0
+            if abs(ocy - cy) < h * 0.6:
+                continue                 # 同一行（含上下交叠的同带兄弟行），跳过
+            if oy1 <= cy:
+                if above_bottom is None or oy1 > above_bottom:
+                    above_bottom = oy1
+            elif oy0 >= cy:
+                if below_top is None or oy0 < below_top:
+                    below_top = oy0
+    if above_bottom is not None:
+        y0 = max(y0, above_bottom + eps)
+    if below_top is not None:
+        y1 = min(y1, below_top - eps)
+    return y0, y1
+
+
+def redact_line_safe(page, line_rect, erase_rect=None):
+    """按行删除文字，但不误伤相邻行。
+
+    line_rect 为命中行 bbox（决定删除哪一行），erase_rect 为字符级
+    实际区域（决定 x 范围，默认取 line_rect）；y 方向按邻行边界钳制，
+    保证红act 矩形不与其它行相交，杜绝整行误删。
+    """
+    import pymupdf as _pym
+    er = erase_rect or line_rect
+    y0, y1 = _safe_y_range(page, line_rect)
+    if y1 - y0 < 0.2:
+        # 整行被上下行夹死（理论极罕见）：退回整行红act，宁残留不扩散
+        redact_rect(page, er)
+        return
+    page.add_redact_annot(
+        _pym.Rect(er.x0, y0, er.x1, y1))
+    page.apply_redactions()
+
+
 def replace_text(page, rect, new_text, fontsize=12, color=(0, 0, 0), fontfamily="",
                  bold=False, italic=False):
     """覆盖式修改文字：删除原区域内容后写入新文字。返回新文本。"""

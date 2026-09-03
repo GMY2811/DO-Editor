@@ -2140,6 +2140,10 @@ class DocumentView(QWidget):
         self._row_edit_meta = {
             "page": page,
             "rect": QRectF(r),
+            # 擦除区 = 字符级并集（不含字体上下行），避免红act 越界吞掉
+            # 相邻行文字；行 bbox 在行距紧凑时与邻行交叠，不能直接用来擦除。
+            "erase": list(line.get("erase")) if line.get("erase") else
+                     [r.x(), r.y(), r.right(), r.bottom()],
             "text": str(line.get("text", "")),
             "cx": float(line.get("cx", r.x() + r.width() / 2.0)),
             # 提交时直接复用点击命中行的格式与主 span 矩形，避免
@@ -2245,9 +2249,12 @@ class DocumentView(QWidget):
             except Exception:
                 embed = None
                 baseline = None
+        er = meta.get("erase")
+        erase_rect = (QRectF(er[0], er[1], er[2] - er[0], er[3] - er[1])
+                      if er and len(er) == 4 else None)
         self._commit_edited_line(page, rect, new_text, family, size,
                                  color, bold, italic, embed=embed,
-                                 baseline=baseline)
+                                 baseline=baseline, erase=erase_rect)
         return True
 
     def _begin_inplace_text(self, page, pt):
@@ -2796,15 +2803,29 @@ class DocumentView(QWidget):
         self._inline_oid = oid
 
     def _commit_edited_line(self, page, rect, text, fontfamily, fontsize, color,
-                            bold, italic, embed=None, baseline=None):
+                            bold, italic, embed=None, baseline=None,
+                            erase=None):
         """就地编辑结果写回 PDF：擦除原行文字，在相同位置叠加新文字浮层。
 
         embed/baseline 由 _prepare_row_embed 提供，用于保存时以原字体、
         原基线高度写回，保证最终 PDF 观感贴近原文；为空则走 htmlbox。
+
+        erase 为字符级擦除矩形（不含字体上下行）。红act 删除与矩形
+        相交的整段文本，PyMuPDF 行 bbox 含字体 ascent/descent，行距
+        紧凑的文档中相邻行 bbox 互相交叠，直接用行 bbox 会误删相邻
+        整行文字——必须用仅覆盖真实字形的 erase 矩形。
         """
-        fr = pymupdf.Rect(rect.x(), rect.y(), rect.right(), rect.bottom())
+        if erase is not None and not erase.isEmpty():
+            fr = pymupdf.Rect(erase.x(), erase.y(),
+                              erase.right(), erase.bottom())
+        else:
+            fr = None
+        fr_line = pymupdf.Rect(rect.x(), rect.y(),
+                               rect.right(), rect.bottom())
         self.begin_undo_step(document_change=True)
-        backend.redact_rect(self.doc[int(page)], fr)
+        # 安全擦除：红act 矩形 y 向按邻行边界钳制，删除本行而不吞相邻行。
+        backend.redact_line_safe(self.doc[int(page)], fr_line,
+                                 erase_rect=fr or fr_line)
         self.modified = True
         if not text.strip():
             self._refresh()

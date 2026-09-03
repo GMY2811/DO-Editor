@@ -275,6 +275,10 @@ class PageView(QWidget):
 
         每行除 rect/text 外附带 fmt（字体/字号/颜色/粗斜体，取该行
         中文字最长 span 的格式），供就地编辑时还原视觉外观。
+        erase 为整行字符字形 bbox 的并集——PyMuPDF 的 line bbox 含
+        字体上行/下行，行距紧凑时与相邻行 bbox 交叠，若直接用 line
+        bbox 做擦除（redact）会连带吞掉相邻整行文字；字符级并集只
+        覆盖真实字形区域，与相邻行不相交，擦除安全。
         """
         cached = self._edit_lines.get(page)
         if cached is not None:
@@ -282,7 +286,7 @@ class PageView(QWidget):
         out = []
         if self._doc is not None and 0 <= page < len(self._doc):
             try:
-                data = self._doc[page].get_text("dict")
+                data = self._doc[page].get_text("rawdict")
             except Exception:
                 data = {}
             for block in data.get("blocks", []):
@@ -295,13 +299,37 @@ class PageView(QWidget):
                     bb = line.get("bbox")
                     if not bb or len(bb) != 4:
                         continue
-                    text = "".join(s.get("text", "") for s in spans)
+                    # rawdict 的 span 无 "text" 键，文本须由 chars 拼接；
+                    # dict 结构则直接用 span["text"]。
+                    def _span_text(s):
+                        chs = s.get("chars") or []
+                        if chs:
+                            return "".join(ch.get("c", "") for ch in chs)
+                        return s.get("text", "")
+                    text = "".join(_span_text(s) for s in spans)
                     if not text.strip():
                         continue
                     x0, y0, x1, y1 = (float(bb[0]), float(bb[1]),
                                       float(bb[2]), float(bb[3]))
                     if x1 - x0 < 1.0 or y1 - y0 < 1.0:
                         continue
+                    # 字符级并集：跳过空白字符（无字形），得出真实擦除区
+                    erase = None
+                    for s in spans:
+                        for ch in s.get("chars", []) or []:
+                            cb = ch.get("bbox")
+                            if not cb or len(cb) != 4:
+                                continue
+                            if not ch.get("c") or ch["c"].isspace():
+                                continue
+                            if erase is None:
+                                erase = [float(cb[0]), float(cb[1]),
+                                         float(cb[2]), float(cb[3])]
+                            else:
+                                erase[0] = min(erase[0], float(cb[0]))
+                                erase[1] = min(erase[1], float(cb[1]))
+                                erase[2] = max(erase[2], float(cb[2]))
+                                erase[3] = max(erase[3], float(cb[3]))
                     # 主 span = 该行中文字最长的一段，代表整行格式
                     main = max(spans, key=lambda s: len(s.get("text", "")))
                     col = int(main.get("color", 0)) & 0xFFFFFF
@@ -309,6 +337,7 @@ class PageView(QWidget):
                         main.get("font", ""), int(main.get("flags", 0)))
                     out.append({
                         "rect": QRectF(x0, y0, x1 - x0, y1 - y0),
+                        "erase": erase,
                         "text": text,
                         "font": str(main.get("font", "") or ""),
                         "span_bbox": [float(v) for v in
