@@ -531,10 +531,13 @@ class FormatDialog(QDialog):
         self.bold_btn.setCheckable(True)
         self.bold_btn.setChecked(bool(fmt.get("bold", False)))
         self.bold_btn.setToolTip("加粗")
-        self.bold_btn.setFixedSize(40, 30)
+        # 与 size_spin(34)/color_btn(34) 同高，宽度放宽到 44 让 14pt
+        # B/I 字形在 padding:0 下也不会被压扁——之前 40×30 比旁边的
+        # 控件矮且窄，italic 的 "I" 渲染成斜杠后只剩 "/"，看起来像被裁。
+        self.bold_btn.setFixedSize(44, 34)
         bold_f = QFont(self.bold_btn.font())
         bold_f.setBold(True)
-        bold_f.setPointSize(14)
+        bold_f.setPointSize(13)
         self.bold_btn.setFont(bold_f)
         row_fmt.addWidget(self.bold_btn)
 
@@ -543,10 +546,10 @@ class FormatDialog(QDialog):
         self.italic_btn.setCheckable(True)
         self.italic_btn.setChecked(bool(fmt.get("italic", False)))
         self.italic_btn.setToolTip("斜体")
-        self.italic_btn.setFixedSize(40, 30)
+        self.italic_btn.setFixedSize(44, 34)
         italic_f = QFont(self.italic_btn.font())
         italic_f.setItalic(True)
-        italic_f.setPointSize(14)
+        italic_f.setPointSize(13)
         self.italic_btn.setFont(italic_f)
         row_fmt.addWidget(self.italic_btn)
 
