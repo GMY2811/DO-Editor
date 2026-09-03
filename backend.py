@@ -539,6 +539,44 @@ def _has_cjk(text):
     return any('\u4e00' <= c <= '\u9fff' for c in text)
 
 
+def _is_cjk_char(ch):
+    """判定字符属于 CJK 书写系统(汉字/假名/谚文/CJK 符号/全角)。
+
+    PyMuPDF Story 引擎对 CJK 字符统一落到 Droid Sans Fallback Regular,
+    不区分斜体字面(真实斜体面不存在)且不做合成斜体, 因此含 CJK 的斜体
+    需走 transform: skewX(-14deg) 合成斜体; 否则 CSS font-style:italic
+    对汉字无声地退化为正体(导致保存斜体失效, 见 _verify_cjk_italic.py)。
+    """
+    if not ch:
+        return False
+    c = ord(ch)
+    return (0x4E00 <= c <= 0x9FFF      # CJK Unified Ideographs
+            or 0x3400 <= c <= 0x4DBF   # CJK Ext A
+            or 0x3040 <= c <= 0x30FF   # Hiragana / Katakana
+            or 0xAC00 <= c <= 0xD7AF   # Hangul Syllables
+            or 0x3000 <= c <= 0x303F   # CJK Symbols & Punctuation
+            or 0xFF00 <= c <= 0xFFEF)  # Halfwidth / Fullwidth Forms
+
+
+def _partition_italic(text):
+    """按 CJK / 非 CJK 把文本切成段, 用于对含汉字的斜体做分段样式处理。
+
+    返回 [(seg_text, is_cjk_segment), ...]; 连续同类字符合并为一段。
+    """
+    if not text:
+        return []
+    out = []
+    cur_is_cjk = _is_cjk_char(text[0])
+    start = 0
+    for i in range(1, len(text)):
+        if _is_cjk_char(text[i]) != cur_is_cjk:
+            out.append((text[start:i], cur_is_cjk))
+            start = i
+            cur_is_cjk = not cur_is_cjk
+    out.append((text[start:], cur_is_cjk))
+    return out
+
+
 def _css_font_family(family):
     """系统字体名 → CSS font-family 类别（serif/sans-serif/monospace）。
 
@@ -574,16 +612,70 @@ def font_style_flags(fontname, flags=0):
 
 def insert_text_auto(page, rect, text, fontsize=12, color=(0, 0, 0), fontfamily="",
                      bold=False, italic=False):
-    """插入文字，自动处理中英文字体。fontfamily 为系统字体名，映射为衬线/无衬线/等宽。"""
+    """插入文字，自动处理中英文字体。fontfamily 为系统字体名，映射为衬线/无衬线/等宽。
+
+    含 CJK 字符且 italic=True 时, 把文本按 CJK / 非 CJK 分段, 绕开
+    insert_htmlbox(实测: CSS `font-style:italic` 对内置 CJK 字面无声;
+    CSS `transform:skewX` 在 insert_htmlbox 也不生效) 直接用
+    `page.insert_text` 绘制: CJK 段走内置 `china-s` 字体 + morph 错切
+    矩阵合成斜体; 非 CJK 段走内置 `hebo`(Helvetica Oblique, 加粗时
+    `hebi`) 真斜体字面; 两类在同一基线上累加 `text_length` 推进光标。
+    其余分支维持原有 htmlbox 单行 + CSS 路径不变。
+    """
+    import pymupdf as _pym
+
+    if italic and any(_is_cjk_char(c) for c in text):
+        r255 = _rgb255(color)
+        _draw_italic_cjk_segments(
+            page, rect, _partition_italic(text), fontsize, r255, bold=bold)
+        return
+
     import html as _html
-    safe = _html.escape(text).replace("\n", "<br>")
     r, g, b = [int(round(c * 255)) for c in color]
     fam = _css_font_family(fontfamily)
     weight = "bold" if bold else "normal"
     style = "italic" if italic else "normal"
     css = (f"* {{ font-family: {fam}; font-size: {fontsize}px; "
            f"color: rgb({r},{g},{b}); font-weight: {weight}; font-style: {style}; }}")
-    page.insert_htmlbox(rect, safe, css=css)
+    page.insert_htmlbox(rect, _html.escape(text).replace("\n", "<br>"), css=css)
+
+
+def _draw_italic_cjk_segments(page, rect, segments, fontsize, color_255, bold=False,
+                              x_start=None):
+    """CJK + italic 合成斜体直接绘制(支持从任意 x 起点并返回占用宽度)。
+
+    segments: [(seg_text, is_cjk), ...] — 由 _partition_italic 生成。
+    单一基线单行(无 wrap): text 过长超出 rect 时仍按左对齐绘制, 右侧
+    可能溢出, 与原始 htmlbox 行为一致(短文本场景)。
+    """
+    import pymupdf as _pym
+    tan_a = -0.2493   # tan(-14°), 与常规拉丁斜体字面倾斜量匹配
+    skew_matrix = _pym.Matrix(1, 0, tan_a, 1, 0, 0)
+    ascender = fontsize * 0.8
+    y_baseline = rect.y0 + ascender
+    if x_start is None:
+        x_start = rect.x0
+    f_cjk = _pym.Font("china-s")
+    f_lat = _pym.Font("hebi" if bold else "heit")
+    color_f = tuple(c / 255.0 for c in color_255)
+    x_cursor = x_start
+    for seg, is_cjk in segments:
+        if not seg:
+            continue
+        if is_cjk:
+            pivot = _pym.Point(x_cursor, y_baseline)
+            page.insert_text(
+                (x_cursor, y_baseline), seg,
+                fontname="china-s", fontsize=fontsize,
+                color=color_f, morph=(pivot, skew_matrix))
+        else:
+            page.insert_text(
+                (x_cursor, y_baseline), seg,
+                fontname=f_lat.name, fontsize=fontsize,
+                color=color_f)
+        x_cursor += f_cjk.text_length(seg, fontsize) if is_cjk \
+                    else f_lat.text_length(seg, fontsize)
+    return x_cursor - x_start
 
 
 def _rgb255(color):
@@ -607,23 +699,72 @@ def insert_rich_text_auto(page, rect, runs):
 
     逐段生成内联 span 后由 insert_htmlbox 排版；字号以 pt 语义
     与 insert_text_auto 保持一致。
+
+    若任一 run 含 CJK 且 italic=True, htmlbox 无法合成 CJK 斜体, 改走
+    直接 `page.insert_text` 路径: CJK 段内置 china-s + morph 错切合成
+    斜体; 非 CJK 段内置 hebo/hebi 真斜体; 各 run 按自己的 size/color/
+    bold 在同一基线上串联(以 rect.x0 起步, x 累加 text_length)。
+    其余分支维持原有 htmlbox 路径不变。
     """
+    import pymupdf as _pym
+
+    # 若任何 run 含 CJK 且 italic=True, htmlbox 路径无法合成 CJK 斜体
+    # (CSS transform 在 insert_htmlbox 不生效, font-style:italic 对汉字无声);
+    # 改走直接 page.insert_text 路径: CJK 段内置 china-s + morph 错切,
+    # 非 CJK 段内置 hebo/hebi 真斜体, 各 run 按尺寸/颜色在同一基线串联。
+    if any(r.get("italic") and any(_is_cjk_char(c) for c in (r.get("text") or ""))
+           for r in runs or []):
+        x_cursor = rect.x0
+        for run in runs or []:
+            text = (run.get("text") or "")
+            if not text:
+                continue
+            size = max(1.0, float(run.get("size") or 12.0))
+            color = _rgb255(run.get("color") or (0, 0, 0))
+            color_f = tuple(c / 255.0 for c in color)
+            italic = bool(run.get("italic"))
+            bold = bool(run.get("bold"))
+            has_cjk = any(_is_cjk_char(c) for c in text)
+            y_run = rect.y0 + size * 0.8
+            if italic and has_cjk:
+                w = _draw_italic_cjk_segments(
+                    page, rect, _partition_italic(text), size, color,
+                    bold=bold, x_start=x_cursor)
+                x_cursor += w
+            elif has_cjk:
+                # 非斜体 CJK 段: 内置 china-s 覆盖汉字, 同步推进 x_cursor
+                page.insert_text((x_cursor, y_run), text,
+                                 fontname="china-s", fontsize=size,
+                                 color=color_f)
+                x_cursor += _pym.Font("china-s").text_length(text, size)
+            else:
+                fontname = (
+                    "hebi" if (italic and bold) else
+                    "heit" if italic else
+                    "hebo" if bold else "helv")
+                page.insert_text((x_cursor, y_run), text,
+                                 fontname=fontname, fontsize=size,
+                                 color=color_f)
+                x_cursor += _pym.Font(fontname).text_length(text, size)
+        return
+
     import html as _html
     parts = []
     for run in runs or []:
         text = (run.get("text") or "")
         if not text:
             continue
-        safe = _html.escape(text).replace("\n", "<br>")
         fam = _css_font_family(run.get("family") or "")
         weight = "bold" if run.get("bold") else "normal"
-        style = "italic" if run.get("italic") else "normal"
+        run_italic = bool(run.get("italic"))
         size = max(1.0, float(run.get("size") or 12.0))
         r, g, b = _rgb255(run.get("color") or (0, 0, 0))
+        style = "italic" if run_italic else "normal"
+        esc = _html.escape(text).replace("\n", "<br>")
         parts.append(
             f'<span style="font-family:{fam};font-size:{size}px;'
             f'font-weight:{weight};font-style:{style};'
-            f'color:rgb({r},{g},{b});">{safe}</span>')
+            f'color:rgb({r},{g},{b});">{esc}</span>')
     if not parts:
         return
     page.insert_htmlbox(rect, "".join(parts),
