@@ -529,9 +529,10 @@ class FormatDialog(QDialog):
         self.bold_btn.setCheckable(True)
         self.bold_btn.setChecked(bool(fmt.get("bold", False)))
         self.bold_btn.setToolTip("加粗")
-        self.bold_btn.setFixedSize(34, 30)
+        self.bold_btn.setFixedSize(40, 32)
         bold_f = QFont(self.bold_btn.font())
         bold_f.setBold(True)
+        bold_f.setPointSize(14)
         self.bold_btn.setFont(bold_f)
         row_fmt.addWidget(self.bold_btn)
 
@@ -540,9 +541,10 @@ class FormatDialog(QDialog):
         self.italic_btn.setCheckable(True)
         self.italic_btn.setChecked(bool(fmt.get("italic", False)))
         self.italic_btn.setToolTip("斜体")
-        self.italic_btn.setFixedSize(34, 30)
+        self.italic_btn.setFixedSize(40, 32)
         italic_f = QFont(self.italic_btn.font())
         italic_f.setItalic(True)
+        italic_f.setPointSize(14)
         self.italic_btn.setFont(italic_f)
         row_fmt.addWidget(self.italic_btn)
 
