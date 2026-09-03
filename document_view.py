@@ -2039,7 +2039,8 @@ class DocumentView(QWidget):
         """在文字行原位置就地打开单行编辑框（无弹窗）。
 
         编辑器紧贴该行文字框，字号/颜色/字体还原原文样式；输入框中
-        预填原行文字并全选，回车或点击其它处提交，Esc 取消。
+        预填原行文字但不全选——光标定位到鼠标点击的字符处，点哪改哪，
+        避免误操作整行被替换；回车或点击其它处提交，Esc 取消。
         """
         if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
             return
@@ -2104,7 +2105,14 @@ class DocumentView(QWidget):
         edit.raise_()
         edit.show()
         edit.setFocus()
-        edit.selectAll()
+        # 点击进入不默认全选：光标定位到鼠标点击处的字符，便于点哪改哪。
+        # 鼠标不在框内（键盘/程序触发）则把光标放到行尾，避免误替换整行。
+        click_pos = edit.mapFromGlobal(QCursor.pos())
+        char_idx = edit.cursorPositionAt(click_pos)
+        if char_idx < 0:
+            char_idx = len(edit.text())
+        QTimer.singleShot(
+            0, lambda e=edit, i=char_idx: e.setCursorPosition(i))
         edit.returnPressed.connect(self._finish_row_edit)
         edit.installEventFilter(self)
         self._row_edit = edit
