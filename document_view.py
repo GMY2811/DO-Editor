@@ -1061,10 +1061,12 @@ class DocumentView(QWidget):
         使新文字与原行处于同一垂直位置。文字只按单行从左往右排（不折行），
         宽度超出部分在保存时由调用方按字符数估算的对象宽度承担。
 
-        字形兜底：若新文本含原字体没有的字形（典型：把西文行改成中文，
-        Arial/Helvetica 等无中文字形，直接写回会渲染成方块），自动回退到
-        系统中文全量字体（对象原字族 → 雅黑/宋体/黑体/等线/楷体/仿宋），
-        保证保存后汉字正常显示；字号、颜色、基线保持不变。
+        字形兜底：若新文本含所选字体没有的字形——典型场景包括把西文行改成
+        中文（Arial/Helvetica 无中文字形）、或嵌入子集字体缺少改入的字符
+        （如中文字体子集缺西文字母）——直接写回会渲染成方块，此时自动回退到
+        系统全量字体（对象原字族 → 雅黑/宋体/黑体/等线/楷体/仿宋），保证保存
+        后汉字/字母均正常显示；字号、颜色、基线保持不变，粗斜样式由所选
+        变体字体文件承载。
         """
         text = obj.get("text", "")
         if not (text or "").strip():
@@ -1073,19 +1075,20 @@ class DocumentView(QWidget):
         fname = embed.get("name")
         if not fname:
             raise RuntimeError("no embed font name")
-        # —— 字形覆盖检测：文本含非西文字符且原字体缺字形 → 换中文字体 ——
-        if any(ord(ch) > 0x2E7F for ch in text if not ch.isspace()):
-            try:
-                fo = None
-                if embed.get("file"):
-                    fo = pymupdf.Font(fontfile=embed["file"])
-                elif embed.get("buffer"):
-                    fo = pymupdf.Font(fontbuffer=embed["buffer"])
-                covered = fo is not None and self._font_covers(fo, text)
-            except Exception:
-                covered = False
-            if not covered:
-                fname, embed = self._fallback_cjk_font(obj, text)
+        # —— 字形覆盖检测：文本含任一原字体没有的字形 → 换全量系统字体 ——
+        # 不做“仅中文才检测”的门限：西文行、混排、嵌入子集缺字形同样会
+        # 在保存后变方块，必须对全部非空白字符逐一校验。
+        try:
+            fo = None
+            if embed.get("file"):
+                fo = pymupdf.Font(fontfile=embed["file"])
+            elif embed.get("buffer"):
+                fo = pymupdf.Font(fontbuffer=embed["buffer"])
+            covered = fo is not None and self._font_covers(fo, text)
+        except Exception:
+            covered = False
+        if not covered:
+            fname, embed = self._fallback_cjk_font(obj, text)
         try:
             if embed.get("file"):
                 page.insert_font(fontname=fname, fontfile=embed["file"])
@@ -1125,6 +1128,8 @@ class DocumentView(QWidget):
         """
         import os as _os
         import re as _re
+        bold = bool(obj.get("bold", False))
+        italic = bool(obj.get("italic", False))
         fams = [obj.get("fontfamily") or "",
                 "Microsoft YaHei", "SimSun", "SimHei",
                 "DengXian", "KaiTi", "FangSong"]
@@ -1133,7 +1138,7 @@ class DocumentView(QWidget):
             if not fam or fam in seen:
                 continue
             seen.add(fam)
-            p = self._system_font_file(fam)
+            p = self._system_font_file(fam, bold=bold, italic=italic)
             if not p:
                 continue
             try:
@@ -1144,7 +1149,9 @@ class DocumentView(QWidget):
                 continue
             # 注册名加 fb 前缀，避免与原嵌入资源/字族名撞名
             clean = _re.sub(r"[^A-Za-z0-9]", "", fam)
-            return "fb" + (clean or "cjk"), {"name": "fb" + clean, "file": p}
+            suffix = self._style_suffix(bold, italic)
+            return "fb" + (clean or "cjk") + suffix, {
+                "name": "fb" + (clean or "cjk") + suffix, "file": p}
         raise RuntimeError("no font covers text glyphs")
 
     @staticmethod
@@ -2070,8 +2077,11 @@ class DocumentView(QWidget):
         luminance = (0.299 * color.red() + 0.587 * color.green() +
                      0.114 * color.blue())
 
-        font_px = max(9.0, size * zoom * 1.08)
-        box_h = max(wh + 4.0, font_px * 1.3 + 4.0)
+        # 编辑框字号与页面渲染严格一致：页面位图与覆盖层文字均按
+        # fontsize*zoom 逻辑像素显示（page_view 以 _zoom 缩放渲染），
+        # 此处不再乘额外放大系数，避免框内文字比原文偏大变形。
+        font_px = max(9.0, size * zoom)
+        box_h = max(wh + 4.0, font_px * 1.35 + 4.0)
         # 垂直：中心对齐该行文字框，避免字体替换引起的基线偏移
         center_y = wy + wh / 2.0
         by = int(center_y - box_h / 2.0)
@@ -2176,7 +2186,8 @@ class DocumentView(QWidget):
                 sb = meta.get("span_bbox") or [
                     rect.x(), rect.y(), rect.right(), rect.bottom()]
                 embed, baseline = self._prepare_row_embed(
-                    self.doc[page], pdf_font, size, sb)
+                    self.doc[page], pdf_font, size, sb,
+                    bold=bold, italic=italic)
             except Exception:
                 embed = None
                 baseline = None
@@ -2219,7 +2230,7 @@ class DocumentView(QWidget):
                         span.get("font", ""), int(span.get("flags", 0)))
                     embed, baseline = self._prepare_row_embed(
                         p, span.get("font", ""), span.get("size", 10.0),
-                        span.get("bbox"))
+                        span.get("bbox"), bold=bold, italic=italic)
             except Exception:
                 embed = None
                 baseline = None
@@ -2439,29 +2450,78 @@ class DocumentView(QWidget):
             return "SimHei"
         return ""
 
-    # 常见中文字体 → Windows 系统全量字体文件（保证写回字形覆盖全部字符）
+    # 常见字体 → Windows 系统全量字体文件（按常规/粗/斜/粗斜四档）。
+    # 保证写回字形覆盖全部字符，同时粗斜样式有对应的变体字体文件，
+    # 否则 PDF 写回时会丢失原文的粗体/斜体观感。中文多数字体无斜体
+    # 变体文件（系统不提供），斜体档回退常规；粗宋体用黑体近似。
     _SYSTEM_FONT_FILES = {
-        "SimSun": r"C:\Windows\Fonts\simsun.ttc",
-        "SimHei": r"C:\Windows\Fonts\simhei.ttf",
-        "KaiTi": r"C:\Windows\Fonts\simkai.ttf",
-        "FangSong": r"C:\Windows\Fonts\simfang.ttf",
-        "Microsoft YaHei": r"C:\Windows\Fonts\msyh.ttc",
-        "DengXian": r"C:\Windows\Fonts\deng.ttf",
-        "Arial": r"C:\Windows\Fonts\arial.ttf",
-        "Times New Roman": r"C:\Windows\Fonts\times.ttf",
-        "Courier New": r"C:\Windows\Fonts\cour.ttf",
+        "SimSun": {"": r"C:\Windows\Fonts\simsun.ttc",
+                   "B": r"C:\Windows\Fonts\simhei.ttf",
+                   "I": r"C:\Windows\Fonts\simsun.ttc",
+                   "BI": r"C:\Windows\Fonts\simhei.ttf"},
+        "SimHei": {"": r"C:\Windows\Fonts\simhei.ttf",
+                   "B": r"C:\Windows\Fonts\simhei.ttf",
+                   "I": r"C:\Windows\Fonts\simhei.ttf",
+                   "BI": r"C:\Windows\Fonts\simhei.ttf"},
+        "KaiTi": {"": r"C:\Windows\Fonts\simkai.ttf",
+                  "B": r"C:\Windows\Fonts\simkai.ttf",
+                  "I": r"C:\Windows\Fonts\simkai.ttf",
+                  "BI": r"C:\Windows\Fonts\simkai.ttf"},
+        "FangSong": {"": r"C:\Windows\Fonts\simfang.ttf",
+                     "B": r"C:\Windows\Fonts\simfang.ttf",
+                     "I": r"C:\Windows\Fonts\simfang.ttf",
+                     "BI": r"C:\Windows\Fonts\simfang.ttf"},
+        "Microsoft YaHei": {"": r"C:\Windows\Fonts\msyh.ttc",
+                            "B": r"C:\Windows\Fonts\msyhbd.ttc",
+                            "I": r"C:\Windows\Fonts\msyh.ttc",
+                            "BI": r"C:\Windows\Fonts\msyhbd.ttc"},
+        "DengXian": {"": r"C:\Windows\Fonts\deng.ttf",
+                     "B": r"C:\Windows\Fonts\dengb.ttf",
+                     "I": r"C:\Windows\Fonts\deng.ttf",
+                     "BI": r"C:\Windows\Fonts\dengb.ttf"},
+        "Arial": {"": r"C:\Windows\Fonts\arial.ttf",
+                  "B": r"C:\Windows\Fonts\arialbd.ttf",
+                  "I": r"C:\Windows\Fonts\ariali.ttf",
+                  "BI": r"C:\Windows\Fonts\arialbi.ttf"},
+        "Times New Roman": {"": r"C:\Windows\Fonts\times.ttf",
+                            "B": r"C:\Windows\Fonts\timesbd.ttf",
+                            "I": r"C:\Windows\Fonts\timesi.ttf",
+                            "BI": r"C:\Windows\Fonts\timesbi.ttf"},
+        "Courier New": {"": r"C:\Windows\Fonts\cour.ttf",
+                        "B": r"C:\Windows\Fonts\courbd.ttf",
+                        "I": r"C:\Windows\Fonts\couri.ttf",
+                        "BI": r"C:\Windows\Fonts\courbi.ttf"},
     }
 
     @staticmethod
-    def _system_font_file(family):
-        """映射字体族名 → 本机系统字体文件（存在才返回，否则 None）。"""
+    def _style_suffix(bold, italic):
+        """粗斜组合 → 字体变体档位后缀（无样式为 ''）。"""
+        if bold and italic:
+            return "BI"
+        if bold:
+            return "B"
+        if italic:
+            return "I"
+        return ""
+
+    @classmethod
+    def _system_font_file(cls, family, bold=False, italic=False):
+        """映射字体族名 → 本机系统字体文件（含粗斜变体，缺失回退常规）。
+
+        返回 None 表示系统无对应字体文件。
+        """
         import os as _os
-        p = DocumentView._SYSTEM_FONT_FILES.get(family or "")
+        variants = cls._SYSTEM_FONT_FILES.get(family or "") or {}
+        if not variants:
+            return None
+        key = cls._style_suffix(bold, italic)
+        p = variants.get(key) or variants.get("")
         if p and _os.path.exists(p):
             return p
         return None
 
-    def _prepare_row_embed(self, page, span_font, span_size, span_bbox):
+    def _prepare_row_embed(self, page, span_font, span_size, span_bbox,
+                           bold=False, italic=False):
         """为写回行准备字体嵌入载荷与基线，保证保存后观感贴近原文。
 
         优先使用「系统同族全量字体文件」（字形覆盖全，用户改入新字符也有字形）；
@@ -2473,12 +2533,19 @@ class DocumentView(QWidget):
             import pymupdf as _pym
             size = float(span_size or 10.0)
             fam = self._map_pdf_font(span_font)
-            fpath = self._system_font_file(fam)
+            # 系统字体优先按 粗/斜 选择对应变体文件，保证写回保留原文样式
+            fpath = self._system_font_file(fam, bold=bold, italic=italic)
             fo = None
             buf = None
             name = ""
             if fpath:
-                name = fam
+                suffix = self._style_suffix(bold, italic)
+                if suffix:
+                    # 变体字体用独立注册名，避免与同族常规字体资源撞名
+                    clean = re.sub(r"[^A-Za-z0-9]", "", fam or "") or "font"
+                    name = clean + suffix
+                else:
+                    name = fam
                 try:
                     fo = _pym.Font(fontfile=fpath)
                 except Exception:
