@@ -26,10 +26,40 @@ LABEL2FILE = {
 }
 
 def glyph_ok(label, text):
-    """span 的字体名能否覆盖文本全部字形(能否正常显示、不出现方块)。"""
-    p = LABEL2FILE.get(label)
+    """span 的字体名能否覆盖文本全部字形(能否正常显示、不出现方块)。
+
+    保存子集化后 span font 名可能带变体后缀（如 'Microsoft YaHei
+    Regular' / 'KaiTi Regular'），映射时先剥掉 Regular/Bold/Italic/
+    Oblique 等尾缀再查表。
+    """
+    import re as _re
+    cand = label
+    if cand not in LABEL2FILE:
+        cand = _re.sub(r"\s+(Regular|Bold|Italic|Oblique|Light|Medium)$",
+                       "", cand or "").strip()
+        cand = cand.replace("MT", "") if "Arial" in cand else cand
+    p = LABEL2FILE.get(cand)
     if not p or not os.path.exists(p):
-        return False
+        # 映射不到系统文件时退回按族名模糊匹配（中文族名带空格等别名）
+        low = (cand or label or "").lower()
+        if "arial" in low:
+            p = os.path.join(F, "arial.ttf")
+        elif "times" in low or "roman" in low:
+            p = os.path.join(F, "times.ttf")
+        elif "yahei" in low or "雅黑" in low or "微软" in low:
+            p = os.path.join(F, "msyh.ttc")
+        elif "simsun" in low or "song" in low or "宋" in low:
+            p = os.path.join(F, "simsun.ttc")
+        elif "simhei" in low or "hei" in low or "黑" in low:
+            p = os.path.join(F, "simhei.ttf")
+        elif "kai" in low or "楷" in low:
+            p = os.path.join(F, "simkai.ttf")
+        elif "deng" in low or "等线" in low:
+            p = os.path.join(F, "deng.ttf")
+        elif "fang" in low or "仿宋" in low:
+            p = os.path.join(F, "simfang.ttf")
+        else:
+            return False
     fo = pymupdf.Font(fontfile=p)
     return all(fo.has_glyph(ord(c)) for c in text if not c.isspace())
 

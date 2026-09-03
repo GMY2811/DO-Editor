@@ -649,7 +649,8 @@ def _draw_italic_cjk_segments(page, rect, segments, fontsize, color_255, bold=Fa
     可能溢出, 与原始 htmlbox 行为一致(短文本场景)。
     """
     import pymupdf as _pym
-    tan_a = -0.2493   # tan(-14°), 与常规拉丁斜体字面倾斜量匹配
+    tan_a = 0.2493    # tan(14°), 合成右倾 italic(主流 PDF 阅读器方向; PyMuPDF
+                 # 自家 get_pixmap 渲染下方向会反转, 故此处不用负号)
     skew_matrix = _pym.Matrix(1, 0, tan_a, 1, 0, 0)
     ascender = fontsize * 0.8
     y_baseline = rect.y0 + ascender

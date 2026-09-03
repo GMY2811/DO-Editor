@@ -775,6 +775,14 @@ class DocumentView(QWidget):
             if getattr(self, "_inplace_edit", None) is not None:
                 self._commit_inplace_text(commit=True)
             self._bake_objects()
+            # 保存前子集化嵌入字体：把保存时新嵌入的系统全量字体（雅黑
+            # ttc 约 20MB，仅原文档字形兜底时才嵌入）裁成只含本档实际用到
+            # 的字形，避免输出文件暴涨数十倍、压缩写盘拖慢保存。实测单个
+            # 大字体 subset 约 40ms，收益远大于开销；失败则跳过（保正确）。
+            try:
+                self.doc.subset_fonts()
+            except Exception:
+                pass
             tmp = path + ".tmp"
             save_args = {"garbage": 3, "deflate": True}
             reopen_password = self._open_password
@@ -1092,18 +1100,29 @@ class DocumentView(QWidget):
         fname = embed.get("name")
         if not fname:
             raise RuntimeError("no embed font name")
+        # 注册名必须为纯字母数字；历史 embed 可能带空格/连字符
+        # （如 "Microsoft Ya Hei"），直接 insert_font 会抛异常导致
+        # 保存静默回退 htmlbox——这里统一清理。
+        import re as _re2
+        fname = _re2.sub(r"[^A-Za-z0-9]", "", fname) or "font"
         # —— 字形覆盖检测：文本含任一原字体没有的字形 → 换全量系统字体 ——
         # 不做“仅中文才检测”的门限：西文行、混排、嵌入子集缺字形同样会
         # 在保存后变方块，必须对全部非空白字符逐一校验。
-        try:
-            fo = None
-            if embed.get("file"):
-                fo = pymupdf.Font(fontfile=embed["file"])
-            elif embed.get("buffer"):
-                fo = pymupdf.Font(fontbuffer=embed["buffer"])
-            covered = fo is not None and self._font_covers(fo, text)
-        except Exception:
-            covered = False
+        # 性能：Font(fontfile=…) 解析系统 TTC 很贵（雅黑 ~100-180ms），
+        # 按来源(file 路径 / buffer 内容)缓存 Font，同一来源只解析一次；
+        # insert_font 重复同名注册 PyMuPDF 内部已缓存(实测 0.1ms)。
+        # buffer 来源（原文档嵌入子集）由 _prepare_row_embed 在产出前已做
+        # 字形覆盖与样式承载判定——其中 CID(Type0) 子集的 has_glyph 恒
+        # False，不能在此再作兜底信号（否则每条中文修改都误回退 20MB 系统
+        # 字体）。系统 file 来源的 has_glyph 可靠，照常兜底。
+        if embed.get("buffer"):
+            covered = True
+        else:
+            try:
+                fo = self._cached_embed_font(embed)
+                covered = fo is not None and self._font_covers(fo, text)
+            except Exception:
+                covered = False
         if not covered:
             fname, embed = self._fallback_cjk_font(obj, text)
         try:
@@ -1122,8 +1141,64 @@ class DocumentView(QWidget):
         base = obj.get("baseline")
         if base is None:
             base = fr.y1 - size * 0.15
+        # 中文斜体：Windows 的中文字体没有斜体变体文件，_embed_for_style /
+        # _prepare_row_embed 的“斜体档”实际拿到的仍是正体字体文件，直接
+        # 写回必然丢斜体（像素 diff 0%，见 _verify_bake_cjk_italic.py）。
+        # 含 CJK 的斜体改用 morph 错切合成：斜切随字形写入 content
+        # stream，保存/重开/其它阅读器都保持倾斜，与 backend 里添加文字
+        # 的 CJK 斜体合成同参数同观感。
+        if bool(obj.get("italic", False)) and any(
+                backend._is_cjk_char(c) for c in text):
+            self._bake_skew_italic(page, fr, text, fname, size, base, rgb)
+            return
         page.insert_text((fr.x0, float(base)), text, fontname=fname,
                          fontsize=size, color=rgb)
+
+    def _bake_skew_italic(self, page, fr, text, fname, size, base, rgb):
+        """用目标字体 + morph 错切矩阵把整行文字合成斜体写回。
+
+        参数与 backend._draw_italic_cjk_segments 的 CJK 段一致
+        （tan(-14°)≈-0.2493，与常规拉丁斜体字面倾斜量匹配），保证
+        “修改原行”与“添加文字”两条保存路径的汉字斜体观感统一。
+        整行同一字体一次插入，无需分段推进光标。
+        """
+        tan_a = 0.2493   # tan(14°), 合成右倾 italic; 与 backend._draw_italic_cjk_segments
+                          # 同符号, 保证「修改原行」与「添加文字」两条保存路径斜体
+                          # 方向在主流 PDF 阅读器(Adobe/Edge/Chrome/Sumatra)一致
+        pivot = pymupdf.Point(float(fr.x0), float(base))
+        skew = pymupdf.Matrix(1, 0, tan_a, 1, 0, 0)
+        page.insert_text((float(fr.x0), float(base)), text,
+                         fontname=fname, fontsize=size, color=rgb,
+                         morph=(pivot, skew))
+
+    # 字体来源 → 解析出的 Font 缓存。系统 TTC(雅黑 msyh.ttc ~20MB)解析要
+    # 100-180ms, 覆盖检测每次重建会拖慢整份文档保存。Font 对象只读、与
+    # 具体 document 无关, 可按来源全局复用。缓存至多保留 24 个(文档字体
+    # 数量有限), 超出清空防止长时间会话内存膨胀。
+    _embed_font_cache = {}
+    _EMBED_FONT_CACHE_MAX = 24
+
+    @classmethod
+    def _cached_embed_font(cls, embed):
+        """按 file 路径 / buffer 内容返回解析过的 Font(无来源返回 None)。"""
+        src = embed.get("file") if embed.get("file") else embed.get("buffer")
+        if not src:
+            return None
+        key = ("f", src) if embed.get("file") else ("b", src)
+        cache = cls._embed_font_cache
+        fo = cache.get(key)
+        if fo is None:
+            try:
+                fo = (pymupdf.Font(fontfile=src) if key[0] == "f"
+                      else pymupdf.Font(fontbuffer=src))
+            except Exception:
+                fo = None
+            cache[key] = fo
+            if len(cache) > cls._EMBED_FONT_CACHE_MAX:
+                # 只清不删热点键: 整体重建会丢当前键, 先清再补回
+                cache.clear()
+                cache[key] = fo
+        return fo
 
     @staticmethod
     def _font_covers(font, text):
@@ -1159,10 +1234,10 @@ class DocumentView(QWidget):
             if not p:
                 continue
             try:
-                fo = pymupdf.Font(fontfile=p)
+                fo = self._cached_embed_font({"file": p})
             except Exception:
-                continue
-            if not self._font_covers(fo, text):
+                fo = None
+            if fo is None or not self._font_covers(fo, text):
                 continue
             # 注册名加 fb 前缀，避免与原嵌入资源/字族名撞名
             clean = _re.sub(r"[^A-Za-z0-9]", "", fam)
@@ -2266,15 +2341,34 @@ class DocumentView(QWidget):
                     rect.x(), rect.y(), rect.right(), rect.bottom()]
                 embed, baseline = self._prepare_row_embed(
                     self.doc[page], pdf_font, size, sb,
-                    bold=bold, italic=italic)
+                    bold=bold, italic=italic, text=new_text,
+                    orig_text=old_text)
             except Exception:
                 embed = None
                 baseline = None
         elif style_changed:
-            # 用户整段改了样式（字体/粗斜/字号…）：按新样式重建系统
-            # 变体字体 embed，保证写回保留新观感；系统缺该族/变体则
-            # 移除 embed 走 htmlbox。
-            embed = self._embed_for_style(family, size, bold, italic)
+            # 用户整段改了样式（字体/粗斜/字号…）：重建写回 embed。
+            # 字族未换时优先复用原行嵌入字体（子集小、写盘快）：中文斜体
+            # 由保存时 morph 合成，正体字形即可承载；原资源缺字形/缺对应
+            # 粗斜档时 _prepare_row_embed 自动回退系统变体。换了字族或
+            # 系统兜底失败 → _embed_for_style 按新样式选系统字体。
+            old_pdf_font = str((meta.get("fmt") or {}).get("font") or "")
+            same_fam = bool(old_pdf_font) and (
+                (family or "").lower() == (self._map_pdf_font(old_pdf_font)
+                                           or "").lower())
+            if same_fam:
+                try:
+                    sb = meta.get("span_bbox") or [
+                        rect.x(), rect.y(), rect.right(), rect.bottom()]
+                    embed, baseline = self._prepare_row_embed(
+                        self.doc[page], old_pdf_font, size, sb,
+                        bold=bold, italic=italic, text=new_text,
+                        orig_text=old_text)
+                except Exception:
+                    embed = None
+                    baseline = None
+            if embed is None:
+                embed = self._embed_for_style(family, size, bold, italic)
         self._commit_edited_line(page, rect, new_text, family, size,
                                  color, bold, italic, embed=embed,
                                  baseline=baseline, erase=erase_rect)
@@ -2616,13 +2710,25 @@ class DocumentView(QWidget):
         """
         if not obj.get("embed"):
             return False
-        changed = (
-            (family or "") != (obj.get("fontfamily") or "")
-            or float(size) != float(obj.get("fontsize") or 0)
-            or bool(bold) != bool(obj.get("bold"))
-            or bool(italic) != bool(obj.get("italic")))
-        if not changed:
+        fam_changed = (family or "") != (obj.get("fontfamily") or "")
+        size_changed = float(size) != float(obj.get("fontsize") or 0)
+        bold_changed = bool(bold) != bool(obj.get("bold"))
+        italic_changed = bool(italic) != bool(obj.get("italic"))
+        if not (fam_changed or size_changed or bold_changed
+                or italic_changed):
             return False
+        # 中文斜体：保存烘焙时用 morph 错切合成（正体字形即可承载），
+        # 无需换斜体字体档。字族/字号/粗细都没变、仅勾选斜体时保留原
+        # embed（多为原行小子集字体），避免重建 20MB 级系统字体拖慢
+        # 保存并使输出文件膨胀。
+        if italic_changed and not (fam_changed or size_changed
+                                   or bold_changed) and italic:
+            try:
+                txt = str(obj.get("text") or "")
+                if any(backend._is_cjk_char(c) for c in txt):
+                    return True
+            except Exception:
+                pass
         new_embed = self._embed_for_style(family, size, bold, italic)
         if new_embed is not None:
             obj["embed"] = new_embed
@@ -2633,11 +2739,23 @@ class DocumentView(QWidget):
         return True
 
     def _prepare_row_embed(self, page, span_font, span_size, span_bbox,
-                           bold=False, italic=False):
+                           bold=False, italic=False, text="",
+                           orig_text=""):
         """为写回行准备字体嵌入载荷与基线，保证保存后观感贴近原文。
 
-        优先使用「系统同族全量字体文件」（字形覆盖全，用户改入新字符也有字形）；
-        找不到系统同族时退回抽取原嵌入字体 buffer（可能是子集）。均失败返回 None。
+        嵌入字体来源按「小且贴原文」优先：
+        1) 原行在 PDF 里已有的嵌入字体（通常为子集，几 KB~几十 KB，
+           insert_font/写盘都快；观感与原行一致）。前提：能解析成 Font、
+           字形覆盖要写回的文本、粗斜档可承载（西文斜体需资源本身为斜体
+           变体；中文斜体由保存时 morph 错切合成，正体字形即可；粗体需
+           资源含粗字形）。
+        2) 上述任一不满足才退回「系统同族全量字体文件」（雅黑 ttc 约
+           20MB，嵌入一次 100ms+ 且使输出文件膨胀——仅字形兜底用）。
+
+        orig_text 为被替换行的原文本：CID(Type0) 子集字体的字形覆盖无法
+        用 has_glyph 判断（恒 False），但子集必含原行全部字符——新文本
+        字符全部在原行中出现即可放心复用子集。
+
         返回 (embed_dict | None, baseline_y)。embed 形如
         {"name": 注册名, "file": 系统路径} 或 {"name": 注册名, "buffer": 字节}。
         """
@@ -2645,66 +2763,145 @@ class DocumentView(QWidget):
             import pymupdf as _pym
             size = float(span_size or 10.0)
             fam = self._map_pdf_font(span_font)
-            # 系统字体优先按 粗/斜 选择对应变体文件，保证写回保留原文样式
-            fpath = self._system_font_file(fam, bold=bold, italic=italic)
+            # ---- 1) 原嵌入字体 buffer 优先 ----
+            buf, raw_name, ftype = self._extract_embed_buffer(page, span_font)
             fo = None
-            buf = None
-            name = ""
-            if fpath:
-                suffix = self._style_suffix(bold, italic)
-                if suffix:
-                    # 变体字体用独立注册名，避免与同族常规字体资源撞名
-                    clean = re.sub(r"[^A-Za-z0-9]", "", fam or "") or "font"
-                    name = clean + suffix
-                else:
-                    name = fam
+            if buf:
                 try:
-                    fo = _pym.Font(fontfile=fpath)
+                    fo = _pym.Font(fontbuffer=buf)
                 except Exception:
                     fo = None
-            else:
-                # 无系统同族字体 → 尝试抽取原嵌入字体 buffer
-                cleaned = re.sub(r"^[A-Fa-f0-9]{6}\+", "",
-                                 (span_font or "")).strip()
-                base = re.sub(r"[\s-]", "", cleaned).lower()
-                for f in page.get_fonts(full=True):
-                    cand = re.sub(r"[\s-]", "", (f[3] or "")).lower()
-                    if not base or not cand:
-                        continue
-                    hit = (base in cand or cand in base or
-                           cand.startswith(base) or base.startswith(cand))
-                    if not hit:
-                        continue
-                    try:
-                        _nm, _ext, _sub, buf = self.doc.extract_font(f[0])
-                    except Exception:
-                        buf = None
-                    if buf:
-                        name = cleaned or _nm or f"F{f[0]}"
-                        try:
-                            fo = _pym.Font(fontbuffer=buf)
-                        except Exception:
-                            fo = None
-                        break
-            asc = 0.86
             if fo is not None:
-                try:
-                    a = float(getattr(fo, "ascender", 0.86))
-                    if 0.2 < a < 1.6:
-                        asc = a
-                except Exception:
-                    pass
-            bb = span_bbox or (0, 0, 0, 0)
-            baseline = float(bb[1]) + asc * size
-            if fpath:
-                return {"name": name, "file": fpath}, baseline
-            if buf:
-                return {"name": name, "buffer": buf}, baseline
-            return None, baseline
+                cleaned = re.sub(r"^[A-Fa-f0-9]{6}\+", "",
+                                 (raw_name or "")).strip()
+                low = re.sub(r"[\s-]", "", cleaned).lower()
+                if (self._embed_style_ok(low, bold, italic, text)
+                        and self._subset_covers(fo, ftype, text, orig_text)):
+                    # 注册名必须为纯字母数字（"Microsoft Ya Hei Regular"
+                    # 这类带空格/连字符的名字会让 insert_font 抛异常）
+                    name = (re.sub(r"[^A-Za-z0-9]", "", cleaned)
+                            or re.sub(r"[^A-Za-z0-9]", "",
+                                      fam or "") or "font")
+                    asc = self._font_ascender(fo, size)
+                    baseline = float((span_bbox or (0, 0, 0, 0))[1]) + asc
+                    return {"name": name, "buffer": buf}, baseline
+            # ---- 2) 回退系统同族字体（含粗斜变体文件选择）----
+            fpath = self._system_font_file(fam, bold=bold, italic=italic)
+            if not fpath:
+                return None, float((span_bbox or (0, 0, 0, 0))[3]) \
+                    - max(4.0, size * 0.15)
+            suffix = self._style_suffix(bold, italic)
+            if suffix:
+                # 变体字体用独立注册名，避免与同族常规字体资源撞名
+                clean = re.sub(r"[^A-Za-z0-9]", "", fam or "") or "font"
+                name = clean + suffix
+            else:
+                # 常规档同样清理：微软雅黑 → MicrosoftYaHei（原始名带空格，
+                # 直接作 fontname 注册会抛异常导致保存静默回退 htmlbox）
+                name = re.sub(r"[^A-Za-z0-9]", "", fam or "") or "font"
+            fo = self._cached_embed_font({"file": fpath})
+            asc = self._font_ascender(fo, size) if fo is not None else (
+                0.86 * size)
+            baseline = float((span_bbox or (0, 0, 0, 0))[1]) + asc
+            return {"name": name, "file": fpath}, baseline
         except Exception:
             bb = span_bbox or (0, 0, 0, 0)
             size = float(span_size or 10.0)
             return None, float(bb[3]) - size * 0.15
+
+    @staticmethod
+    def _font_ascender(fo, size):
+        """字体上行高度像素值（异常时回落默认 0.86em）。"""
+        try:
+            a = float(getattr(fo, "ascender", 0.86))
+            if 0.2 < a < 1.6:
+                return a * size
+        except Exception:
+            pass
+        return 0.86 * size
+
+    def _extract_embed_buffer(self, page, span_font):
+        """按字体名从页面资源中抽取原嵌入字体的 buffer。
+
+        返回 (buffer|None, 原始字体名|'', 字体类型|'')。内置/未嵌入/
+        Type3 字体（xref 不可抽取）返回 (None, '', '')，由调用方回退
+        系统字体。字体类型用于区分 CID(Type0) 子集——PyMuPDF 的
+        Font(fontbuffer=) 对 Type0 子集 has_glyph 恒 False，字形覆盖
+        须改用原行文本启发式判定。
+        """
+        try:
+            cleaned = re.sub(r"^[A-Fa-f0-9]{6}\+", "",
+                             (span_font or "")).strip()
+            base = re.sub(r"[\s-]", "", cleaned).lower()
+            if not base:
+                return None, "", ""
+            for f in page.get_fonts(full=True):
+                cand = re.sub(r"[\s-]", "", (f[3] or "")).lower()
+                if not cand:
+                    continue
+                hit = (base in cand or cand in base or
+                       cand.startswith(base) or base.startswith(cand))
+                if not hit:
+                    continue
+                try:
+                    _nm, _ext, _sub, buf = self.doc.extract_font(f[0])
+                except Exception:
+                    continue
+                if buf:
+                    return (buf, (cleaned or _nm or (f[3] or "")),
+                            str(f[2] or _sub or ""))
+        except Exception:
+            pass
+        return None, "", ""
+
+    def _subset_covers(self, fo, font_type, text, orig_text):
+        """原嵌入子集字体能否覆盖待写文本全部字形。
+
+        CID(Type0) 子集：恒不放行。PyMuPDF 的 Font(fontbuffer=) 对 Type0
+        子集 has_glyph 恒 False；且 subnet 后 FontFile2 丢失 Unicode cmap，
+        insert_font 重嵌会全部映射为 \x00/豆腐（实测渲染非白采样仅 169 点），
+        因此中文等 CID 子集一律回退系统全量字体（嵌入后由保存时
+        subset_fonts 裁成小子集，文件不膨胀）。
+        非 Type0（TrueType/Type1 简单子集）：has_glyph 可靠，直接判定。
+        """
+        txt = (text or "").strip()
+        if not txt:
+            return True
+        low = (font_type or "").lower()
+        if "type0" in low or "cid" in low:
+            return False
+        try:
+            return all(fo.has_glyph(ord(c)) for c in txt
+                       if not c.isspace())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _embed_style_ok(low_name, bold, italic, text=""):
+        """判定原嵌入字体能否承载目标粗斜样式（避免静默丢样式）。
+
+        - bold=True：字体名需带粗体标识（原资源确为粗体字形）；
+        - italic=True：西文斜体需真斜体字形（字体名带 italic/oblique）；
+          中文斜体由保存时 morph 错切合成，正体字形即可承载；
+        - 字体名不可判时，任何粗斜需求一律拒绝（回退系统变体，保正确）。
+        """
+        if not (bold or italic):
+            return True
+        has_bold = any(k in low_name for k in
+                       ("bold", "black", "-bd", "bd", "heavy",
+                        "extrabold", "semibold"))
+        has_italic = any(k in low_name for k in
+                         ("italic", "oblique", "ita", "curs"))
+        if bold and not has_bold:
+            return False
+        if italic and not has_italic:
+            try:
+                if any(backend._is_cjk_char(c) for c in (text or "")):
+                    return not bold or has_bold
+            except Exception:
+                pass
+            return False
+        return True
 
     def _update_text_object(self, oid, runs):
         """编辑条确定：用富文本 runs 更新既有文本对象。

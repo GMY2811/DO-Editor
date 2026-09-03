@@ -34,7 +34,9 @@ spans = [s for bl in re[0].get_text("dict").get("blocks", [])
          if bl.get("type") == 0 for ln in bl.get("lines", [])
          for s in ln.get("spans", []) if s.get("text")]
 fonts = {s["font"] for s in spans if s["text"].strip()}
-assert "KaiTi" in fonts, f"KaiTi font lost in saved PDF: {fonts}"
+# 子集化后 span font 名可能带变体后缀（'KaiTi Regular'），按族名判定
+assert any("KaiTi" in f for f in fonts), \
+    f"KaiTi font lost in saved PDF: {fonts}"
 print("FONT_FIDELITY_OK  saved_fonts=", fonts)
 re.close()
 
