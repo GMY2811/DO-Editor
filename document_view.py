@@ -766,6 +766,13 @@ class DocumentView(QWidget):
 
     def _save_to(self, path):
         try:
+            # 就地编辑未提交时先写回文档：点工具栏保存按钮会先触发编辑框
+            # 失焦提交，但 Ctrl+S 快捷键保存时编辑框不失焦——这里统一兜底，
+            # 保证保存不丢失行内修改/就地新增的文字。
+            if getattr(self, "_row_edit", None) is not None:
+                self._commit_row_edit(commit=True)
+            if getattr(self, "_inplace_edit", None) is not None:
+                self._commit_inplace_text(commit=True)
             self._bake_objects()
             tmp = path + ".tmp"
             save_args = {"garbage": 3, "deflate": True}
@@ -808,6 +815,10 @@ class DocumentView(QWidget):
             self._refresh()
             self.securityChanged.emit()
             self.statusMessage.emit("已保存", 2000)
+            # 保存成功即退出就地文本编辑型工具状态（修改文字/添加文字），
+            # 自动回到选择模式——无需再手动按 Esc 退出编辑状态。
+            if self.current_mode in ("replace_text", "text"):
+                self.set_mode("view")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存失败：\n{e}")
 
