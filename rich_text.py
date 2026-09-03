@@ -341,13 +341,31 @@ class RichEditBox(QTextEdit):
 
     # -- 右键「格式编辑…」独立模块 --------------------------------------
 
-    def _format_at_position(self, pos):
-        """取文档 pos 处字符格式为 {family,size,color,bold,italic}。"""
+    def _char_format_at(self, pos):
+        """按 QTextFragment 定位 pos 处**字符**的格式。
+
+        QTextCursor.setPosition(pos).charFormat() 在 pos 恰为 fragment
+        边界（选区起点=新样式片段第一个字符）时会退化返回上一段样式，
+        导致选中加粗/斜体/彩色字符时对话框状态读不到真实样式。
+        这里遍历所在 block 的 fragment，取「包含 pos 的片段」——
+        fragment.position() <= pos < position()+len 保证 pos 落在该片段
+        的字符上，边界处取右侧片段，符合「读取该处字符样式」语义。
+        """
         doc = self.document()
-        last = max(0, doc.characterCount() - 1)
-        tc = QTextCursor(doc)
-        tc.setPosition(min(max(0, int(pos)), last))
-        cf = tc.charFormat()
+        pos = int(pos)
+        if pos < 0:
+            return QTextCharFormat()
+        block = doc.findBlock(min(pos, max(0, doc.characterCount() - 1)))
+        it = block.begin()
+        while not it.atEnd():
+            f = it.fragment()
+            if (f.isValid() and f.text()
+                    and f.position() <= pos < f.position() + len(f.text())):
+                return f.charFormat()
+            it += 1
+        return QTextCharFormat()
+
+    def _snapshot_from_cf(self, cf):
         return {
             "family": self._fmt_family(cf),
             "size": self._fmt_size_pt(cf),
@@ -356,6 +374,27 @@ class RichEditBox(QTextEdit):
             "italic": bool(cf.fontItalic()),
         }
 
+    def _format_selection_snapshot(self, anchor, end, had_selection):
+        """打开对话框前的样式快照。
+
+        有选区 → 读「选区首字符」所在片段的样式（fragment 定位，避免
+        起点恰在新样式片段边界时读成上一段）；无选区 → 读光标处字符
+        样式（=后续输入将采用的格式）。
+        """
+        if had_selection and end > anchor:
+            cf = self._char_format_at(anchor)
+            return self._snapshot_from_cf(cf)
+        return self._format_at_position(anchor)
+
+    def _format_at_position(self, pos):
+        """取文档 pos 处字符格式为 {family,size,color,bold,italic}。"""
+        doc = self.document()
+        last = max(0, doc.characterCount() - 1)
+        tc = QTextCursor(doc)
+        tc.setPosition(min(max(0, int(pos)), last))
+        cf = tc.charFormat()
+        return self._snapshot_from_cf(cf)
+
     def _open_format_editor(self, anchor, end, had_selection):
         """弹出独立「格式编辑」模块；确认后应用到右键时的选区/光标。
 
@@ -363,7 +402,7 @@ class RichEditBox(QTextEdit):
         exec 期间编辑框会失焦，调用方须保证 _suppress_focusout 生效，
         避免上层把编辑提交关掉导致改动无处可落。
         """
-        snap = self._format_at_position(anchor)
+        snap = self._format_selection_snapshot(anchor, end, had_selection)
         dlg = FormatDialog(snap, self.window())
         self._suppress_focusout += 1
         try:
