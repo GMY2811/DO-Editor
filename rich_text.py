@@ -427,8 +427,10 @@ class RichEditBox(QTextEdit):
     def mousePressEvent(self, event):
         # 右键点在当前选区之外时，取消选择并把光标移到该处，
         # 保证「格式设置」始终作用于用户右键的那段字符。
+        # PySide6 6.x 的 cursorForPosition 仅接受 QPoint(QPointF 会抛
+        # TypeError 让编辑框"碰一下就死"), 用 toPoint() 转一下。
         if event.button() == Qt.MouseButton.RightButton:
-            click_cur = self.cursorForPosition(event.position())
+            click_cur = self.cursorForPosition(event.position().toPoint())
             cur = self.textCursor()
             inside = (cur.hasSelection() and
                       cur.selectionStart() <= click_cur.position() <=
