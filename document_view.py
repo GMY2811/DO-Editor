@@ -3157,21 +3157,6 @@ class DocumentView(QWidget):
         ka = [_style_key(r) for r in runs]
         return ka == kb
 
-    def _change_text_color(self, oid):
-        if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
-            return
-        obj = self._find_object(oid)
-        if obj is None or obj.get("kind") != "text":
-            return
-        c = QColorDialog.getColor(obj.get("color") or QColor(self.edit_color),
-                                  self, "选择文字颜色")
-        if c.isValid():
-            self.begin_undo_step()
-            obj["color"] = c
-            self.modified = True
-            self._refresh_objects()
-            self.page_view.update()
-
     def _change_annotation_color(self, oid):
         if not self._require_permission(
                 pymupdf.PDF_PERM_ANNOTATE, "修改批注"):
@@ -3236,6 +3221,14 @@ class DocumentView(QWidget):
         self.delete_object(self.page_view.selected_id())
 
     def _on_context_menu(self, global_pos):
+        menu = self._build_context_menu(global_pos)
+        if menu.actions():
+            menu.exec(global_pos)
+
+    def _build_context_menu(self, global_pos):
+        """构建右键菜单(不弹出)。抽出以便测试直接断言菜单项；text 对象
+        右键已去掉「编辑文字/更改颜色」入口(编辑走双击就地编辑、改色走
+        编辑框内「格式编辑…」)，批注对象保留「更改颜色」。"""
         menu = QMenu(self)
         oid = self.page_view.selected_id()
         sel_obj = self._find_object(oid) if oid is not None else None
@@ -3289,14 +3282,6 @@ class DocumentView(QWidget):
                     lambda: self._edit_note_object(oid))
                 action.setEnabled(can_annotate)
                 menu.addSeparator()
-            elif sel_obj.get("kind") == "text":
-                action = menu.addAction(
-                    i18n.tr("edit_text"), lambda: self._edit_text_object(oid))
-                action.setEnabled(can_modify)
-                action = menu.addAction(
-                    i18n.tr("change_color"), lambda: self._change_text_color(oid))
-                action.setEnabled(can_modify)
-                menu.addSeparator()
             elif sel_obj.get("kind") in ANNOTATION_OBJECT_KINDS:
                 action = menu.addAction(
                     i18n.tr("change_color"),
@@ -3310,8 +3295,7 @@ class DocumentView(QWidget):
             menu.addAction(i18n.tr("cancel_place"), self._cancel_placement)
         menu.addSeparator()
         menu.addAction(i18n.tr("fit_width2"), self.fit_width)
-        if menu.actions():
-            menu.exec(global_pos)
+        return menu
 
     def copy_selected_text(self):
         if not self._require_permission(pymupdf.PDF_PERM_COPY, "复制内容"):
