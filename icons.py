@@ -130,11 +130,6 @@ def icon_next():
     return _build(d)
 
 
-def _magnifier(d, s):
-    p = None
-    pass
-
-
 def icon_zoom_in():
     def d(p, s):
         p.drawEllipse(QRectF(4, 4, 12, 12))
@@ -216,16 +211,6 @@ def icon_ink():
     def d(p, s):
         p.drawPolyline([QPointF(5, 12), QPointF(9, 7), QPointF(13, 15),
                         QPointF(17, 8), QPointF(19, 12)])
-    return _build(d)
-
-
-def icon_note():
-    def d(p, s):
-        p.drawRect(QRectF(5, 4, 14, 16))
-        _line(p, 14, 4, 14, 8)
-        _line(p, 14, 8, 19, 8)
-        _line(p, 8, 12, 16, 12)
-        _line(p, 8, 15, 13, 15)
     return _build(d)
 
 

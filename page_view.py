@@ -274,16 +274,6 @@ class PageView(QWidget):
             self.setCursor(Qt.CursorShape.IBeamCursor)
         self.update()
 
-    def invalidate_edit_lines(self, page=None):
-        """PDF 内容变化后丢弃行框缓存，下一次绘制时自动重建。"""
-        if page is None:
-            self._edit_lines.clear()
-        else:
-            self._edit_lines.pop(page, None)
-        self._edit_hover = None
-        if self._edit_overlay:
-            self.update()
-
     def _edit_line_hits(self, page):
         """返回一页的可编辑文字行列表（按 PDF 坐标，缓存）。
 
@@ -398,13 +388,6 @@ class PageView(QWidget):
         for idx, ln in enumerate(self._edit_line_hits(page)):
             if ln["rect"].contains(pt):
                 return (page, idx)
-        return None
-
-    def hit_edit_line(self, page, pt):
-        """PDF 坐标命中测试：返回该行的 {rect, text} 或 None（供外部复用）。"""
-        for ln in self._edit_line_hits(int(page)):
-            if ln["rect"].contains(pt):
-                return ln
         return None
 
     # ---------------- 对象 ----------------

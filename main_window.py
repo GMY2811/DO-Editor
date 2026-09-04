@@ -1960,7 +1960,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._apply_titlebar_dark)
             QTimer.singleShot(180, self._apply_titlebar_dark)
 
-    def _on_system_theme_changed(self, scheme):
+    def _on_system_theme_changed(self, _scheme):
         if self.theme_mode == "system":
             self._apply_theme(refresh_native_frame=True)
         else:
@@ -2031,13 +2031,6 @@ class MainWindow(QMainWindow):
         else:
             view = self._new_tab()
             view.load(path, password)
-
-    def _jump_to_page(self):
-        try:
-            n = int(self.page_edit.text())
-            self.current_view().show_page(n - 1)
-        except (ValueError, AttributeError):
-            pass
 
     def _focus_search(self):
         self.search_edit.setFocus()

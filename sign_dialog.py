@@ -403,7 +403,6 @@ class SignatureDialog(QDialog):
         if not ok or not name.strip():
             return
         save_signature(qimage_to_png_bytes(img), name.strip())
-        self.status_hint = f"已保存签名「{name.strip()}」"
         QMessageBox.information(self, "完成", f"签名「{name.strip()}」已保存到签名库")
 
     def _confirm(self):

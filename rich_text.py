@@ -135,17 +135,6 @@ class RichEditBox(QTextEdit):
         """像素字号换算系数（通常为页面缩放 zoom）。"""
         self._scale = max(0.05, float(scale))
 
-    def set_content(self, text, fmt=None):
-        """以统一格式载入纯文本；fmt 形如 {family,size,color,bold,italic}。"""
-        runs = single_run(
-            text,
-            (fmt or {}).get("family", ""),
-            (fmt or {}).get("size", 12.0),
-            (fmt or {}).get("color"),
-            (fmt or {}).get("bold", False),
-            (fmt or {}).get("italic", False))
-        self.set_runs(runs)
-
     def set_runs(self, runs):
         """载入多段富文本（保留各段样式）。"""
         runs = merge_runs(runs)
@@ -271,9 +260,6 @@ class RichEditBox(QTextEdit):
                 it += 1
             block = block.next()
         return merge_runs(runs)
-
-    def plain_text(self):
-        return self.toPlainText()
 
     # -- 格式工具 ----------------------------------------------------------
 

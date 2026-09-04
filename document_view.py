@@ -1352,23 +1352,6 @@ class DocumentView(QWidget):
                 "name": "fb" + (clean or "cjk") + suffix, "file": p}
         raise RuntimeError("no font covers text glyphs")
 
-    @staticmethod
-    def _pdf_fontname(family):
-        if not family:
-            return "helv"
-        low = family.lower()
-        if any(k in low for k in ("yahei", "microsoft", "simsun", "simhei",
-                                  "宋体", "黑体", "雅黑", "微软", "楷", "仿宋",
-                                  "song", "hei")):
-            return "china-s"
-        if any(k in low for k in ("times", "roman")):
-            return "times-roman"
-        if any(k in low for k in ("courier", "mono")):
-            return "cour"
-        if any(k in low for k in ("arial", "helvetica", "helv")):
-            return "helv"
-        return family
-
     # ================= 渲染 / 导航 =================
     def _refresh(self):
         dpr = max(1.0, self.page_view.devicePixelRatioF())
@@ -1417,12 +1400,6 @@ class DocumentView(QWidget):
         if win is not None:
             win.closed.disconnect(self._on_slideshow_closed)
             self._slide_window = None
-
-    def next_page(self):
-        self.show_page(self.page_view.current_page() + 1)
-
-    def prev_page(self):
-        self.show_page(self.page_view.current_page() - 1)
 
     def zoom_in(self):
         self._fit_mode = None

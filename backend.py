@@ -42,7 +42,6 @@ def open_pdf(path, password=None):
             raise PdfPasswordInvalid(path)
     doc._do_was_encrypted = encrypted
     doc._do_auth_level = auth_level
-    doc._do_open_password = password
     return doc
 
 
@@ -489,12 +488,6 @@ def add_strikeout(page, rect, color=None):
     return a
 
 
-def add_squiggly(page, rect, color=None):
-    a = page.add_squiggly_annot(rect)
-    _color(a, stroke=color or (0.85, 0.1, 0.1))
-    return a
-
-
 def add_rect(page, rect, color=None):
     a = page.add_rect_annot(rect)
     _color(a, stroke=color or (0.85, 0.1, 0.1))
@@ -512,16 +505,6 @@ def add_note(page, point, text, color=None):
     if color is not None:
         _color(annot, stroke=color)
     return annot
-
-
-def add_text_box(page, rect, text, color=None):
-    a = page.add_freetext_annot(rect, text, fontsize=11, fill_color=(1, 1, 1))
-    if color is not None:
-        try:
-            a.update(fontcolor=color)
-        except Exception:
-            pass
-    return a
 
 
 def add_ink(page, points, color=None):
