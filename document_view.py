@@ -2,6 +2,8 @@
 import os
 import re
 import copy
+import time
+import errno
 import pymupdf
 from PySide6.QtCore import (Qt, QSize, QRect, QRectF, QPointF, Signal,
                             QEvent, QTimer, QItemSelectionModel)
@@ -746,6 +748,37 @@ class DocumentView(QWidget):
         self.pageChanged.emit(0, 0)
         self.securityChanged.emit()
 
+    @staticmethod
+    def _atomic_replace(src, dst, max_retries=4):
+        """把 src 原子替换到 dst。
+
+        Windows 上 os.replace 经常因为目标文件正被另一个进程持有读/写
+        句柄（PDF 阅读器/浏览器内嵌预览/AV 扫描/OneDrive 同步等）而抛
+        ``WinError 5 (ERROR_ACCESS_DENIED)`` / ``PermissionError``。
+        这种占用通常是临时的——其他进程在亚秒级时间内完成读取或索引后
+        会释放句柄——所以用短退避重试几次大多能成功。最大 4 次退避
+        0.15+0.3+0.6+1.2 ≈ 2.25s；其他错误（路径不存在等）立即抛。
+        """
+        delays = (0.0, 0.15, 0.3, 0.6, 1.2)[: max_retries + 1]
+        last_err = None
+        for delay in delays:
+            if delay:
+                time.sleep(delay)
+            try:
+                os.replace(src, dst)
+                return
+            except (PermissionError, OSError) as e:
+                last_err = e
+                winerr = getattr(e, "winerror", None)
+                errno_code = getattr(e, "errno", None) or e.errno
+                # 仅对 AccessDenied (winerror 5 / errno EACCES|EPERM)
+                # 继续重试；其他错误立即抛出，避免无意义延迟。
+                if winerr != 5 and errno_code not in (
+                        errno.EACCES, errno.EPERM):
+                    break
+        assert last_err is not None
+        raise last_err
+
     def save(self):
         if self.doc is None:
             return
@@ -804,7 +837,28 @@ class DocumentView(QWidget):
                 reopen_password = None
             self.doc.save(tmp, **save_args)
             self.doc.close()
-            os.replace(tmp, path)
+            try:
+                self._atomic_replace(tmp, path)
+            except OSError as e:
+                # 重命名失败：清理残留的 .tmp 临时文件（避免占空间、也避免
+                # 下次保存时与同名 .tmp 冲突），然后构造带诊断信息的异常
+                # 让外层 QMessageBox 展示给用户。
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+                hint = ""
+                winerr = getattr(e, "winerror", None)
+                errno_code = getattr(e, "errno", None) or e.errno
+                if winerr == 5 or errno_code in (errno.EACCES, errno.EPERM):
+                    hint = ("\n\n可能原因：目标文件正被其他程序占用。"
+                            "\n请关闭占用该 PDF 的程序（PDF 阅读器、"
+                            "浏览器内嵌预览、OneDrive/坚果云等网盘同步、"
+                            "防病毒软件等），再重新保存。")
+                elif "系统找不到指定的文件" in str(e) or "No such file" in str(e):
+                    hint = "\n\n可能原因：目标目录不存在或无写入权限。"
+                raise RuntimeError(f"保存失败：{e}{hint}") from e
             self.doc = backend.open_pdf(path, reopen_password)
             self.file_path = path
             self.modified = False
