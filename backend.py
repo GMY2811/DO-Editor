@@ -641,19 +641,20 @@ def insert_text_auto(page, rect, text, fontsize=12, color=(0, 0, 0), fontfamily=
 
 
 def _draw_italic_cjk_segments(page, rect, segments, fontsize, color_255, bold=False,
-                              x_start=None):
+                              x_start=None, y_baseline=None):
     """CJK + italic 合成斜体直接绘制(支持从任意 x 起点并返回占用宽度)。
 
     segments: [(seg_text, is_cjk), ...] — 由 _partition_italic 生成。
     单一基线单行(无 wrap): text 过长超出 rect 时仍按左对齐绘制, 右侧
     可能溢出, 与原始 htmlbox 行为一致(短文本场景)。
+    y_baseline: 可选外部传入的共享基线 y(多 run 混排时用), 缺省按 rect 算。
     """
     import pymupdf as _pym
     tan_a = 0.2493    # tan(14°), 合成右倾 italic(主流 PDF 阅读器方向; PyMuPDF
                  # 自家 get_pixmap 渲染下方向会反转, 故此处不用负号)
     skew_matrix = _pym.Matrix(1, 0, tan_a, 1, 0, 0)
-    ascender = fontsize * 0.8
-    y_baseline = rect.y0 + ascender
+    if y_baseline is None:
+        y_baseline = rect.y0 + fontsize * 0.8
     if x_start is None:
         x_start = rect.x0
     f_cjk = _pym.Font("china-s")
@@ -713,8 +714,18 @@ def insert_rich_text_auto(page, rect, runs):
     # (CSS transform 在 insert_htmlbox 不生效, font-style:italic 对汉字无声);
     # 改走直接 page.insert_text 路径: CJK 段内置 china-s + morph 错切,
     # 非 CJK 段内置 hebo/hebi 真斜体, 各 run 按尺寸/颜色在同一基线串联。
-    if any(r.get("italic") and any(_is_cjk_char(c) for c in (r.get("text") or ""))
-           for r in runs or []):
+    # 多 run 走直接绘制还需共享基线: htmlbox 路径会把行框外的大字号 run
+    # 折到下一行(用户反馈"同行文字拆分成两行"——根因)。只要 run 字号不一
+    # 致, 统一改走直接绘制, 共享基线按最大字号算出, 视觉底部对齐。
+    # 其它情形(同字号多 run / 单一 run)仍走 htmlbox, 渲染与旧版一致。
+    any_cjk_italic = any(
+        r.get("italic") and any(_is_cjk_char(c) for c in (r.get("text") or ""))
+        for r in runs or [])
+    size_vary = len({float(r.get("size") or 12.0) for r in runs or []}) > 1
+    if any_cjk_italic or size_vary:
+        # 共用基线 = 行底 + max_size * 0.8 (PyMuPDF insert_text 接受 y=基线)
+        sizes = [max(1.0, float(r.get("size") or 12.0)) for r in runs or []]
+        y_shared = rect.y0 + (max(sizes) if sizes else 12.0) * 0.8
         x_cursor = rect.x0
         for run in runs or []:
             text = (run.get("text") or "")
@@ -726,15 +737,14 @@ def insert_rich_text_auto(page, rect, runs):
             italic = bool(run.get("italic"))
             bold = bool(run.get("bold"))
             has_cjk = any(_is_cjk_char(c) for c in text)
-            y_run = rect.y0 + size * 0.8
             if italic and has_cjk:
                 w = _draw_italic_cjk_segments(
                     page, rect, _partition_italic(text), size, color,
-                    bold=bold, x_start=x_cursor)
+                    bold=bold, x_start=x_cursor,
+                    y_baseline=y_shared)
                 x_cursor += w
             elif has_cjk:
-                # 非斜体 CJK 段: 内置 china-s 覆盖汉字, 同步推进 x_cursor
-                page.insert_text((x_cursor, y_run), text,
+                page.insert_text((x_cursor, y_shared), text,
                                  fontname="china-s", fontsize=size,
                                  color=color_f)
                 x_cursor += _pym.Font("china-s").text_length(text, size)
@@ -743,7 +753,7 @@ def insert_rich_text_auto(page, rect, runs):
                     "hebi" if (italic and bold) else
                     "heit" if italic else
                     "hebo" if bold else "helv")
-                page.insert_text((x_cursor, y_run), text,
+                page.insert_text((x_cursor, y_shared), text,
                                  fontname=fontname, fontsize=size,
                                  color=color_f)
                 x_cursor += _pym.Font(fontname).text_length(text, size)
