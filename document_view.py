@@ -817,6 +817,7 @@ class DocumentView(QWidget):
             except Exception:
                 pass
             tmp = path + ".tmp"
+            recover = path + ".recover.pdf"
             save_args = {"garbage": 3, "deflate": True}
             reopen_password = self._open_password
             if self._security_mode == "aes256":
@@ -840,14 +841,46 @@ class DocumentView(QWidget):
             try:
                 self._atomic_replace(tmp, path)
             except OSError as e:
-                # 重命名失败：清理残留的 .tmp 临时文件（避免占空间、也避免
-                # 下次保存时与同名 .tmp 冲突），然后构造带诊断信息的异常
-                # 让外层 QMessageBox 展示给用户。
+                # 保存到目标失败。此刻 self.doc 已被 close（写临时文件后
+                # 必须先释放句柄才能替换目标）。若放任不管，self.doc 就
+                # 永远停在“已关闭”状态——视图层任何重绘/鼠标移动都会因
+                # 访问已关闭文档抛 ValueError: document closed 而崩溃。
+                # 因此必须立刻把文档恢复到可用状态：
+                #   1) 把 tmp 改名为 path + ".recover.pdf"（doc 未占用
+                #      tmp，rename 几乎必然成功）作为新载体；
+                #   2) 从该文件重新打开文档——内含用户最新修改，不丢数据；
+                #   3) 使用固定恢复名，二次失败会覆盖同名旧备份，不积累
+                #      垃圾；且下次保存写的是新的 .tmp，不会与 doc 自身
+                #      打开的文件冲突（PyMuPDF 禁止 save 到自身文件）。
+                restored = False
                 try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
+                    if os.path.exists(recover):
+                        os.remove(recover)  # doc 已 close，旧备份句柄已释放
                 except OSError:
                     pass
+                try:
+                    os.replace(tmp, recover)
+                    self.doc = backend.open_pdf(recover, reopen_password)
+                    restored = True
+                except Exception:
+                    # rename 极罕见失败（如 AV 恰好扫到 tmp）：退而直接从
+                    # tmp 打开，宁可下次保存前再处理也不让 doc 停在 closed。
+                    try:
+                        self.doc = backend.open_pdf(tmp, reopen_password)
+                        restored = True
+                    except Exception:
+                        self.doc = None
+                if restored:
+                    self._undo_pdf_cache = None
+                    # 视图层仍指向旧（已 closed）doc 对象：立即重绑到
+                    # 恢复的新文档，避免 paintEvent 等访问旧对象。
+                    self._refresh()
+                else:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
                 hint = ""
                 winerr = getattr(e, "winerror", None)
                 errno_code = getattr(e, "errno", None) or e.errno
@@ -858,8 +891,18 @@ class DocumentView(QWidget):
                             "防病毒软件等），再重新保存。")
                 elif "系统找不到指定的文件" in str(e) or "No such file" in str(e):
                     hint = "\n\n可能原因：目标目录不存在或无写入权限。"
-                raise RuntimeError(f"保存失败：{e}{hint}") from e
+                backup_note = (f"\n\n您这次的修改没有丢失，已安全保留在：\n"
+                               f"{recover if restored else tmp}") if restored else ""
+                raise RuntimeError(
+                    f"保存失败：{e}{backup_note}{hint}") from e
             self.doc = backend.open_pdf(path, reopen_password)
+            # 本次保存成功：清理此前保存失败遗留的 .recover.pdf 备份。
+            # （其句柄已在本次 doc.save 后的 close 中释放，可安全删除。）
+            try:
+                if os.path.exists(recover):
+                    os.remove(recover)
+            except OSError:
+                pass
             self.file_path = path
             self.modified = False
             # 保存后的当前状态成为新基准；撤销到任何历史状态都应重新
@@ -1554,7 +1597,7 @@ class DocumentView(QWidget):
         self.thumb_list.clear()
         self._thumb_batch = 0
         self._thumbnail_job_active = False
-        if self.doc is None:
+        if self.doc is None or getattr(self.doc, "is_closed", False):
             return
         # 缩略图比例跟随文档方向：横向文档用矮缩略图，
         # 避免固定竖版比例导致横向页面上下留白、间距过大。
@@ -1578,7 +1621,11 @@ class DocumentView(QWidget):
 
     def _render_thumbnail_batch(self):
         self._thumbnail_job_active = False
-        if self.doc is None or getattr(self, "_thumb_batch", 0) is None:
+        # doc 可能在批次渲染期间被替换/关闭（如另存替换文档、关标签），
+        # 用 is_closed 兜底，避免访问已关闭文档抛 document closed。
+        if (self.doc is None
+                or getattr(self.doc, "is_closed", False)
+                or getattr(self, "_thumb_batch", 0) is None):
             return
         batch_size = 24
         start = self._thumb_batch

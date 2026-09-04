@@ -108,6 +108,19 @@ class PageView(QWidget):
         self._pan_last = None
         self._compute_layout()
 
+    def _doc_open(self):
+        """self._doc 是否指向一个“可安全访问”的文档。
+
+        仅判断 is not None 不够：document_view 在保存流程中会 close 旧
+        Document 再重开，若失败窗口内 PageView 持有了已 close 的对象，
+        任何 len(self._doc)/backend.page_size 都会抛 ValueError
+        (document closed)，在 paintEvent/mouseMoveEvent 等 Qt 回调里
+        反复抛异常会导致界面崩溃。这里统一加一道 is_closed 防线，
+        一旦文档已关闭就当“没有文档”处理。
+        """
+        return (self._doc is not None
+                and not getattr(self._doc, "is_closed", False))
+
     def set_zoom(self, zoom):
         self._zoom = max(0.05, zoom)
         self._images = {}
@@ -116,7 +129,7 @@ class PageView(QWidget):
     def _compute_layout(self):
         self._offsets = []
         self._page_h = []
-        if self._doc is None:
+        if not self._doc_open():
             self._total_w = 0
             self._total_h = 0
             self.setFixedSize(0, 0)
@@ -142,7 +155,7 @@ class PageView(QWidget):
         self._update_visible()
 
     def _update_visible(self):
-        if self._doc is None:
+        if not self._doc_open():
             return
         buf = 400
         top = self._viewport_y - buf
@@ -177,7 +190,7 @@ class PageView(QWidget):
         self._images[i] = img
 
     def page_count(self):
-        return len(self._doc) if self._doc else 0
+        return len(self._doc) if self._doc_open() else 0
 
     def current_page(self):
         if not self._offsets:
@@ -212,7 +225,7 @@ class PageView(QWidget):
 
     def pdf_point_at(self, pos):
         """将画布局部坐标转换为有效的页面/PDF 坐标并约束在页面内。"""
-        if self._doc is None or not self._offsets:
+        if not self._doc_open() or not self._offsets:
             return None
         page, pt = self._pdf_point(QPointF(pos))
         pw, ph = backend.page_size(self._doc, page)
@@ -222,7 +235,7 @@ class PageView(QWidget):
 
     def _point_hits_text(self, pos):
         """点击处是否有可选择文字；空白区域用于抓手拖动。"""
-        if self._doc is None or not self._offsets:
+        if not self._doc_open() or not self._offsets:
             return False
         page, pt = self._pdf_point(QPointF(pos))
         pw, ph = backend.page_size(self._doc, page)
@@ -285,7 +298,7 @@ class PageView(QWidget):
         if cached is not None:
             return cached
         out = []
-        if self._doc is not None and 0 <= page < len(self._doc):
+        if self._doc_open() and 0 <= page < len(self._doc):
             try:
                 data = self._doc[page].get_text("rawdict")
             except Exception:
@@ -378,7 +391,7 @@ class PageView(QWidget):
 
     def _edit_line_at(self, pos):
         """画布坐标 → 命中的文字行 (page, idx)，未命中返回 None。"""
-        if not self._edit_overlay or self._doc is None or not self._offsets:
+        if not self._edit_overlay or not self._doc_open() or not self._offsets:
             return None
         page = self._page_at(pos.y())
         pt = self._pdf_point(pos)[1]
@@ -479,7 +492,7 @@ class PageView(QWidget):
     # ---------------- 绘制 ----------------
     def paintEvent(self, event):
         p = QPainter(self)
-        if self._doc is not None:
+        if self._doc_open():
             buf = 400
             top = self._viewport_y - buf
             bottom = self._viewport_y + self._viewport_h + buf
@@ -915,7 +928,7 @@ class PageView(QWidget):
 
     # ---------------- 文本选择 ----------------
     def _compute_selection(self):
-        if self._sel_start is None or self._sel_cur is None or self._doc is None:
+        if self._sel_start is None or self._sel_cur is None or not self._doc_open():
             self._sel_words = []
             return
         page = self._page_at(self._sel_start.y())
