@@ -16,7 +16,8 @@ RichEditBox：仿 QLineEdit 的单行就地编辑控件，内容却是富文本�
 """
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QTextCharFormat, QTextCursor
+from PySide6.QtGui import (QBrush, QColor, QFont, QTextCharFormat,
+                           QTextCursor, QTextFormat)
 from PySide6.QtWidgets import (QColorDialog, QDialog, QDoubleSpinBox,
                                QFontComboBox, QFrame, QHBoxLayout, QLabel,
                                QMenu, QPushButton, QTextEdit, QVBoxLayout)
@@ -26,6 +27,12 @@ from PySide6.QtWidgets import (QColorDialog, QDialog, QDoubleSpinBox,
 # 目标像素 / (96/72)；读回时再乘回。scale 由 set_scale 传入（=页面 zoom
 # 或带 1.08 输入放大系数）。
 _PX_PER_PT = 96.0 / 72.0
+
+# 字体族名的自定义属性键：写 _char_format 时随字符格式一并保存；读回时
+# 只做 QVariant 属性读取，绝不触发 Qt 的 QFont 字族解析——Qt 在部分字符
+# 格式（空字族、文档默认格式等）上 fontFamily()/fontFamilies() 会触发
+# 不可被 try/except 捕获的原生访问违例（access violation）。
+_FAM_PROP = int(QTextFormat.Property.UserProperty) + 101
 
 
 # --------------------------------------------------------------------------
@@ -271,12 +278,19 @@ class RichEditBox(QTextEdit):
     # -- 格式工具 ----------------------------------------------------------
 
     def _fmt_family(self, cf):
-        """安全读取字符格式的字体族（fontFamilies 在空文档默认格式上
-        可能触发原生崩溃，统一走 fontFamily()）。"""
+        """安全读取字符格式的字体族。
+
+        族名在 _char_format 写入时随字符格式保存为自定义属性 _FAM_PROP，
+        这里只做纯 QVariant 属性读取——绝不调用 fontFamily()/fontFamilies()。
+        Qt 对「空字族 / 文档默认格式」等字符格式执行字族解析会触发不可被
+        try/except 捕获的原生访问违例（实测 access violation），属性读取
+        与之完全隔离。属性缺失（非本控件创建的格式）返回空串，由调用方
+        兜底为基准字族。
+        """
         try:
-            fam = cf.fontFamily()
-            if fam:
-                return fam
+            v = cf.property(_FAM_PROP)
+            if isinstance(v, str) and v:
+                return v
         except Exception:
             pass
         return ""
@@ -299,6 +313,9 @@ class RichEditBox(QTextEdit):
         family = (run.get("family") or self._base_fmt.get("family")
                   or "Microsoft YaHei")
         cf.setFontFamilies([family])
+        # 同时存为自定义属性：读回族名走 _fmt_family 属性读取，
+        # 避免 Qt 字族解析在特定字符格式上的原生访问违例。
+        cf.setProperty(_FAM_PROP, family)
         # 存点阵值 = 目标像素 / (96/72)，使 Qt 渲染像素 ≈ pt*scale
         size = float(run.get("size") or 12.0)
         pt = max(1.0, size * self._scale / _PX_PER_PT)

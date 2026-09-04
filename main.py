@@ -1,6 +1,20 @@
 """DO编辑器 程序入口。"""
 import os
 import sys
+import faulthandler
+
+# 崩溃诊断：段错误/原生异常时把调用栈写入日志文件。
+# all_threads=True 覆盖渲染等工作线程（GUI 崩在子线程默认抓不到）。
+_FAULT_LOG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "_crash_trace.log")
+try:
+    with open(_FAULT_LOG, "a", encoding="utf-8") as _f:
+        _f.write("\n===== %s =====\n" % __import__("time").strftime("%Y-%m-%d %H:%M:%S"))
+    _fh = open(_FAULT_LOG, "a", encoding="utf-8")
+    faulthandler.enable(file=_fh, all_threads=True)
+except Exception:
+    pass
+
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 import app_config as cfg
