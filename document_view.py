@@ -1125,6 +1125,15 @@ class DocumentView(QWidget):
                 covered = False
         if not covered:
             fname, embed = self._fallback_cjk_font(obj, text)
+        # 页面若已注册同名资源，多半是原 PDF 嵌入的 CID/TrueType 子集
+        # (只含原文档用过的字形)；直接复用会把新字形映射成 \x00 豆腐。
+        # 用页内唯一名强制注册新的全量字体，保证新文本字形可用。
+        # get_fonts(full=True) 元组: (xref, ext, type, basefont, name, ...),
+        # 第 4 项 (f[3]) 是带子集前缀的 basefont, 第 5 项 (f[4]) 才是
+        # insert_font 时使用的资源名, 与 fname 直接比较必须用 f[4]。
+        if any((f[4] or "") == fname for f in page.get_fonts(full=True)):
+            self._bake_font_seq = getattr(self, "_bake_font_seq", 0) + 1
+            fname = f"{fname}{self._bake_font_seq}"
         try:
             if embed.get("file"):
                 page.insert_font(fontname=fname, fontfile=embed["file"])
@@ -1133,9 +1142,9 @@ class DocumentView(QWidget):
             else:
                 raise RuntimeError("no embed font source")
         except Exception:
-            # 同名资源可能已在页面注册（同一页多处同字体修改）
+            # 唯一名仍撞名(极少见); 留作最后兜底. 同样用 f[4] 资源名比较.
             fonts = page.get_fonts(full=True)
-            if not any(f[3] == fname or fname in (f[3] or "") for f in fonts):
+            if not any((f[4] or "") == fname for f in fonts):
                 raise
         size = max(4.0, float(obj.get("fontsize") or 10.0))
         base = obj.get("baseline")
