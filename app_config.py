@@ -1,7 +1,7 @@
 """DO编辑器 —— 全局配置与品牌信息。"""
 
 APP_NAME = "DO编辑器"
-APP_VERSION = "2.6.9"
+APP_VERSION = "2.9.9"
 DEVELOPER = "RAY"
 DEVELOPER_EMAIL = "gmy.2811@gmail.com"
 ORG_NAME = "RAY"

@@ -9,7 +9,7 @@ from PySide6.QtCore import (Qt, QSize, QRect, QRectF, QPointF, Signal,
                             QEvent, QTimer, QItemSelectionModel)
 from PySide6.QtGui import (QIcon, QPixmap, QImage, QPainter, QColor, QPen,
                            QFont, QTransform, QKeySequence, QShortcut,
-                           QCursor, QPageLayout, QTextCursor)
+                           QCursor, QTextCursor)
 from PySide6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout, QSplitter,
                                QScrollArea, QListWidget, QListWidgetItem,
                                QTabWidget, QStackedWidget, QFrame, QPushButton,
@@ -18,16 +18,66 @@ from PySide6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout, QSpli
                                QGraphicsDropShadowEffect, QAbstractItemView,
                                QStyledItemDelegate, QStyleOptionViewItem, QStyle,
                                QTreeWidget, QTreeWidgetItem)
-from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+from PySide6.QtPrintSupport import QPrinter
 
 import backend
 import i18n
 from page_view import PageView
-from rich_text import (RichEditBox, merge_runs, runs_text, single_run,
-                       runs_all_same_style)
+from rich_text import (RichEditBox, PdfRowEditBox, merge_runs, runs_text, single_run,
+                       runs_all_same_style, _qt_safe_family)
 from sign_dialog import (SignatureDialog, SignatureLibraryDialog,
                          SignatureFontComboBox, qimage_to_png_bytes)
 from slide_show import SlideShowWindow
+
+# ---- 诊断后门（仅 DO_LIVE_DIAG=1 时启用）：记录 live 写回每段字体决策，
+# 并自动保存编辑中的 PDF 快照，供"方块/变大"类问题做字形级取证 ----
+def _live_diag_dir(meta):
+    if not (meta and isinstance(meta, dict)):
+        return None
+    d = meta.get("_diag")
+    if d and os.path.isdir(d.get("dir", "")):
+        return d
+    if not os.environ.get("DO_LIVE_DIAG"):
+        return None
+    try:
+        di = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "_live_diag")
+        os.makedirs(di, exist_ok=True)
+        d = {"dir": di, "seq": 0}
+        meta["_diag"] = d
+        # 清掉旧日志
+        open(os.path.join(di, "_live_diag.log"), "w",
+             encoding="utf-8").write("=== live diag %s ===\n"
+                                     % time.strftime("%H:%M:%S"))
+        return d
+    except Exception:
+        return None
+
+
+def _live_diag_log(meta, line):
+    d = _live_diag_dir(meta)
+    if not d:
+        return
+    try:
+        with open(os.path.join(d["dir"], "_live_diag.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _live_diag_snap(doc, meta, tag):
+    d = _live_diag_dir(meta)
+    if not d:
+        return
+    try:
+        d["seq"] += 1
+        path = os.path.join(d["dir"], "step_%03d_%s.pdf"
+                            % (d["seq"], tag))
+        with open(path, "wb") as f:
+            f.write(doc.tobytes())
+    except Exception:
+        pass
 
 MODE_DEFS = [
     ("view",         "选择",     "view",  "select"),
@@ -55,7 +105,7 @@ class ReplaceTextDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(i18n.tr("replace_text"))
         from PySide6.QtWidgets import (QTextEdit, QSpinBox, QPushButton,
-                                      QHBoxLayout, QFontComboBox, QCheckBox)
+                                      QHBoxLayout, QCheckBox)
         from PySide6.QtGui import QFont
         self._fontsize = default_size
         self._color = QColor(default_color) if default_color is not None else QColor(0, 0, 0)
@@ -450,6 +500,7 @@ class DocumentView(QWidget):
         self.mode_actions = {}
         self._row_edit = None        # 就地行编辑 QLineEdit（无弹窗工具条）
         self._row_edit_meta = None   # {page, rect, text, fmt} 行编辑元数据
+        self._row_live_busy = False  # 行编辑 live 写回重入保护
         self._row_focus_pending = False  # 失焦已提交过行编辑（供点击空白判定）
         self._inplace_edit = None   # 「文本」工具就地新增文字的 QLineEdit
         self._inplace_meta = None   # {page, pt, family, size, color, bold, italic}
@@ -470,7 +521,12 @@ class DocumentView(QWidget):
         self._window_fit_timer.setSingleShot(True)
         self._window_fit_timer.setInterval(150)
         self._window_fit_timer.timeout.connect(
-            lambda: self.fit_width(preserve_position=True))
+            self._on_window_fit_timeout)
+        # 就地编辑（行/新增文字/对象文字）期间收到窗口尺寸变化：自动适宽
+        # 会缩放整页并令透明编辑层与 PDF 行脱位（Acrobat 编辑中从不缩放
+        # 页面），因此改为挂起，待编辑框关闭后再补一次适配。
+        self._fit_after_edit = False
+        self._fit_after_edit_mode = "width"
         self._last_viewport_w = 0
         self._last_viewport_h = 0
         # 主窗口按文档方向调整自身大小时置位，抑制随后的 resizeEvent 适宽，
@@ -781,22 +837,22 @@ class DocumentView(QWidget):
 
     def save(self):
         if self.doc is None:
-            return
+            return False
         if self.file_path:
-            self._save_to(self.file_path)
+            return self._save_to(self.file_path)
         else:
-            self.save_as()
+            return self.save_as()
 
     def save_as(self):
         if self.doc is None:
-            return
+            return False
         path, _ = QFileDialog.getSaveFileName(self, "另存为", "未命名.pdf",
                                               "PDF 文件 (*.pdf)")
         if not path:
-            return
+            return False
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
-        self._save_to(path)
+        return self._save_to(path)
 
     def _save_to(self, path):
         try:
@@ -925,8 +981,10 @@ class DocumentView(QWidget):
             # 自动回到选择模式——无需再手动按 Esc 退出编辑状态。
             if self.current_mode in ("replace_text", "text"):
                 self.set_mode("view")
+            return True
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存失败：\n{e}")
+            return False
 
     def set_pdf_encryption(self, user_pw, owner_pw, permissions):
         self.begin_undo_step()
@@ -1008,7 +1066,10 @@ class DocumentView(QWidget):
         if self._undo_pdf_cache is None:
             # 保留原加密设置。这样撤销不会意外把受保护文档变成明文。
             self._undo_pdf_cache = self.doc.tobytes(
-                garbage=3, deflate=True,
+                # 编辑中的文档不能压缩 / 重排 xref：MuPDF 的字体缓存仍引用
+                # 原编号，下一次 TextWriter 写入会把字形引用到其他对象。
+                # 对象整理只在保存并立即重新打开文档时进行。
+                garbage=0, deflate=True,
                 encryption=pymupdf.PDF_ENCRYPT_KEEP)
         return self._undo_pdf_cache
 
@@ -1208,10 +1269,8 @@ class DocumentView(QWidget):
         # 性能：Font(fontfile=…) 解析系统 TTC 很贵（雅黑 ~100-180ms），
         # 按来源(file 路径 / buffer 内容)缓存 Font，同一来源只解析一次；
         # insert_font 重复同名注册 PyMuPDF 内部已缓存(实测 0.1ms)。
-        # buffer 来源（原文档嵌入子集）由 _prepare_row_embed 在产出前已做
-        # 字形覆盖与样式承载判定——其中 CID(Type0) 子集的 has_glyph 恒
-        # False，不能在此再作兜底信号（否则每条中文修改都误回退 20MB 系统
-        # 字体）。系统 file 来源的 has_glyph 可靠，照常兜底。
+        # buffer 来源沿用对象中已选好的嵌入字体；子集的 has_glyph
+        # 不能直接用于判断覆盖情况。系统 file 来源照常校验字形。
         if embed.get("buffer"):
             covered = True
         else:
@@ -1247,9 +1306,8 @@ class DocumentView(QWidget):
         base = obj.get("baseline")
         if base is None:
             base = fr.y1 - size * 0.15
-        # 中文斜体：Windows 的中文字体没有斜体变体文件，_embed_for_style /
-        # _prepare_row_embed 的“斜体档”实际拿到的仍是正体字体文件，直接
-        # 写回必然丢斜体（像素 diff 0%，见 _verify_bake_cjk_italic.py）。
+        # 中文斜体：Windows 中文字体通常没有斜体变体文件，字体选择
+        # 可能仍返回正体；直接写回会丢失对象的斜体样式。
         # 含 CJK 的斜体改用 morph 错切合成：斜切随字形写入 content
         # stream，保存/重开/其它阅读器都保持倾斜，与 backend 里添加文字
         # 的 CJK 斜体合成同参数同观感。
@@ -1523,8 +1581,47 @@ class DocumentView(QWidget):
             self._sidebar_fit_timer.start()
 
     def _fit_page_after_sidebar_resize(self):
-        if self.doc is not None and not self.side_tabs.isHidden():
+        if self.doc is None or self.side_tabs.isHidden():
+            return
+        if self._inline_edit_active():
+            self._fit_after_edit = True
+            self._fit_after_edit_mode = "page"
+            return
+        self.fit_page(preserve_position=True)
+
+    # ---------------- 就地编辑期间的缩放保护 ----------------
+    def _inline_edit_active(self):
+        """是否有就地编辑框开着（行文字/新增文字/对象文字）。
+
+        这些编辑框以画布 _zoom 坐标锚定在 PDF 行/点上，编辑过程中页面被
+        重新缩放会让框与文档内容脱位。窗口自动适宽等触发必须挂起，等编辑
+        结束（提交/取消）后再补做，保证所见即所得不闪跳。
+        """
+        return (getattr(self, "_row_edit", None) is not None
+                or getattr(self, "_inplace_edit", None) is not None
+                or getattr(self, "_obj_edit", None) is not None)
+
+    def _on_window_fit_timeout(self):
+        if self._inline_edit_active():
+            # 正在就地编辑：挂起适宽，编辑结束后由 _close_inline_editor 补跑
+            self._fit_after_edit = True
+            self._fit_after_edit_mode = "width"
+            return
+        self.fit_width(preserve_position=True)
+
+    def _flush_fit_after_edit(self):
+        """编辑框关闭后若曾有挂起的适宽请求，补做一次。"""
+        if not self._fit_after_edit:
+            return
+        self._fit_after_edit = False
+        mode = self._fit_after_edit_mode or "width"
+        self._fit_after_edit_mode = "width"
+        if self.doc is None or self._inline_edit_active():
+            return
+        if mode == "page":
             self.fit_page(preserve_position=True)
+        else:
+            self.fit_width(preserve_position=True)
 
     def resizeEvent(self, event):
         """窗口尺寸变化时整页适配（节流），保持当前页完整显示。
@@ -2221,6 +2318,7 @@ class DocumentView(QWidget):
             return
         self._begin_row_edit(int(page), line)
 
+
     def _begin_row_edit(self, page, line):
         """在文字行原位置就地打开单行富文本编辑框（无弹窗）。
 
@@ -2246,9 +2344,18 @@ class DocumentView(QWidget):
 
         fmt = line.get("fmt") or {}
         size = float(fmt.get("size") or 10.0)
-        family = self._map_pdf_font(fmt.get("font", ""))
+        family = self._row_font_family(page, fmt.get("font", ""))
         if not family:
-            family = "Microsoft YaHei"
+            # 兜底按行文本内容：含 CJK 走 SimSun（中文默认衬线），
+            # 纯西文走 Arial；不强行塞雅黑，否则会让西文无衬线行变
+            # 中文字形观感（"字体/排列格式"全怪）。
+            _text = line.get("text", "") or ""
+            _has_cjk = any(
+                ('一' <= ch <= '鿿') or
+                ('぀' <= ch <= 'ヿ') or
+                ('가' <= ch <= '힯')
+                for ch in _text)
+            family = "SimSun" if _has_cjk else "Arial"
         c = fmt.get("color") or (0, 0, 0)
         color = QColor(int(c[0]), int(c[1]), int(c[2]))
         bold = bool(fmt.get("bold", False))
@@ -2260,16 +2367,17 @@ class DocumentView(QWidget):
         # fontsize*zoom 逻辑像素显示（page_view 以 _zoom 缩放渲染），
         # 此处不再乘额外放大系数，避免框内文字比原文偏大变形。
         font_px = max(9.0, size * zoom)
-        box_h = max(wh + 4.0, font_px * 1.35 + 4.0)
-        # 垂直：中心对齐该行文字框，避免字体替换引起的基线偏移
-        center_y = wy + wh / 2.0
-        by = int(center_y - box_h / 2.0)
-        # 水平：从行首开始，宽度不小于原行框，短行放宽便于输入，
-        # 但不超过页面右缘。
-        bx = max(0, int(wx - 1))
+
+        # 编辑框几何：完全紧贴 PDF line bbox（Acrobat 选中块 = 原文字宽，
+        # 无空白 padding），宽度不强制拉至 180（短行拉成长白条是用户看到
+        # "变大"的核心来源之一）。垂直与行顶对齐，字形 ink 顶与 PDF 行顶
+        # 同位，邻行 baseline 不因框高而错位。
+        bx = max(0, int(wx))
+        by = int(wy)
         page_px_w = backend.page_size(self.doc, page)[0] * zoom
         avail_w = max(2.0, page_px_w - bx)
-        box_w = max(ww + 6.0, min(180.0, avail_w))
+        box_h = wh
+        box_w = max(ww, 2.0)
         box_w = min(box_w, avail_w)
 
         # 初始富文本：按行内各 span 预填（行内原本有混排时保留原样），
@@ -2279,7 +2387,7 @@ class DocumentView(QWidget):
             st = str(s.get("text", ""))
             if not st:
                 continue
-            fam = self._map_pdf_font(s.get("font", "")) or family
+            fam = self._row_font_family(page, s.get("font", "")) or family
             sc = s.get("color") or c
             init_runs.append({
                 "text": st, "family": fam,
@@ -2292,78 +2400,610 @@ class DocumentView(QWidget):
             init_runs = single_run(
                 str(line.get("text", "")), family, size, color, bold, italic)
 
-        edit = RichEditBox(canvas)
+        edit = PdfRowEditBox(canvas)
         edit.setObjectName("rowEditInline")
         edit.set_scale(zoom)
-        # 控件级字体像素与页面一致（逐字符渲染由 RichEditBox 的字符格式
-        # 以 pt*zoom 映射点阵控制，二者数值一致）
+        # 控件级字体像素与页面一致（用于 Qt 内部布局/光标定位）
         from PySide6.QtGui import QFont as _QFont
         _wf = _QFont(family)
         _wf.setPixelSize(int(round(font_px)))
         _wf.setBold(bold)
         _wf.setItalic(italic)
         edit.setFont(_wf)
-        # 编辑器覆盖在页面上，采用近纸色半透明底 + 主题蓝细框，
-        # 文字尽量沿用原颜色（过浅则压暗以保证在白底上可读）。
-        text_color = color.name() if luminance > 225 else (
+        # ================== Acrobat 就地方案（MuPDF 单引擎） ==================
+        # 点击进入编辑的瞬间**不做任何像素/文档改动**：PDF 原字形原样显示。
+        # 编辑框只是完全透明的「输入 + 光标 + 选区」层——框内文字字色透明，
+        # 真正的新文字不在这里渲染！用户实际输入/删除/改样式的那一刻，
+        # contentsChanged → 把整行文本 redact+insert **直接写回内存 PDF**
+        # （原字体子集/系统同族、原字号、原基线），再仅重渲染该行区域位图。
+        # 于是编辑行文字与页面其它行出自**同一个 MuPDF/FreeType 引擎**，
+        # 同字体同字号同基线，彻底消除 Qt/DirectWrite 与 MuPDF 双引擎造成
+        # 的"放大/挪动/字体不一致"。光标闪烁由 Qt 画在透明层上，点哪改哪。
+        init_text_color = color.name() if luminance > 225 else (
             "#1c1c1e" if luminance > 200 else color.name())
+        # 选中态绝不能把字形画出来：框内文字本就透明（字形由下方 MuPDF
+        # 贴片唯一渲染），若 Qt 用 selection-color 重画选中字形，会叠在
+        # PDF 字形上出现"变大/变形/方块"。选中只画半透明浅蓝高亮（与
+        # Acrobat 一致：高亮底下仍是 PDF 原字形），字形永不二次绘制。
         edit.setStyleSheet(
             "QTextEdit#rowEditInline{"
-            "background-color: rgba(255,255,255,0.92);"
-            "border: 1px solid #0a84ff; border-radius: 2px;"
-            "padding: 0 2px; color: %s;"
-            "selection-background-color: #b6d7ff;"
-            "selection-color: #101418;}" % text_color)
+            "background-color: transparent;"
+            "border: none;"
+            "padding: 0px; margin: 0px;"
+            "color: " + init_text_color + ";"
+            "selection-background-color: rgba(0,110,220,35%);"
+            "selection-color: transparent;}")
         edit.set_runs(init_runs)
+        edit.set_text_visible(False)      # 框内文字透明：视觉只看 PDF 引擎
+        # 用文档理想宽度（实际渲染文字宽）兜底框宽：避免 PDF line bbox ww
+        # 小于真实文字宽（如含混排 span）时把后段字裁掉；并防止光标
+        # 滚动后字符被顶出可视区。
+        ideal_w = edit.document().idealWidth()
+        box_w = max(box_w, ideal_w + 2.0)
+        box_w = min(box_w, avail_w)
         edit.setGeometry(bx, by, int(box_w), int(box_h))
+        ranges = line.get("char_x") or []
+        edit.set_pdf_layout(str(line.get("text", "")),
+                            [(a * zoom - bx, b * zoom - bx) for a, b in ranges],
+                            wy - by, wy - by + wh)
         edit.raise_()
         edit.show()
         edit.setFocus()
         # 点击进入不默认全选：光标定位到鼠标点击处的字符，便于点哪改哪。
         # 鼠标不在框内（键盘/程序触发）则把光标放到行尾，避免误替换整行。
-        click_pos = edit.mapFromGlobal(QCursor.pos())
+        click_pos = (QPointF(float(line["cx"]) * zoom - bx, wh / 2)
+                     if "cx" in line else edit.mapFromGlobal(QCursor.pos()))
         cur = edit.textCursor()
-        if edit.rect().contains(click_pos):
+        if QRectF(edit.rect()).contains(QPointF(click_pos)):
             cur = edit.cursorForPosition(click_pos)
         else:
             cur.movePosition(QTextCursor.MoveOperation.End)
         edit.setTextCursor(cur)
         edit.sync_typing_format_from_cursor()
+        # 内容/样式变化（含 IME 提交、格式对话框应用）→ live 写回 PDF
+        edit.document().contentsChanged.connect(
+            self._on_row_edit_contents_changed)
         edit.submitRequested.connect(self._finish_row_edit)
         edit.installEventFilter(self)
         self._row_edit = edit
         self._row_edit_meta = {
             "page": page,
             "rect": QRectF(r),
-            # 擦除区 = 字符级并集（不含字体上下行），避免红act 越界吞掉
+            # 擦除区 = 字符级并集（不含字体上下行），避免 redact 越界吞掉
             # 相邻行文字；行 bbox 在行距紧凑时与邻行交叠，不能直接用来擦除。
             "erase": list(line.get("erase")) if line.get("erase") else
                      [r.x(), r.y(), r.right(), r.bottom()],
             "text": str(line.get("text", "")),
+            "origin": line.get("origin"),     # (x,y) 行首字符基线原点
+            "char_x": line.get("char_x"),     # 每字符(x0,x1)顺序表（供前缀保留）
             "cx": float(line.get("cx", r.x() + r.width() / 2.0)),
             # 提交时直接复用点击命中行的格式与主 span 矩形，避免
             # 表格型文档中按 y 二次定位误中相邻行导致格式/颜色串行。
             "fmt": dict(line.get("fmt") or {}),
             "span_bbox": list(line.get("span_bbox") or
                               [r.x(), r.y(), r.right(), r.bottom()]),
+            # 行内各 span 原始明细（PDF 字体/字号/粗斜），live 写回时
+            # 优先复用对应 span 的嵌入子集字体
+            "spans": list(line.get("spans") or []),
             # 初始富文本（行内原有样式），用于判定用户是否改了格式
             "init_runs": init_runs,
+            # ========== live 会话状态（Acrobat 直写 PDF） ==========
+            "live": False,     # 本会话是否已改动内存 PDF
+            "undo": False,     # 会话级 undo 快照是否已记录
+            "written": False,  # PDF 该行当前内容是否为本次会话写入
+            "last_key": None,  # 上次 live 的 runs 指纹（防重入/防空转）
+            "last_span": None, # 上次写入内容占用的 PDF 区域 [x0,y0,x1,y1]
+            "fseq": 0,         # 字体注册名去重序号
         }
+        # 连接后补记初始指纹：跳过 setTextCursor/sync_typing_format_from_cursor
+        # 可能触发的一次空 contentsChanged tick（内容未变则 live 不空跑）。
+        try:
+            self._row_live_busy = False
+            meta0 = self._row_edit_meta
+            meta0["last_key"] = self._row_fingerprint(init_runs)
+        except Exception:
+            pass
+        # 该行进入就地编辑：立即从整页蓝框/hover 模式摘除（不改任何像素，
+        # 原字形继续由 PDF 位图显示；直到用户真正输入才 live 写回）
+        canvas.set_inline_rect(page, QRectF(r))
 
-    def _finish_row_edit(self):
-        """回车提交就地行编辑，并把键盘焦点还给画布。"""
-        self._commit_row_edit(commit=True)
-        if self.page_view is not None:
-            self.page_view.setFocus()
+    @staticmethod
+    def _row_fingerprint(runs):
+        """整行富文本 runs 的指纹：文本 + 样式逐段拼接，内容/格式变化
+        都会改变指纹（仅移动光标不会），用于 live 写回去重。"""
+        parts = []
+        for r in merge_runs(runs):
+            c = r.get("color")
+            if isinstance(c, QColor):
+                cr, cg, cb = c.red(), c.green(), c.blue()
+            else:
+                cr = cg = cb = 0
+            parts.append("|".join([
+                str(r.get("text", "")),
+                str(r.get("family") or ""),
+                str(round(float(r.get("size") or 12.0), 2)),
+                str(cr), str(cg), str(cb),
+                "B" if r.get("bold") else "-",
+                "I" if r.get("italic") else "-",
+            ]))
+        return "\x1f".join(parts)
+
+    # ------------------------------------------------------------------
+    # live 写回：把编辑框当前内容实时写进内存 PDF（MuPDF 单引擎）
+    # ------------------------------------------------------------------
+
+    def _on_row_edit_contents_changed(self):
+        """行编辑框内容/格式变化 → 整行 redact+insert 写回内存 PDF。
+
+        Acrobat 式就地编辑：键盘输入（含 IME 提交）、删除、粘贴、右键
+        格式修改都会触发本回调，编辑行文字始终由 MuPDF 引擎渲染，与
+        页面其它行完全一致。
+        """
+        if getattr(self, "_row_live_busy", False):
+            return
+        edit = self._row_edit
+        meta = self._row_edit_meta
+        if edit is None or meta is None or self.doc is None:
+            return
+        try:
+            runs = merge_runs(edit.to_runs())
+        except Exception:
+            return
+        key = self._row_fingerprint(runs)
+        if key == meta.get("last_key"):
+            return
+        meta["last_key"] = key
+        self._row_live_busy = True
+        try:
+            self._row_live_write(runs)
+        except Exception as exc:
+            import traceback as _tb
+            _tb.print_exc()
+            self.statusMessage.emit(f"就地更新失败：{exc}", 4000)
+        finally:
+            self._row_live_busy = False
+
+    def _row_live_geom(self, meta):
+        """live 写回几何：x 起点/基线取原行首字符 origin，兜底字形区。"""
+        er = meta.get("erase") or [0.0, 0.0, 0.0, 0.0]
+        og = meta.get("origin")
+        if og and len(og) == 2:
+            x0 = float(og[0])
+            base = float(og[1])
+        else:
+            x0 = float(er[0])
+            base = float(er[3]) - max(1.0, (float(er[3]) - float(er[1])) * 0.15)
+        return x0, base, float(er[1]), float(er[3])
+
+
+
+    def _partition_chars_for_glyph(self, family, text):
+        """按字符族把 text 拆成连续段，每段对应一个字体候选。
+
+        Acrobat 语义：原行字符（无 CJK / 无超 ASCII）不应因新增字符被强制
+        替换成字号/度量更大的字体（如 MicrosoftYaHei）而视觉放大。本函数
+        原字体包含字形时保留原字族；仅将缺失的 CJK/扩展字符交给备用
+        字体，避免把宋体或西文统一替换成雅黑。"""
+        if not text:
+            return []
+        result = []
+        cur_buf = ''
+        cur_fam = None
+        font_file = self._system_font_file(family)
+        source_font = self._cached_embed_font({"file": font_file}) if font_file else None
+        for ch in text:
+            if (backend._is_cjk_char(ch) or ord(ch) > 0x7E) and not self._font_covers(source_font, ch):
+                ch_fam = "Microsoft YaHei"
+            else:
+                ch_fam = family or "Arial"
+            if cur_fam is None:
+                cur_fam = ch_fam
+            if ch_fam != cur_fam and cur_buf:
+                result.append((cur_buf, cur_fam))
+                cur_buf = ""
+                cur_fam = ch_fam
+            cur_buf += ch
+        if cur_buf:
+            result.append((cur_buf, cur_fam))
+        return result
+
+    def _row_live_choose_font(self, page, family, size, bold, italic, text,
+                              meta=None):
+        """为指定子段文本选择并注册写回字体。
+
+        本函数接受任意子段（不必是整段 run），并按
+        子段文本的内容评估候选字体，避免把原字符无差别换成大度量的 fallback
+        字体。流程：1) 尝试原行嵌入子集（仅当子段字符全在原字符集合内，避免
+        换字体污染原字符外观）→ 2) 系统同族候选链 → 3) 内置 china-s/helv。
+        """
+        text = text or ""
+        has_cjk = any(backend._is_cjk_char(c) for c in text)
+        # 原文使用 PDF 标准字体时直接沿用，避免同名字体替换后的字面差异。
+        builtin_fonts = {"Helvetica": "helv", "Helvetica-Bold": "hebo",
+                         "Helvetica-Oblique": "heit", "Helvetica-BoldOblique": "hebi",
+                         "Times-Roman": "tiro", "Times-Bold": "tibo",
+                         "Times-Italic": "tiit", "Times-BoldItalic": "tibi",
+                         "Courier": "cour", "Courier-Bold": "cobo",
+                         "Courier-Oblique": "coit", "Courier-BoldOblique": "cobi",
+                         "Heiti": "china-s"}
+        for span in (meta or {}).get("spans", []):
+            name = builtin_fonts.get(span.get("font"))
+            if (name and self._map_pdf_font(span.get("font")) == family
+                    and bool(span.get("bold")) == bold
+                    and bool(span.get("italic")) == italic):
+                font = pymupdf.Font(name)
+                # 字体含有字形不代表 insert_text 的单字节编码能表达它。
+                # Helvetica/Times 的箭头、希腊字母等必须走 Unicode 字体写入。
+                encodable = (all(ord(ch) <= 0xFFFF for ch in text) if name == "china-s"
+                             else all(ord(ch) < 128 for ch in text))
+                if encodable and self._font_covers(font, text):
+                    return {"name": name, "embed": {"name": name, "builtin": True},
+                            "fo": font}
+        embed = None
+        fo = None
+        # 1. 复用原行嵌入子集：仅当子段字符全是原字符（字符级别校验，不破坏原外观）
+        if meta is not None:
+            orig_text = meta.get("text") or ""
+            try:
+                only_orig_chars = all(
+                    c.isspace() or (c in orig_text) for c in text)
+            except Exception:
+                only_orig_chars = False
+            if only_orig_chars:
+                for s in (meta.get("spans") or []):
+                    pf = str(s.get("font") or "")
+                    if not pf:
+                        continue
+                    if ((self._map_pdf_font(pf) or "").lower() !=
+                            (family or "").lower()):
+                        continue
+                    buf, raw, ftype = self._extract_embed_buffer(page, pf)
+                    if not buf:
+                        continue
+                    try:
+                        fo0 = pymupdf.Font(fontbuffer=buf)
+                    except Exception:
+                        fo0 = None
+                    if fo0 is None:
+                        continue
+                    if self._subset_covers(fo0, ftype, text, orig_text):
+                        clean = re.sub(r"^[A-Fa-f0-9]{6}\+", "",
+                                       (raw or "")).strip()
+                        nm = re.sub(r"[^A-Za-z0-9]", "", clean) or "font"
+                        embed = {"name": nm, "buffer": buf}
+                        fo = fo0
+                        break
+        # 2. 候选链：按 sub_text 文本脚本（ASCII/CJK）选字体
+        if embed is None:
+            embed = self._live_candidate_embed(family, text, bold, italic)
+        # 3. 内置兜底
+        if embed is None or not embed.get("name"):
+            if has_cjk or any(
+                    ord(c) > 0x7E for c in text if not c.isspace()):
+                embed = {"name": "china-s", "builtin": True}
+            else:
+                embed = {"name": "helv", "builtin": True}
+        # 取 fo
+        if fo is None:
+            try:
+                if not embed.get("builtin"):
+                    fo = self._cached_embed_font(embed)
+                else:
+                    fo = pymupdf.Font(embed["name"])
+            except Exception:
+                fo = None
+        # 注册到页面（幂等）：避免 redact 清掉资源后引用失效
+        name = embed.get("name") or "font"
+        if not embed.get("builtin"):
+            reg_name = "L" + re.sub(r"[^A-Za-z0-9]", "", name) or "Lfont"
+            try:
+                have = {f[4] or "" for f in page.get_fonts(full=True)}
+                if reg_name not in have:
+                    if embed.get("file"):
+                        page.insert_font(fontname=reg_name,
+                                         fontfile=embed["file"])
+                    elif embed.get("buffer"):
+                        page.insert_font(fontname=reg_name,
+                                         fontbuffer=embed["buffer"])
+                name = reg_name
+            except Exception:
+                # 重名冲突：换序号名
+                try:
+                    meta_seq = meta if isinstance(meta, dict) else {}
+                    meta_seq["fseq"] = int(meta_seq.get("fseq", 0)) + 1
+                    reg_name = f"L{int(meta_seq['fseq'])}"
+                    have = {f[4] or "" for f in page.get_fonts(full=True)}
+                    if reg_name not in have:
+                        if embed.get("file"):
+                            page.insert_font(fontname=reg_name,
+                                             fontfile=embed["file"])
+                        elif embed.get("buffer"):
+                            page.insert_font(fontname=reg_name,
+                                             fontbuffer=embed["buffer"])
+                    name = reg_name
+                except Exception:
+                    # 实在不行回落内置
+                    reg_name = "china-s" if has_cjk else "helv"
+                    embed = {"name": reg_name, "builtin": True}
+                    try:
+                        fo = pymupdf.Font(reg_name)
+                    except Exception:
+                        fo = None
+                    name = reg_name
+        return {"name": name, "embed": embed, "fo": fo}
+
+    def _live_candidate_embed(self, family, text, bold, italic):
+        """候选链按「字形覆盖」挑选能渲染 text 的系统字体文件 embed。
+
+        原字族系统字体若覆盖不全（少见汉字/符号等），按文本脚本遍历通用
+        大字库，返回首个 has_glyph 全中的文件；全都不中返回 None（由调用
+        方落内置 china-s/helv 万国码兜底）。
+        """
+        has_cjk = any(backend._is_cjk_char(c) for c in (text or ""))
+        fams = [family or ""]
+        fams += (["Microsoft YaHei", "SimSun", "SimHei", "DengXian",
+                  "KaiTi", "FangSong"] if has_cjk else
+                 ["Arial", "Times New Roman", "Segoe UI", "Calibri",
+                  "Cambria", "Microsoft YaHei"])
+        seen = set()
+        for fam in fams:
+            fam = (fam or "").strip()
+            if not fam or fam in seen:
+                continue
+            seen.add(fam)
+            p = self._system_font_file(fam, bold=bold, italic=italic)
+            if not p:
+                continue
+            try:
+                fo = self._cached_embed_font({"file": p})
+            except Exception:
+                fo = None
+            if fo is None or not self._font_covers(fo, text):
+                continue
+            clean = re.sub(r"[^A-Za-z0-9]", "", fam) or "cjk"
+            return {"name": "fb" + clean +
+                    self._style_suffix(bold, italic), "file": p}
+        return None
+
+
+    def _row_live_write(self, runs):
+        """把整行当前 runs 写入内存 PDF（Acrobat 式前缀保真）。
+
+        与简单"整行 redact + 重写"不同：这里先求新文本与原行文本的公共
+        前缀，**没有改动的原字符（连同其原嵌入字体渲染）原位保留、绝不
+        重排**，只 redact 第一个改动字符之后到当前写入右端的区域，并从
+        改动点续写。这样原字符不可能因替换字体（Arial/YaHei 的拉丁字形
+        比原 CIDFont 更宽）而"同行整体变大"。
+        """
+        meta = self._row_edit_meta
+        if meta is None:
+            return
+        pno = int(meta.get("page", -1))
+        if pno < 0 or pno >= len(self.doc):
+            return
+        page = self.doc[pno]
+        pv = self.page_view
+        x0, base_y, y_top, y_bot = self._row_live_geom(meta)
+        text = runs_text(runs)
+        _live_diag_dir(meta)
+        _live_diag_log(meta, "> write text=%r" % text)
+        # Qt 框内文字保持透明（防格式编辑把 alpha 改回出现双引擎叠字）
+        edit = getattr(self, "_row_edit", None)
+        if edit is not None:
+            try:
+                edit.set_text_visible(False)
+            except Exception:
+                pass
+        # 首写 undo 快照（会话级一步）：后续每键都改 doc，绝不逐键入栈
+        if not meta.get("undo"):
+            if self.begin_undo_step(document_change=True):
+                meta["undo"] = True
+        # 只有文字和样式都未改、且此前从未被擦除的原字符才能保留。
+        # 已重写的区域不能再次当成原文；否则把 X 改回 A 时会跳过写回。
+        orig_text = str(meta.get("text") or "")
+        char_x = meta.get("char_x")
+        keep = 0
+        if isinstance(char_x, list) and len(char_x) == len(orig_text):
+            limit = min(len(orig_text), len(text),
+                        meta.get("preserved_prefix", len(orig_text)))
+            def styled_chars(items):
+                for run in items:
+                    style = self._row_fingerprint([dict(run, text="_")])
+                    for ch in str(run.get("text") or ""):
+                        yield ch, style
+            original_chars = list(styled_chars(meta.get("init_runs") or []))
+            current_chars = list(styled_chars(runs))
+            limit = min(limit, len(original_chars), len(current_chars))
+            while keep < limit and original_chars[keep] == current_chars[keep]:
+                keep += 1
+        else:
+            char_x = None
+        meta["preserved_prefix"] = keep
+        # 写入起点：
+        #  - keep 已到原行尾（追加/行尾修改）→ 原行尾右缘续写；
+        #  - keep 停在行中（中间插入/替换/删除）→ 被改首字符原左缘续写；
+        #  - char_x 不可用（退路）→ 行首 x0（整行重排旧行为）。
+        er = meta.get("erase") or [0, 0, 0, 0]
+        if char_x and orig_text:
+            if keep >= len(orig_text):
+                write_x0 = float(char_x[-1][1])
+                orig_right = write_x0
+            else:
+                write_x0 = float(char_x[keep][0])
+                orig_right = float(char_x[-1][1])
+        else:
+            write_x0 = x0
+            orig_right = max(float(er[2]), x0)
+        ls = meta.get("last_span")
+        prev_right = (float(ls[2]) if (meta.get("written") and ls)
+                      else orig_right)
+        red_x1 = max(orig_right, prev_right, write_x0 + 1.0)
+        tail = text[keep:]
+        live_ranges = list((char_x or [])[:keep])
+        _live_diag_log(meta, "  keep=%d write_x0=%.1f red_x1=%.1f base_y=%.1f y_top=%.1f y_bot=%.1f char_x_ok=%s"
+                       % (keep, write_x0, red_x1, base_y, y_top, y_bot,
+                          isinstance(char_x, list)))
+        # —— 擦除 [write_x0, red_x1]（前缀 keep 个原字符不在区内，不被擦）——
+        fr_line = pymupdf.Rect(x0, y_top - 2.0, max(red_x1 + 2.0, x0 + 2.0),
+                               y_bot + 2.0)
+        backend.redact_line_safe(
+            page, fr_line,
+            erase_rect=pymupdf.Rect(write_x0 - 0.2, y_top,
+                                    red_x1 + 0.2, y_bot))
+        if tail.strip():
+            # —— 从改动点续写 tail（混排时各段字体/字号/颜色/粗斜独立）——
+            # 先按字符族拆分子段（ASCII / CJK 各选最优字体），避免原行
+            # ASCII 被 CJK fallback 大字库整行替换造成视觉放大。
+            x = write_x0
+            for r in self._slice_runs(runs, keep):
+                seg = str(r.get("text") or "")
+                if not seg:
+                    continue
+                size = max(1.0, float(r.get("size") or 10.0))
+                cc = r.get("color")
+                if isinstance(cc, QColor):
+                    rgb = (cc.redF(), cc.greenF(), cc.blueF())
+                else:
+                    rgb = (0.0, 0.0, 0.0)
+                bold = bool(r.get("bold"))
+                italic = bool(r.get("italic"))
+                family_hint = (self._map_pdf_font(r.get("family") or "")
+                              or "Arial")
+                sub_segments = self._partition_chars_for_glyph(
+                    family_hint, seg)
+                if not sub_segments:
+                    sub_segments = [(seg, family_hint)]
+                for sub_text, sub_fam in sub_segments:
+                    ent = self._row_live_choose_font(
+                        page, sub_fam, size, bold, italic, sub_text, meta)
+                    _live_diag_log(
+                        meta, "    seg=%r fam=%r -> name=%r builtin=%s"
+                        % (sub_text, sub_fam,
+                           (ent or {}).get("name"),
+                           bool((ent or {}).get("embed", {}).get("builtin"))))
+                    # 采用原字体或同族完整字体；缺字时才使用兜底字体。
+                    use_name = ent["name"]
+                    use_fo = ent["fo"]
+                    builtin = bool(ent["embed"].get("builtin"))
+                    _live_diag_log(
+                        meta, "    -> use_font=%r"
+                        % use_name)
+                    # 使用写入 PDF 的同一字体度量，逐字记录光标和命中位置。
+                    next_x = x
+                    for ch in sub_text:
+                        # Font.text_length 对内置 CJK 字体的 ASCII 返回半宽，
+                        # insert_text 却按全宽写入；get_text_length 与写入一致。
+                        advance = (pymupdf.get_text_length(ch, fontname=use_name, fontsize=size)
+                                   if builtin else use_fo.text_length(ch, size))
+                        live_ranges.append((next_x, next_x + advance))
+                        next_x += advance
+                    if not sub_text.strip():
+                        x = next_x
+                        continue
+                    try:
+                        if not builtin:
+                            # TextWriter 直接使用已验证的完整字体对象，避免沿用
+                            # 页面中旧的 CID 资源映射而写出方块。
+                            writer = pymupdf.TextWriter(page.rect)
+                            writer.append((x, base_y), sub_text, font=use_fo, fontsize=size)
+                            morph = None
+                            if italic and not use_fo.is_italic:
+                                morph = (pymupdf.Point(x, base_y),
+                                         pymupdf.Matrix(1, 0, 0.2493, 1, 0, 0))
+                            writer.write_text(page, color=rgb, morph=morph)
+                        elif italic and any(
+                                backend._is_cjk_char(c) for c in sub_text):
+                            pivot = pymupdf.Point(x, base_y)
+                            skew = pymupdf.Matrix(1, 0, 0.2493, 1, 0, 0)
+                            page.insert_text((x, base_y), sub_text,
+                                             fontname=use_name,
+                                             fontsize=size, color=rgb,
+                                             morph=(pivot, skew))
+                        else:
+                            page.insert_text((x, base_y), sub_text,
+                                             fontname=use_name,
+                                             fontsize=size, color=rgb)
+                    except Exception as _e:
+                        import traceback as _tb
+                        _live_diag_log(meta,
+                                       "    !! insert_text EXC %r: %s"
+                                       % (_e, _tb.format_exc().replace("\n",
+                                                                        " | ")))
+                    x = next_x
+            x_end = x
+        else:
+            x_end = write_x0
+            for ch in tail:
+                advance = pymupdf.Font("helv").text_length(ch, 10.0)
+                live_ranges.append((x_end, x_end + advance))
+                x_end += advance
+        meta["written"] = True
+        meta["live"] = True
+        # 行高带：保留原字形 y 带并外扩容纳上行/下行
+        max_size = max((float(r.get("size") or 10.0) for r in runs),
+                       default=10.0)
+        top = min(y_top, base_y - max(y_bot - y_top, max_size * 1.5))
+        bot = max(y_bot, base_y + max((y_bot - y_top) * 0.4, max_size * 0.5))
+        if ls:
+            # 缩小字号时也重绘上一次大字占用的区域，避免留下旧字像素。
+            top = min(top, float(ls[1]))
+            bot = max(bot, float(ls[3]))
+        span = [write_x0 - 0.5, top,
+                max(x_end, red_x1) + 0.5, bot]
+        meta["last_span"] = span
+        if isinstance(edit, PdfRowEditBox):
+            # 保持控件与画布坐标一致；向右输入后扩展命中区，避免 Qt 内部
+            # 滚动或旧框宽把后半行的鼠标事件送到页面上。
+            zoom = pv._zoom
+            origin_x = min(x0, float(meta["rect"].left()))
+            bx = int(origin_x * zoom)
+            by = int(pv._offsets[pno] + top * zoom)
+            right = max(x_end, float(meta["rect"].right())) * zoom
+            page_right = backend.page_size(self.doc, pno)[0] * zoom
+            edit.setGeometry(bx, by, max(2, int(min(page_right, right + 4) - bx)),
+                             max(2, int((bot - top) * zoom) + 2))
+            edit.set_pdf_layout(text,
+                                [(a * zoom - bx, b * zoom - bx) for a, b in live_ranges],
+                                (y_top - top) * zoom, (y_bot - top) * zoom,
+                                write_x0 * zoom - bx)
+        self.modified = True
+        _live_diag_snap(self.doc, meta, "write")
+        # 仅重渲染改动区域（前缀原字符不变无需重绘）
+        if pv is not None:
+            r = QRectF(max(0.0, write_x0 - 1.0), top,
+                       max(x_end, red_x1) - write_x0 + 2.0,
+                       bot - top)
+            pv.set_inline_rect(pno, r)     # 该行持续摘除蓝框
+            pv.rerender_page_region(pno, r, pad=2.0)
+        return text
+
+    @staticmethod
+    def _slice_runs(runs, skip):
+        """跳过整行 runs 的前 skip 个字符，返回剩余 run 列表（用于只重排
+        keep 之后的部分；分界只可能出现在一个 run 内）。"""
+        out = []
+        n = skip
+        for r in runs:
+            seg = str(r.get("text") or "")
+            if n <= 0:
+                out.append(r)
+                continue
+            if n >= len(seg):
+                n -= len(seg)
+                continue
+            r2 = dict(r)
+            r2["text"] = seg[n:]
+            out.append(r2)
+            n = 0
+        return out
 
     def _commit_row_edit(self, commit=True):
-        """关闭就地行编辑框。commit=True 时把改动写回 PDF。
+        """关闭就地行编辑。
 
-        提交前把框内富文本合并成样式段：
-        - 单段统一格式 → 走原单样式写回路径（未改样式时用点击行原字体
-          embed 精确写回；用户整段改过样式则按新样式重建系统变体字体）；
-        - 多段（用户做了字符级混排）→ 生成带 runs 的浮层对象，保存时
-          逐段写回。
+        Acrobat 式：编辑过程中文本已实时写入内存 PDF。commit=True 时
+        该行即最终结果（无需再生成浮层对象/Qt 重排），undo 栈保留会话
+        级快照供 Ctrl+Z 整行撤销；commit=False（Esc/取消）时若文档已被
+        本会话改写，用会话级快照整体还原。
 
         返回是否曾处于行编辑状态（用于点击空白的提示决策）。
         """
@@ -2371,106 +3011,35 @@ class DocumentView(QWidget):
         if edit is None:
             return False
         meta = self._row_edit_meta or {}
-        page = int(meta.get("page", 0))
-        rect = meta.get("rect")
-        new_runs = merge_runs(edit.to_runs())
-        new_text = runs_text(new_runs)
+        live = bool(meta.get("live"))
+        was_live = live
+        if not commit and live:
+            # 取消：文档已被会话改写 → 用会话前快照还原（undo 弹栈恢复）
+            self.undo()
+            return True
+        # 提交或未改动：结束编辑框（清理 excl/缓存）
+        if not live:
+            pno = int(meta.get("page", -1))
+            if pno >= 0 and self.page_view is not None:
+                # 无任何改动：还原该行蓝框（可再次点击编辑）
+                pass
         self._close_inline_editor()
-        if not commit or rect is None:
-            return True
-        old_text = meta.get("text", "")
-        init_runs = meta.get("init_runs") or []
-        # 内容与整行样式都没动 → 不产生撤销记录
-        if new_text == old_text and not self._runs_style_diff(
-                new_runs, init_runs):
-            return True
-        er = meta.get("erase")
-        erase_rect = (QRectF(er[0], er[1], er[2] - er[0], er[3] - er[1])
-                      if er and len(er) == 4 else None)
+        _live_diag_snap(self.doc, meta, "commit")
+        if commit and was_live:
+            # 行内容已直接写在 doc 中：失效该页文字缓存，确保再次点击
+            # 该行/文字选择基于新文本重新解析
+            pno = int(meta.get("page", -1))
+            if self.page_view is not None:
+                self.page_view.invalidate_text_cache(pno if pno >= 0 else None)
+            if self.doc is not None:
+                self.modified = True
+        return was_live or edit is not None
 
-        # ---- 多段混排：富文本对象 ----
-        if len(new_runs) > 1:
-            self._commit_edited_line(
-                page, rect, new_text, "", 10.0, QColor(0, 0, 0),
-                False, False, runs=new_runs, erase=erase_rect)
-            return True
-
-        # ---- 单段：恢复整行样式参数 ----
-        try:
-            r0 = new_runs[0]
-            family = (r0.get("family") or
-                      self._map_pdf_font((meta.get("fmt") or {}).get("font", "")) or
-                      "Microsoft YaHei")
-            size = round(float(r0.get("size") or 10.0), 1)
-            color = r0.get("color")
-            if not isinstance(color, QColor):
-                color = QColor(0, 0, 0)
-            bold = bool(r0.get("bold"))
-            italic = bool(r0.get("italic"))
-        except Exception:
-            family, size, color, bold, italic = "Microsoft YaHei", 10.0, \
-                QColor(0, 0, 0), False, False
-
-        embed = None
-        baseline = None
-        fmt = meta.get("fmt") or {}
-        style_changed = self._runs_style_diff(new_runs, init_runs)
-        if fmt and not style_changed:
-            # 样式未变（只改文字）：沿用点击行的原字体与基线精确写回
-            try:
-                pdf_font = str(fmt.get("font") or "")
-                size = round(float(fmt.get("size") or 10.0), 1)
-                cc = fmt.get("color") or (0, 0, 0)
-                color = QColor(int(cc[0]), int(cc[1]), int(cc[2]))
-                bold = bool(fmt.get("bold", False))
-                italic = bool(fmt.get("italic", False))
-                sb = meta.get("span_bbox") or [
-                    rect.x(), rect.y(), rect.right(), rect.bottom()]
-                embed, baseline = self._prepare_row_embed(
-                    self.doc[page], pdf_font, size, sb,
-                    bold=bold, italic=italic, text=new_text,
-                    orig_text=old_text)
-            except Exception:
-                embed = None
-                baseline = None
-        elif style_changed:
-            # 用户整段改了样式（字体/粗斜/字号…）：重建写回 embed。
-            # 字族未换时优先复用原行嵌入字体（子集小、写盘快）：中文斜体
-            # 由保存时 morph 合成，正体字形即可承载；原资源缺字形/缺对应
-            # 粗斜档时 _prepare_row_embed 自动回退系统变体。换了字族或
-            # 系统兜底失败 → _embed_for_style 按新样式选系统字体。
-            old_pdf_font = str((meta.get("fmt") or {}).get("font") or "")
-            same_fam = bool(old_pdf_font) and (
-                (family or "").lower() == (self._map_pdf_font(old_pdf_font)
-                                           or "").lower())
-            if same_fam:
-                try:
-                    sb = meta.get("span_bbox") or [
-                        rect.x(), rect.y(), rect.right(), rect.bottom()]
-                    embed, baseline = self._prepare_row_embed(
-                        self.doc[page], old_pdf_font, size, sb,
-                        bold=bold, italic=italic, text=new_text,
-                        orig_text=old_text)
-                except Exception:
-                    embed = None
-                    baseline = None
-            if embed is None:
-                embed = self._embed_for_style(family, size, bold, italic)
-        self._commit_edited_line(page, rect, new_text, family, size,
-                                 color, bold, italic, embed=embed,
-                                 baseline=baseline, erase=erase_rect)
-        return True
-
-    @staticmethod
-    def _runs_style_diff(runs_a, runs_b):
-        """runs 列表整体样式是否不同（忽略文本本身，仅比样式序列）。
-
-        用于判断用户是否在就地编辑中改动过格式。
-        """
-        from rich_text import _style_key
-        ka = [_style_key(r) for r in (runs_a or [])]
-        kb = [_style_key(r) for r in (runs_b or [])]
-        return ka != kb
+    def _finish_row_edit(self):
+        """回车提交就地行编辑，并把键盘焦点还给画布。"""
+        self._commit_row_edit(commit=True)
+        if self.page_view is not None:
+            self.page_view.setFocus()
 
     def _begin_inplace_text(self, page, pt):
         """「文本」工具点击处就地输入新文字（无弹窗工具条）。
@@ -2485,7 +3054,9 @@ class DocumentView(QWidget):
         self._close_inline_editor()
 
         fmt = self._detect_format_at(page, pt)
-        family = self._map_pdf_font(fmt.get("family", "")) or "Microsoft YaHei"
+        family = _qt_safe_family(
+            self._map_pdf_font(fmt.get("family", ""))) or _qt_safe_family(
+                "Microsoft YaHei")
         size = float(fmt.get("size") or 10.0)
         color = fmt.get("color")
         if color is None or not isinstance(color, QColor):
@@ -2524,6 +3095,15 @@ class DocumentView(QWidget):
             "family": family, "size": size, "color": color,
             "bold": bold, "italic": italic,
         })
+        # 控件本身也用兜底后的 QFont：保证光标/系统弹出与空文档默认
+        # 字符样式都用一个真实可绘制的字体，避免 Qt 在未定义字族上输出豆腐。
+        base_qfont = QFont(family)
+        base_qfont.setPointSizeF(max(1.0, float(size)))
+        if bold:
+            base_qfont.setBold(True)
+        if italic:
+            base_qfont.setItalic(True)
+        edit.setFont(base_qfont)
         edit.setStyleSheet(style)
         edit.setGeometry(int(wx), int(wy), int(box_w), int(box_h))
         edit.raise_()
@@ -2588,6 +3168,12 @@ class DocumentView(QWidget):
             self._obj_edit.deleteLater()
         self._obj_edit = None
         self._obj_edit_oid = None
+        # 就地编辑结束 → 该行恢复整页框模式下的蓝框（仍可再次点击编辑）
+        pv = getattr(self, "page_view", None)
+        if pv is not None:
+            pv.set_inline_rect(-1, None)
+        # 编辑期间挂起的窗口适宽在此补做（此刻编辑器已全部关闭）
+        self._flush_fit_after_edit()
 
     def _detect_format_at(self, page, pt):
         """检测点击位置文字格式（字体/字号/颜色/粗细）。
@@ -2645,25 +3231,47 @@ class DocumentView(QWidget):
             pass
         return fmt
 
+    def _row_font_family(self, pno, pdf_font):
+        """CIDFont+F3 等资源别名不是真实字族，从嵌入字体名称表解析。"""
+        family = self._map_pdf_font(pdf_font)
+        if family:
+            return family
+        buf, _, _ = self._extract_embed_buffer(self.doc[pno], pdf_font)
+        if buf:
+            try:
+                return self._map_pdf_font(pymupdf.Font(fontbuffer=buf).name)
+            except Exception:
+                pass
+        return ""
+
     @staticmethod
     def _map_pdf_font(pdf_font):
         """PDF 内部字体名 → 系统字体名（找不到则返回空串）。
 
         中文字体优先按「衬线/宋体系」与「无衬线/黑体系」归类到系统自带
-        的等价字体，保证就地编辑写回与原文保持同一字族观感；识别不了时
-        才返回空串由调用方兜底（雅黑）。英文全名中可能带子集前缀
-        （如 ABCDEF+SimSun），统一用小写包含匹配。
+        的等价字体；系统本就有的字体（DengXian/SimSun/SimHei/微软雅黑
+        等）严格透传不归类，否则会被错误映射到观感完全不同的字体（最
+        严重的例子：DengXian → 雅黑会让合同正文普遍视觉"放大"）。
+        PyMuPDF 对嵌入子集字体名字段已经去掉子集前缀（如
+        `BCDGEE+DengXian` 直接显示为 `DengXian`），无需再处理。
         """
         low = (pdf_font or "").lower()
         if not low:
             return ""
-        # ---- 西文等宽 / 无衬线 / 衬线 ----
+        if "calibri" in low:
+            return "Calibri"
+        if "cambria" in low:
+            return "Cambria"
+        # ---- 西文等宽 ----
         if any(k in low for k in ("courier", "consolas", "mono", "等宽")):
             return "Courier New"
-        if any(k in low for k in ("arial", "helvetica", "helv", "liberationsans")):
+        # ---- 西文无衬线（含 Nimbus Sans/Arial/Helvetica）----
+        if any(k in low for k in ("helvetica", "helv", "arial",
+                                  "arialmt", "nimbus sans", "liberationsans")):
             return "Arial"
+        # ---- 西文衬线 ----
         if any(k in low for k in ("times", "roman", "georgia", "garamond",
-                                  "liberationserif")):
+                                  "liberationserif", "nimbus roman")):
             return "Times New Roman"
         # ---- 楷体 / 仿宋（先于泛化宋体判断，避免被归成宋体）----
         if any(k in low for k in ("kaiti", "kai", "楷", "kaishu")):
@@ -2671,27 +3279,49 @@ class DocumentView(QWidget):
         # ---- 仿宋（注意：不能用裸 "fang"，否则误命中苹方 PingFang）----
         if any(k in low for k in ("fangsong", "仿宋", "stfangsong", "fzfs")):
             return "FangSong"
+        # ---- 系统中文字体严格透传（不能与雅黑段混）----
+        # DengXian(等线) 是合同等正文中常用细体无衬线，系统自带；
+        # 错映射到雅黑会让字形粗一截、字面宽一截，视觉"放大"主因。
+        if "dengxian" in low or "等线" in low:
+            return "DengXian"
+        # ---- 传统粗黑体（SimHei/方正黑体等）----
+        if any(k in low for k in ("simhei", "fzhei", "fzht", "方正黑", "黑体")):
+            return "SimHei"
         # ---- 宋体 / 明体等衬线中文字体 → SimSun ----
         if any(k in low for k in (
-                "simsun", "songti", "song", "stsong", "songsc", "nssong",
-                "uming", "ming", "sun", "batsong", "thsong", "书宋", "报宋",
-                "宋", "fzsong", "fzss", "fzxbs", "dhyuan",
+                "simsun", "nssim", "simsun-extb",
+                "songti", "stsong", "songsc", "nssong",
+                "uming", "ming", "batsong", "thsong", "书宋", "报宋",
+                "fzsong", "fzss", "fzxbs", "dhyuan",
                 "notoserif", "noto serif", "sourcehanserif", "source han serif",
                 "思源宋", "serifcjk", "serif cjk", "serifsc", "stzhongsong",
                 "华文中宋")):
             return "SimSun"
-        # ---- 现代无衬线中文字体 → 微软雅黑（思源黑体/苹方/Noto/Droid/
-        # 华文黑体/文泉驿等系统缺失，雅黑观感最接近，避免回退成粗重的 SimHei）
+        # ---- 现代无衬线中文字体 → 微软雅黑（思源黑/苹方/Noto/Droid Sans
+        # Fallback/文泉驿等系统缺失，雅黑观感最接近；不要在此段放进
+        # dengxian/heiti/宋体类，会被误命中）----
         if any(k in low for k in (
-                "yahei", "msyh", "雅黑", "微软", "dengxian", "droid sans",
-                "noto sans", "notosans", "sourcehansans", "思源黑",
-                "pingfang", "stheiti", "heiti", "jhenghei", "jheng",
+                "yahei", "msyh", "雅黑", "微软",
+                "droid sans fallback", "sourcehansans", "思源黑",
+                "pingfang", "stheiti", "jhenghei", "jheng",
                 "wqy", "wenquanyi", "sans cjk", "sanssc", "hansans",
                 "malgun", "segoe ui", "兰亭黑", "方正兰亭", "华为", "harmonyos")):
             return "Microsoft YaHei"
-        # ---- 传统粗黑体（SimHei/方正黑体等）----
-        if any(k in low for k in ("simhei", "fzhei", "fzht", "方正黑", "黑体")):
+        # ---- MuPDF 对未嵌入中文字体的 fallback 归一化（合同 PDF 验证：
+        # 'Heiti' 在 MuPDF 实际渲染为无衬线 Droid Sans Fallback）----
+        if "heiti" in low:
+            return "Microsoft YaHei"
+        # ---- PyMuPDF 内置 CJK 字体名（极罕见 BaseFont 透出场景；PyMuPDF
+        # 文本提取层通常已归一化为 Heiti，仅当透出时命中）----
+        if any(k in low for k in ("china-ss", "chinass", "中黑", "hei-gbk")):
             return "SimHei"
+        if any(k in low for k in ("china-s", "chinas", "stsong-lite")):
+            return "SimSun"
+        if any(k in low for k in ("china-ts", "chinats", "china-ks",
+                                  "chinaks", "kaiti-sc")):
+            return "KaiTi"
+        if any(k in low for k in ("china-fs", "chinafs")):
+            return "FangSong"
         return ""
 
     # 常见字体 → Windows 系统全量字体文件（按常规/粗/斜/粗斜四档）。
@@ -2731,6 +3361,18 @@ class DocumentView(QWidget):
                             "B": r"C:\Windows\Fonts\timesbd.ttf",
                             "I": r"C:\Windows\Fonts\timesi.ttf",
                             "BI": r"C:\Windows\Fonts\timesbi.ttf"},
+        "Segoe UI": {"": r"C:\Windows\Fonts\segoeui.ttf",
+                     "B": r"C:\Windows\Fonts\segoeuib.ttf",
+                     "I": r"C:\Windows\Fonts\segoeuii.ttf",
+                     "BI": r"C:\Windows\Fonts\segoeuiz.ttf"},
+        "Calibri": {"": r"C:\Windows\Fonts\calibri.ttf",
+                    "B": r"C:\Windows\Fonts\calibrib.ttf",
+                    "I": r"C:\Windows\Fonts\calibrii.ttf",
+                    "BI": r"C:\Windows\Fonts\calibriz.ttf"},
+        "Cambria": {"": r"C:\Windows\Fonts\cambria.ttc",
+                    "B": r"C:\Windows\Fonts\cambriab.ttf",
+                    "I": r"C:\Windows\Fonts\cambriai.ttf",
+                    "BI": r"C:\Windows\Fonts\cambriaz.ttf"},
         "Courier New": {"": r"C:\Windows\Fonts\cour.ttf",
                         "B": r"C:\Windows\Fonts\courbd.ttf",
                         "I": r"C:\Windows\Fonts\couri.ttf",
@@ -2825,87 +3467,6 @@ class DocumentView(QWidget):
             obj.pop("baseline", None)
         return True
 
-    def _prepare_row_embed(self, page, span_font, span_size, span_bbox,
-                           bold=False, italic=False, text="",
-                           orig_text=""):
-        """为写回行准备字体嵌入载荷与基线，保证保存后观感贴近原文。
-
-        嵌入字体来源按「小且贴原文」优先：
-        1) 原行在 PDF 里已有的嵌入字体（通常为子集，几 KB~几十 KB，
-           insert_font/写盘都快；观感与原行一致）。前提：能解析成 Font、
-           字形覆盖要写回的文本、粗斜档可承载（西文斜体需资源本身为斜体
-           变体；中文斜体由保存时 morph 错切合成，正体字形即可；粗体需
-           资源含粗字形）。
-        2) 上述任一不满足才退回「系统同族全量字体文件」（雅黑 ttc 约
-           20MB，嵌入一次 100ms+ 且使输出文件膨胀——仅字形兜底用）。
-
-        orig_text 为被替换行的原文本：CID(Type0) 子集字体的字形覆盖无法
-        用 has_glyph 判断（恒 False），但子集必含原行全部字符——新文本
-        字符全部在原行中出现即可放心复用子集。
-
-        返回 (embed_dict | None, baseline_y)。embed 形如
-        {"name": 注册名, "file": 系统路径} 或 {"name": 注册名, "buffer": 字节}。
-        """
-        try:
-            import pymupdf as _pym
-            size = float(span_size or 10.0)
-            fam = self._map_pdf_font(span_font)
-            # ---- 1) 原嵌入字体 buffer 优先 ----
-            buf, raw_name, ftype = self._extract_embed_buffer(page, span_font)
-            fo = None
-            if buf:
-                try:
-                    fo = _pym.Font(fontbuffer=buf)
-                except Exception:
-                    fo = None
-            if fo is not None:
-                cleaned = re.sub(r"^[A-Fa-f0-9]{6}\+", "",
-                                 (raw_name or "")).strip()
-                low = re.sub(r"[\s-]", "", cleaned).lower()
-                if (self._embed_style_ok(low, bold, italic, text)
-                        and self._subset_covers(fo, ftype, text, orig_text)):
-                    # 注册名必须为纯字母数字（"Microsoft Ya Hei Regular"
-                    # 这类带空格/连字符的名字会让 insert_font 抛异常）
-                    name = (re.sub(r"[^A-Za-z0-9]", "", cleaned)
-                            or re.sub(r"[^A-Za-z0-9]", "",
-                                      fam or "") or "font")
-                    asc = self._font_ascender(fo, size)
-                    baseline = float((span_bbox or (0, 0, 0, 0))[1]) + asc
-                    return {"name": name, "buffer": buf}, baseline
-            # ---- 2) 回退系统同族字体（含粗斜变体文件选择）----
-            fpath = self._system_font_file(fam, bold=bold, italic=italic)
-            if not fpath:
-                return None, float((span_bbox or (0, 0, 0, 0))[3]) \
-                    - max(4.0, size * 0.15)
-            suffix = self._style_suffix(bold, italic)
-            if suffix:
-                # 变体字体用独立注册名，避免与同族常规字体资源撞名
-                clean = re.sub(r"[^A-Za-z0-9]", "", fam or "") or "font"
-                name = clean + suffix
-            else:
-                # 常规档同样清理：微软雅黑 → MicrosoftYaHei（原始名带空格，
-                # 直接作 fontname 注册会抛异常导致保存静默回退 htmlbox）
-                name = re.sub(r"[^A-Za-z0-9]", "", fam or "") or "font"
-            fo = self._cached_embed_font({"file": fpath})
-            asc = self._font_ascender(fo, size) if fo is not None else (
-                0.86 * size)
-            baseline = float((span_bbox or (0, 0, 0, 0))[1]) + asc
-            return {"name": name, "file": fpath}, baseline
-        except Exception:
-            bb = span_bbox or (0, 0, 0, 0)
-            size = float(span_size or 10.0)
-            return None, float(bb[3]) - size * 0.15
-
-    @staticmethod
-    def _font_ascender(fo, size):
-        """字体上行高度像素值（异常时回落默认 0.86em）。"""
-        try:
-            a = float(getattr(fo, "ascender", 0.86))
-            if 0.2 < a < 1.6:
-                return a * size
-        except Exception:
-            pass
-        return 0.86 * size
 
     def _extract_embed_buffer(self, page, span_font):
         """按字体名从页面资源中抽取原嵌入字体的 buffer。
@@ -2963,32 +3524,6 @@ class DocumentView(QWidget):
         except Exception:
             return False
 
-    @staticmethod
-    def _embed_style_ok(low_name, bold, italic, text=""):
-        """判定原嵌入字体能否承载目标粗斜样式（避免静默丢样式）。
-
-        - bold=True：字体名需带粗体标识（原资源确为粗体字形）；
-        - italic=True：西文斜体需真斜体字形（字体名带 italic/oblique）；
-          中文斜体由保存时 morph 错切合成，正体字形即可承载；
-        - 字体名不可判时，任何粗斜需求一律拒绝（回退系统变体，保正确）。
-        """
-        if not (bold or italic):
-            return True
-        has_bold = any(k in low_name for k in
-                       ("bold", "black", "-bd", "bd", "heavy",
-                        "extrabold", "semibold"))
-        has_italic = any(k in low_name for k in
-                         ("italic", "oblique", "ita", "curs"))
-        if bold and not has_bold:
-            return False
-        if italic and not has_italic:
-            try:
-                if any(backend._is_cjk_char(c) for c in (text or "")):
-                    return not bold or has_bold
-            except Exception:
-                pass
-            return False
-        return True
 
     def _update_text_object(self, oid, runs):
         """编辑条确定：用富文本 runs 更新既有文本对象。
@@ -3043,85 +3578,6 @@ class DocumentView(QWidget):
         self._refresh_objects()
         self.page_view.select(oid)
 
-    def _commit_edited_line(self, page, rect, text, fontfamily, fontsize, color,
-                            bold, italic, embed=None, baseline=None,
-                            erase=None, runs=None):
-        """就地编辑结果写回 PDF：擦除原行文字，在相同位置叠加新文字浮层。
-
-        embed/baseline 由 _prepare_row_embed 提供，用于保存时以原字体、
-        原基线高度写回，保证最终 PDF 观感贴近原文；为空则走 htmlbox。
-
-        runs 非空（多段混排）时忽略 embed/baseline，对象带 runs 按段写回；
-        顶层样式字段取首段值，便于既有单样式渲染/编辑逻辑使用。
-
-        erase 为字符级擦除矩形（不含字体上下行）。红act 删除与矩形
-        相交的整段文本，PyMuPDF 行 bbox 含字体 ascent/descent，行距
-        紧凑的文档中相邻行 bbox 互相交叠，直接用行 bbox 会误删相邻
-        整行文字——必须用仅覆盖真实字形的 erase 矩形。
-        """
-        if runs:
-            runs = merge_runs(runs)
-            text = runs_text(runs)
-            if runs:
-                r0 = runs[0]
-                fontfamily = r0.get("family") or fontfamily
-                fontsize = r0.get("size") or fontsize
-                color = r0.get("color") if isinstance(
-                    r0.get("color"), QColor) else color
-                bold = bool(r0.get("bold"))
-                italic = bool(r0.get("italic"))
-        if erase is not None and not erase.isEmpty():
-            fr = pymupdf.Rect(erase.x(), erase.y(),
-                              erase.right(), erase.bottom())
-        else:
-            fr = None
-        fr_line = pymupdf.Rect(rect.x(), rect.y(),
-                               rect.right(), rect.bottom())
-        self.begin_undo_step(document_change=True)
-        # 安全擦除：红act 矩形 y 向按邻行边界钳制，删除本行而不吞相邻行。
-        backend.redact_line_safe(self.doc[int(page)], fr_line,
-                                 erase_rect=fr or fr_line)
-        self.modified = True
-        if not text.strip():
-            self._refresh()
-            self.statusMessage.emit(
-                i18n.tr("replace_deleted").format(p=int(page) + 1), 3000)
-            return
-        self._obj_counter += 1
-        # 新文字可能比原文更长：把对象矩形放宽到能容纳整行内容，
-        # 否则保存（按矩形排版）时会把长句折成两行。按字符数估算宽度，
-        # 东亚字约 1.0em、西文约 0.55em，与 Qt/PDF 设备无关，稳定可靠。
-        if runs and len(runs) > 1:
-            est_w = self._est_runs_width(runs)
-        else:
-            size_pt = max(4.0, float(fontsize or 10.0))
-            est_w = sum(
-                size_pt if ord(ch) > 0x2E80 else size_pt * 0.55
-                for ch in text) * 1.06 + 6.0
-        obj_w = max(rect.width(), est_w)
-        size_pt = max(4.0, float(fontsize or 10.0))
-        obj_h = max(rect.height(), size_pt * 1.3 + 2.0)
-        obj = {
-            "id": self._obj_counter, "page": int(page),
-            "rect": QRectF(rect.x(), rect.y(),
-                           max(obj_w, 40.0), max(obj_h, 20.0)),
-            "text": text,
-            "color": color if color is not None else QColor(0, 0, 0),
-            "fontsize": fontsize, "fontfamily": fontfamily,
-            "bold": bold, "italic": italic, "kind": "text",
-        }
-        if runs and len(runs) > 1:
-            obj["runs"] = runs
-            obj.pop("embed", None)
-            obj.pop("baseline", None)
-        else:
-            obj["embed"] = embed
-            obj["baseline"] = baseline
-        self.objects.append(obj)
-        self._refresh()
-        self.page_view.select(self._obj_counter)
-        self.statusMessage.emit(
-            i18n.tr("replace_done").format(p=int(page) + 1), 3000)
 
     @staticmethod
     def _est_runs_width(runs):
@@ -3207,7 +3663,7 @@ class DocumentView(QWidget):
     def _measure_text_rect(text, fontfamily, fontsize, bold, italic=False):
         """根据文字内容测量单行框大小（返回 PDF 坐标 QRectF）。"""
         from PySide6.QtGui import QFont, QFontMetrics
-        f = QFont(fontfamily if fontfamily else "Microsoft YaHei UI")
+        f = QFont(_qt_safe_family(fontfamily or "Microsoft YaHei UI"))
         f.setPixelSize(max(10, int(fontsize)))
         f.setBold(bold)
         f.setItalic(italic)
@@ -3339,7 +3795,11 @@ class DocumentView(QWidget):
         size = float(r0.get("size") or 10.0)
         color = (r0.get("color") if isinstance(r0.get("color"), QColor)
                  else QColor(self.edit_color))
-        family = r0.get("family") or "Microsoft YaHei"
+        # 与 _begin_inplace_text/页面绘制一致：对象 runs 的字族可能来自
+        # PDF 嵌入子集名（"Nimbus Sans Regular" 等），必须安全化为系统已
+        # 安装族名，否则编辑框 QFont 解析空族名 → 输入/选中字符全方块。
+        family = _qt_safe_family(
+            r0.get("family") or "Microsoft YaHei")
         lum = (0.299 * color.red() + 0.587 * color.green() +
                0.114 * color.blue())
         text_color = color.name() if lum > 225 else (
@@ -3816,17 +4276,13 @@ class DocumentView(QWidget):
     def _render_print_page(self, page_no, zoom, rot=0, want_gray=False, doc=None):
         """渲染单个 PDF 页为 QImage（打印用）。
 
-        边长上限 2000px：避免超大位图在部分打印机驱动
-        （如 EPSON GDI）下破坏打印流导致空白页。
+        保留请求的分辨率；驱动的位图尺寸限制由输出时分块处理。
         返回 RGB32 格式 QImage（驱动兼容性最好）。
         doc：外部 pymupdf Document（多文档拼版用）；默认当前 self.doc。
         """
         use_doc = doc if doc is not None else self.doc
         page = use_doc[page_no]
-        pr_w = max(page.rect.width, page.rect.height)
-        if pr_w * zoom > 2000:
-            zoom *= 2000 / (pr_w * zoom)
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom),
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csRGB,
                               alpha=False)
         img = QImage(pix.samples, pix.width, pix.height, pix.stride,
                      QImage.Format.Format_RGB888).copy()
@@ -3838,6 +4294,27 @@ class DocumentView(QWidget):
             img = img.convertToFormat(QImage.Format.Format_RGB32)
         return img
 
+    @staticmethod
+    def _print_target_size(page_rect, cell, resolution, scale_mode,
+                           custom_scale=1.0, rotation=0):
+        from print_dialog import print_target_size
+        return print_target_size(page_rect, cell, resolution, scale_mode,
+                                 custom_scale, rotation)
+
+    @staticmethod
+    def _draw_print_image(painter, target, image):
+        # 保持高分辨率，将单次发送给 GDI 的位图控制在 2000px 内。
+        # 相邻块共用浮点边界，避免整数截断产生缝隙。
+        for top in range(0, image.height(), 2000):
+            for left in range(0, image.width(), 2000):
+                width = min(2000, image.width() - left)
+                height = min(2000, image.height() - top)
+                rect = QRectF(target.x() + left * target.width() / image.width(),
+                              target.y() + top * target.height() / image.height(),
+                              width * target.width() / image.width(),
+                              height * target.height() / image.height())
+                painter.drawImage(rect, image.copy(left, top, width, height))
+
     def print_pdf(self):
         """打印：同一个文档的多页按 N 页/张 排版（N-up），预览同步。"""
         if self.doc is None:
@@ -3846,9 +4323,8 @@ class DocumentView(QWidget):
             return
         if not self._require_permission(pymupdf.PDF_PERM_PRINT, i18n.tr("menu_print")):
             return
-        from print_dialog import (PrintDialog, ALIGN_CENTER, ALIGN_TOP_CENTER,
-                                  ALIGN_BOTTOM_CENTER, _nup_grid,
-                                  SCALE_ACTUAL, SCALE_CUSTOM)
+        from print_dialog import (PrintDialog, ALIGN_TOP_CENTER,
+                                  ALIGN_BOTTOM_CENTER, _nup_grid)
         dlg = PrintDialog(self.doc, self)
         if dlg.exec() != PrintDialog.DialogCode.Accepted:
             return
@@ -3863,24 +4339,18 @@ class DocumentView(QWidget):
         rot = dlg.rotation()
         want_gray = dlg.grayscale()
 
-        # 页面范围（自定义对话框决定）
-        total = len(self.doc)
-        if dlg.print_current_only():
-            cur = max(0, self.page_view.current_page())
-            from_page = to_page = min(cur, total - 1)
-        elif dlg.custom_range():
-            f, t = dlg.custom_range()
-            from_page = max(0, f - 1)
-            to_page = min(total - 1, t - 1)
-        else:
-            from_page, to_page = 0, total - 1
-        pages = list(range(from_page, to_page + 1))
+        # 预览与打印使用同一页码列表。
+        pages = dlg.selected_pages()
         if dlg.reverse_order():
             pages.reverse()
         copies = max(1, dlg.copies())
+        if not pages:
+            return
         all_pages = []
         for _ in range(copies):
             all_pages.extend(pages)
+            # 每份从新纸开始，不能拼到上一份末页的空白格里。
+            all_pages.extend([None] * ((-len(pages)) % nup))
         if not all_pages:
             return
 
@@ -3891,6 +4361,10 @@ class DocumentView(QWidget):
             return
         try:
             page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
+            # 非 fullPage 模式下，QPainter 原点已经位于可打印区域左上角。
+            # pageRect 的物理纸张边距不能再次加到绘制坐标上。
+            if not printer.fullPage():
+                page_rect.moveTo(0, 0)
             res = max(72, printer.resolution())
             cols, rows = _nup_grid(nup)
             cell_w = page_rect.width() / cols
@@ -3901,8 +4375,14 @@ class DocumentView(QWidget):
             for page_no in all_pages:
                 # 每张纸的首个页面才 newPage（同一张纸内不 newPage）
                 if placed == 0 and not is_first_sheet:
-                    printer.newPage()
+                    if not printer.newPage():
+                        QMessageBox.critical(self, i18n.tr('hint'), i18n.tr('print_failed'))
+                        return
                 is_first_sheet = False
+
+                if page_no is None:
+                    placed = (placed + 1) % nup
+                    continue
 
                 col = placed % cols
                 row = placed // cols
@@ -3910,19 +4390,15 @@ class DocumentView(QWidget):
                               page_rect.y() + row * cell_h,
                               cell_w, cell_h)
 
-                img = self._render_print_page(
-                    page_no, res / 72.0, rot, want_gray)
-                iw, ih = img.width(), img.height()
-
-                # 缩放（多页时在单元格内生效）
-                if scale_mode == SCALE_ACTUAL:
-                    dw, dh = iw * 72.0 / res, ih * 72.0 / res
-                elif scale_mode == SCALE_CUSTOM:
-                    dw, dh = iw * 72.0 / res * custom_scale, \
-                        ih * 72.0 / res * custom_scale
-                else:
-                    scale = min(cell.width() / iw, cell.height() / ih)
-                    dw, dh = iw * scale, ih * scale
+                source_rect = self.doc[page_no].rect
+                dw, dh = self._print_target_size(
+                    source_rect, cell, res, scale_mode, custom_scale, rot)
+                source_width = (source_rect.height if rot % 180
+                                else source_rect.width)
+                # 按纸上实际尺寸提供最高 600 DPI 的细节，避免 N-up
+                # 浪费内存，也避免自定义放大时仍使用低分辨率原图。
+                zoom = dw / source_width * min(res, 600) / res
+                img = self._render_print_page(page_no, zoom, rot, want_gray)
 
                 # 位置：水平居中，垂直按选择对齐（单元格内）
                 if alignment == ALIGN_TOP_CENTER:
@@ -3935,9 +4411,10 @@ class DocumentView(QWidget):
                     x = cell.x() + (cell.width() - dw) / 2
                     y = cell.y() + (cell.height() - dh) / 2
 
-                # QPixmap int 重载：Windows GDI 兼容
-                painter.drawPixmap(int(x), int(y), int(dw), int(dh),
-                                   QPixmap.fromImage(img))
+                painter.save()
+                painter.setClipRect(cell)
+                self._draw_print_image(painter, QRectF(x, y, dw, dh), img)
+                painter.restore()
 
                 placed += 1
                 if placed >= nup:

@@ -1,6 +1,5 @@
 """手写签名画板、签名库（保存/调用）。"""
 import os
-import time
 import i18n
 from PySide6.QtCore import (Qt, QBuffer, QByteArray, QIODevice, QSize, QRectF,
                             QPointF)

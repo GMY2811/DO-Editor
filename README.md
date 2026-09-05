@@ -1,6 +1,6 @@
 # DO编辑器（DO Editor）
 
-[![Download](https://img.shields.io/badge/Download-v2.6.9-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v2.6.9/DO-Editor-Setup-v2.6.9.exe)
+[![Download](https://img.shields.io/badge/Download-v2.9.9-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v2.9.9/DO-Editor-Setup-v2.9.9.exe)
 [![Release](https://img.shields.io/github/v/release/GMY2811/DO-Editor?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/latest)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 
@@ -17,7 +17,7 @@
 前往 [Releases](../../releases) 页面，下载最新版本的 `DO编辑器-Setup-v*.exe` 安装程序，双击安装即可。
 
 - 支持 Windows 10 / 11
-- 安装包约 112MB，安装后磁盘占用约 350MB
+- 安装包约 122MB，安装后磁盘占用约 350MB
 - 安装时可选「将 PDF 文件关联到 DO编辑器」
 - 自带卸载程序（控制面板或开始菜单均可卸载）
 

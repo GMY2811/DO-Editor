@@ -15,12 +15,15 @@ RichEditBox：仿 QLineEdit 的单行就地编辑控件，内容却是富文本�
 - 粘贴自动过滤换行，控件始终保持单行。
 """
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import (QBrush, QColor, QFont, QTextCharFormat,
-                           QTextCursor, QTextFormat)
+import os
+
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QTimer
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QPalette,
+                           QTextBlockFormat, QTextCharFormat, QTextCursor,
+                           QTextFormat, QPainter, QPen)
 from PySide6.QtWidgets import (QColorDialog, QDialog, QDoubleSpinBox,
                                QFontComboBox, QFrame, QHBoxLayout, QLabel,
-                               QMenu, QPushButton, QTextEdit, QVBoxLayout)
+                               QPushButton, QTextEdit, QVBoxLayout)
 
 # Qt 中 1pt 按逻辑 DPI(96) 渲染为 4/3 逻辑像素。编辑器以「pt*scale
 # 逻辑像素」精确显示（与页面位图文字等大），故写入字符格式的点阵值 =
@@ -33,6 +36,139 @@ _PX_PER_PT = 96.0 / 72.0
 # 格式（空字族、文档默认格式等）上 fontFamily()/fontFamilies() 会触发
 # 不可被 try/except 捕获的原生访问违例（access violation）。
 _FAM_PROP = int(QTextFormat.Property.UserProperty) + 101
+_SIZE_PROP = int(QTextFormat.Property.UserProperty) + 102
+
+
+# PDF 子集字体里看到的家族名（如 "Arial Regular"/"Calibri Regular"/
+# "Nimbus Sans Regular"/"Droid Sans Fallback" 等）只是排版惯例字符串，
+# Windows 真实安装的字体族名往往不同。直接拿这些字符串交给 QFont/QPainter
+# 在 Widget 上画，会得到「空字族 → 全方块」豆腐视图。这里把常见字符串
+# 规范成系统已装族名（且已知含全量 CJK），最后再用 QFontDatabase 校验一次。
+_WIN_FAMILY_REMAP = {
+    "arial regular": "Arial",
+    "arial bold": "Arial",
+    "arial italic": "Arial",
+    "arial bolditalic": "Arial",
+    "calibri regular": "Calibri",
+    "calibri bold": "Calibri",
+    "calibri italic": "Calibri",
+    "calibri bolditalic": "Calibri",
+    "times new roman regular": "Times New Roman",
+    "times new roman bold": "Times New Roman",
+    "times": "Times New Roman",
+    "times-regular": "Times New Roman",
+    "times bold": "Times New Roman",
+    "nimbus sans regular": "Arial",
+    "nimbus sans italic": "Arial",
+    "nimbus sans bold": "Arial",
+    "nimbus mono": "Courier New",
+    "droid sans fallback regular": "Microsoft YaHei",
+    "droid sans fallback bold": "Microsoft YaHei",
+    "noto sans regular": "Microsoft YaHei",
+    "noto sans cjk": "Microsoft YaHei",
+    "noto sans cjk sc regular": "Microsoft YaHei",
+    "fangsong": "FangSong",
+    "kaiti": "KaiTi",
+    "simsun": "SimSun",
+    "simhei": "SimHei",
+    "dengxian": "DengXian",
+    "dengxian light": "DengXian",
+    "microsoft yahei": "Microsoft YaHei",
+    "microsoft yahei ui": "Microsoft YaHei",
+    "microsoft yahei bold": "Microsoft YaHei",
+    "microsoft yahui": "Microsoft YaHei",
+    "msyh": "Microsoft YaHei",
+    "pingfangsc": "Microsoft YaHei",
+    "苹方": "Microsoft YaHei",
+    "微软雅黑": "Microsoft YaHei",
+    "等线": "DengXian",
+    "黑体": "SimHei",
+    "宋体": "SimSun",
+    "楷体": "KaiTi",
+    "仿宋": "FangSong",
+}
+
+_CJK_FONT_FALLBACK = "Microsoft YaHei UI"  # Qt 在 Windows 上 DirectWrite 真实可解析的族名
+
+
+def _qt_safe_family(family):
+    """把任意 PDF 字体族名规范为当前系统已装的 QFont 字体族名。
+
+    不可用时按 `黑体/宋体/楷体/仿宋 → CJK → 西文` 优先级回退，
+    始终返回一个能让 QTextEdit/QPainter 画出来且覆盖中日韩文+常用符号的族。
+    """
+    raw = (family or "").strip()
+    if not raw:
+        return _CJK_FONT_FALLBACK
+    key = raw.lower()
+    remap = _WIN_FAMILY_REMAP.get(key)
+    if remap:
+        raw = remap
+    try:
+        installed = set(QFontDatabase.families())
+    except Exception:
+        installed = set()
+    if raw in installed:
+        return raw
+    if remap and remap in installed:
+        return remap
+    strip = raw.rstrip()
+    for suffix in (" Regular", " Reg", " Bold", " Italic", " BoldItalic",
+                   " Black", " Medium", " Light", " Thin"):
+        if strip.endswith(suffix):
+            stripped = strip[: -len(suffix)].rstrip()
+            if stripped in installed:
+                return stripped
+    # Windows DirectWrite 真实可用的优先级：UI 版本在 DirectWrite 下最稳定
+    for cand in ("Microsoft YaHei UI", "Microsoft YaHei",
+                 "SimHei", "SimSun", "DengXian",
+                 "Arial", "Segoe UI", "Calibri"):
+        if cand in installed:
+            return cand
+    return _CJK_FONT_FALLBACK
+
+
+# ---------------------------------------------------------------------------
+# 启动期"真实试字体"：把 Windows 上的字体文件显式注入 DirectWrite，确保
+# PyInstaller / 容器化环境下的 QFontDatabase 能拿到字形。
+# ---------------------------------------------------------------------------
+_FONTS_INJECTED = False
+
+
+def _inject_windows_fonts_once():
+    """在 PyInstaller / 容器环境启动后，把 Windows 字体文件显式注入 Qt，
+    让 QFontDatabase 在 DirectWrite 下能拿到完整字形数据。
+    只执行一次。"""
+    global _FONTS_INJECTED
+    if _FONTS_INJECTED:
+        return
+    _FONTS_INJECTED = True
+    win_fonts = os.environ.get("WINDIR", r"C:\Windows") + r"\Fonts"
+    candidates = [
+        ("msyh.ttc", "Microsoft YaHei"),
+        ("msyh.ttc", "Microsoft YaHei UI"),
+        ("simhei.ttf", "SimHei"),
+        ("simsun.ttc", "SimSun"),
+        ("arial.ttf", "Arial"),
+        ("seguiemj.ttf", "Segoe UI Emoji"),
+    ]
+    installed = set(QFontDatabase.families())
+    loaded_files = set()
+    for fname, fam in candidates:
+        # 已安装的系统字体由 DirectWrite 原生解析，避免重复注册 TTC
+        # 覆盖系统字族、改变界面小字号的栅格化结果。
+        if fam in installed or fname in loaded_files:
+            continue
+        fpath = os.path.join(win_fonts, fname)
+        if os.path.exists(fpath):
+            try:
+                QFontDatabase.addApplicationFont(fpath)
+                loaded_files.add(fname)
+                installed.update(QFontDatabase.families())
+            except Exception:
+                pass
+
+
 
 
 # --------------------------------------------------------------------------
@@ -114,6 +250,7 @@ class RichEditBox(QTextEdit):
         super().__init__(parent)
         self._scale = 1.0              # 屏幕像素 = pt * scale
         self._suppress_focusout = 0
+        self._text_visible = True      # set_text_visible 状态，paintEvent 用
         # 基准格式：setText/程序化整文替换时沿用（空文档光标 charFormat
         # 读取在某些平台/空文档上会触发原生崩溃，故自行记录）
         self._base_fmt = {
@@ -157,23 +294,29 @@ class RichEditBox(QTextEdit):
             for r in runs:
                 cur.insertText(r["text"], self._char_format(r))
         self.setTextCursor(cur)
+        # 锁死行高：贴齐字形本体像素 + 2，避免 Qt 默认用 widget 字体的
+        # lineSpacing（约 1.35×）撑高行框，让就地编辑框看起来比页面同
+        # 行字"放大"了。
+        base_px = max(1.0, float(self._base_fmt["size"]) * self._scale)
+        line_px = max(1, int(round(base_px)) + 2)
+        doc = self.document()
+        bc = QTextCursor(doc)
+        bc.select(QTextCursor.SelectionType.Document)
+        bfmt = bc.blockFormat()
+        bfmt.setLineHeight(line_px,
+                           QTextBlockFormat.LineHeightTypes.FixedHeight.value)
+        bc.setBlockFormat(bfmt)
         self.document().clearUndoRedoStacks()
 
     def text(self):
         """与 QLineEdit 语义兼容：返回纯文本。"""
         return self.toPlainText()
 
-    def hasSelectedText(self):
-        """与 QLineEdit 语义兼容：当前是否存在选中文字。"""
-        return self.textCursor().hasSelection()
 
     def selectedText(self):
         """与 QLineEdit 语义兼容：返回选中文字。"""
         return self.textCursor().selectedText()
 
-    def cursorPosition(self):
-        """与 QLineEdit 语义兼容：当前光标位置（0..len(纯文本)）。"""
-        return self.textCursor().position()
 
     def setText(self, text):
         """与 QLineEdit 语义兼容：整文替换。
@@ -195,6 +338,60 @@ class RichEditBox(QTextEdit):
             "bold": base["bold"],
             "italic": base["italic"],
         }])
+
+    def set_text_visible(self, visible):
+        """按需显示/隐藏框内全部文字（只切 alpha，保留各 run 原 RGB 色）。
+
+        Acrobat「点击不动原字」的实现关键：进入编辑瞬间框内文字透明
+        隐藏（页面画布仍显示 PDF 位图原字形，视觉零变化、只有光标），
+        用户真正输入/删除的那一刹那才调 visible=True 把 Qt 文字显出来
+        （同时画布填纸色盖掉原字形）。隐藏/恢复都只改 foreground 的
+        alpha（255/0），RGB 通道原样不动，故恢复无需记忆原色。
+        """
+        alpha = 255 if visible else 0
+        self._text_visible = bool(visible)
+        doc = self.document()
+        # 第一遍：只读收集每段 range 及其 charFormat（改副本 alpha），
+        # 绝不在遍历 fragment 时写文档（会合并/拆分 fragment 使迭代器失效）。
+        items = []
+        block = doc.begin()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    cf = frag.charFormat()
+                    col = cf.foreground().color()
+                    col.setAlpha(alpha)
+                    cf.setForeground(QBrush(col))
+                    items.append((frag.position(), frag.length(), cf))
+                it += 1
+            block = block.next()
+        # 第二遍：逐 range 用独立 QTextCursor 应用新格式（只改格式不改文本，
+        # 字符位置全程稳定）。
+        for pos, length, cf in items:
+            if length <= 0:
+                continue
+            c = QTextCursor(doc)
+            c.setPosition(pos)
+            c.setPosition(pos + length, QTextCursor.MoveMode.KeepAnchor)
+            c.setCharFormat(cf)
+
+    def paintEvent(self, event):
+        """字形层硬保障：文字被隐藏（_text_visible=False，Acrobat 就地
+        编辑）时，Qt 画选区/光标只准画高亮底、绝不画字形——否则会与下方
+        MuPDF 单引擎字形叠成"变大/变形/方块"。绘制前把会重画选中字形的
+        palette 角色压成透明（HighlightedText/Text）；选区底由样式表负责。
+        """
+        if not self._text_visible:
+            pal = self.palette()
+            z = QColor(0, 0, 0, 0)
+            if (pal.highlightedText().color() != z
+                    or pal.text().color() != z):
+                pal.setColor(QPalette.ColorRole.HighlightedText, z)
+                pal.setColor(QPalette.ColorRole.Text, z)
+                self.setPalette(pal)
+        super().paintEvent(event)
 
     def sync_typing_format_from_cursor(self):
         """把光标处字符格式同步为后续输入格式。
@@ -283,10 +480,13 @@ class RichEditBox(QTextEdit):
 
     def _fmt_size_pt(self, cf):
         """字符格式中存储的点数 → PDF pt（去除 scale 与 Qt 96dpi 换算）。"""
+        size = cf.property(_SIZE_PROP)
+        if isinstance(size, (int, float)) and size > 0:
+            return float(size)
         ps = cf.fontPointSize()
         if ps > 0 and self._scale > 0:
             return round(ps * _PX_PER_PT / self._scale, 2)
-        return 12.0
+        return float(self._base_fmt.get("size") or 12.0)
 
     def _fmt_bold(self, cf):
         return cf.fontWeight() >= QFont.Weight.Bold
@@ -295,15 +495,19 @@ class RichEditBox(QTextEdit):
         cf = QTextCharFormat()
         # 空字族会生成「无字体」fragment，后续 fontFamily()/fontFamilies()
         # 读取在本机 PySide/Qt 上触发原生访问违例（不可被 try 捕获），
-        # 故一律兜底为非空字族。
-        family = (run.get("family") or self._base_fmt.get("family")
-                  or "Microsoft YaHei")
+        # 故一律兜底为非空字族。同时把 PDF 子集里来的家族名（"Nimbus Sans
+        # Regular"/"Calibri Regular"/"Droid Sans Fallback" 等）规范成
+        # 本机 QFontDatabase 里真实存在的族名，否则 QTextEdit 渲染出全豆腐。
+        family = _qt_safe_family(run.get("family")
+                                 or self._base_fmt.get("family"))
         cf.setFontFamilies([family])
         # 同时存为自定义属性：读回族名走 _fmt_family 属性读取，
         # 避免 Qt 字族解析在特定字符格式上的原生访问违例。
-        cf.setProperty(_FAM_PROP, family)
+        cf.setProperty(_FAM_PROP, run.get("family")
+                       or self._base_fmt.get("family") or family)
         # 存点阵值 = 目标像素 / (96/72)，使 Qt 渲染像素 ≈ pt*scale
         size = float(run.get("size") or 12.0)
+        cf.setProperty(_SIZE_PROP, size)
         pt = max(1.0, size * self._scale / _PX_PER_PT)
         cf.setFontPointSize(round(pt, 2))
         cf.setFontWeight(QFont.Weight.Bold
@@ -315,12 +519,6 @@ class RichEditBox(QTextEdit):
         cf.setForeground(QBrush(QColor(color)))
         return cf
 
-    def _selection_char_format(self):
-        """取选区首字符格式（无选区取光标处字符格式）。"""
-        cur = QTextCursor(self.textCursor())
-        if cur.hasSelection():
-            cur.setPosition(cur.selectionStart())
-        return cur.charFormat()
 
     def _apply_char(self, bold=None, italic=None, family=None, size_pt=None,
                     color=None):
@@ -333,7 +531,9 @@ class RichEditBox(QTextEdit):
             cf.setFontItalic(italic)
         if family:
             cf.setFontFamilies([family])
+            cf.setProperty(_FAM_PROP, family)
         if size_pt is not None:
+            cf.setProperty(_SIZE_PROP, float(size_pt))
             cf.setFontPointSize(max(
                 1.0, float(size_pt) * self._scale / _PX_PER_PT))
         if color is not None:
@@ -502,6 +702,146 @@ class RichEditBox(QTextEdit):
             self.insertPlainText(txt)
         else:
             super().insertFromMimeData(source)
+
+
+class PdfRowEditBox(RichEditBox):
+    """PDF 行的输入层：光标、选区与鼠标命中共用 PDF 字符坐标。
+
+    QTextDocument 只负责文本、格式和输入法，不用其替代字体的排版结果
+    定位。位置表以 Unicode 字符为单位，交给 QTextCursor 前转换为 UTF-16。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pdf_ranges = []
+        self._pdf_positions = [0]
+        self._pdf_top = 0.0
+        self._pdf_bottom = 12.0
+        self._pdf_empty_x = 0.0
+        self._pdf_dragging = False
+        self._caret_on = True
+        self._preedit = ""
+        self._caret_timer = QTimer(self)
+        self._caret_timer.setInterval(500)
+        self._caret_timer.timeout.connect(self._blink_caret)
+        self._caret_timer.start()
+        self.cursorPositionChanged.connect(self._cursor_updated)
+        self.selectionChanged.connect(self._cursor_updated)
+
+    def set_pdf_layout(self, text, ranges, top, bottom, empty_x=0.0):
+        self._pdf_ranges = list(ranges)
+        self._pdf_positions = [0]
+        for ch in text:
+            self._pdf_positions.append(self._pdf_positions[-1] +
+                                       (2 if ord(ch) > 0xFFFF else 1))
+        self._pdf_top, self._pdf_bottom = top, bottom
+        self._pdf_empty_x = empty_x
+        self._cursor_updated()
+
+    def _cursor_updated(self):
+        self._caret_on = True
+        self.viewport().update()
+
+    def _blink_caret(self):
+        self._caret_on = not self._caret_on
+        self.viewport().update()
+
+    def cursorForPosition(self, pos):
+        cur = QTextCursor(self.document())
+        boundaries = [r[0] for r in self._pdf_ranges]
+        if self._pdf_ranges:
+            boundaries.append(self._pdf_ranges[-1][1])
+        else:
+            boundaries = [self._pdf_empty_x]
+        index = min(range(len(boundaries)), key=lambda i: abs(boundaries[i] - pos.x()))
+        index = min(index, len(self._pdf_positions) - 1)
+        cur.setPosition(min(self._pdf_positions[index], self.document().characterCount() - 1))
+        return cur
+
+    def cursorRect(self, cursor=None):
+        cur = self.textCursor() if cursor is None else cursor
+        index = max(0, sum(p <= cur.position() for p in self._pdf_positions) - 1)
+        if index < len(self._pdf_ranges):
+            x = self._pdf_ranges[index][0]
+        elif self._pdf_ranges:
+            x = self._pdf_ranges[-1][1]
+        else:
+            x = self._pdf_empty_x
+        return QRectF(x, self._pdf_top, 1.0,
+                      max(1.0, self._pdf_bottom - self._pdf_top)).toAlignedRect()
+
+    def inputMethodQuery(self, query):
+        if query == Qt.InputMethodQuery.ImCursorRectangle:
+            return self.cursorRect()
+        return super().inputMethodQuery(query)
+
+    def inputMethodEvent(self, event):
+        self._preedit = event.preeditString()
+        super().inputMethodEvent(event)
+        self.viewport().update()
+
+    def paintEvent(self, event):
+        # 不调用 QTextEdit.paintEvent：它会按 Qt 字宽画出另一套光标/选区。
+        painter = QPainter(self.viewport())
+        cur = self.textCursor()
+        for i, (left, right) in enumerate(self._pdf_ranges):
+            if i + 1 >= len(self._pdf_positions):
+                break
+            if (cur.hasSelection() and self._pdf_positions[i] < cur.selectionEnd()
+                    and self._pdf_positions[i + 1] > cur.selectionStart()):
+                painter.fillRect(QRectF(left, self._pdf_top, max(1.0, right - left),
+                                        self._pdf_bottom - self._pdf_top), QColor(0, 110, 220, 80))
+        if self.hasFocus() and self._caret_on:
+            r = self.cursorRect()
+            painter.setPen(QPen(QColor(20, 90, 180), 1))
+            painter.drawLine(r.topLeft(), r.bottomLeft())
+        if self._preedit:
+            painter.setFont(self.font())
+            painter.setPen(QColor(20, 90, 180))
+            r = self.cursorRect()
+            painter.drawText(QPointF(r.left(), r.bottom()), self._preedit)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            hit = self.cursorForPosition(event.position())
+            cur = self.textCursor()
+            inside = (cur.hasSelection() and cur.selectionStart() <= hit.position()
+                      < cur.selectionEnd())
+            if event.button() == Qt.MouseButton.LeftButton:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    cur.setPosition(hit.position(), QTextCursor.MoveMode.KeepAnchor)
+                    hit = cur
+                self.setTextCursor(hit)
+                self._pdf_dragging = True
+            elif not inside:
+                self.setTextCursor(hit)
+            self.setFocus()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pdf_dragging:
+            cur = self.textCursor()
+            cur.setPosition(self.cursorForPosition(event.position()).position(),
+                            QTextCursor.MoveMode.KeepAnchor)
+            self.setTextCursor(cur)
+            event.accept()
+            return
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pdf_dragging = False
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        cur = self.cursorForPosition(event.position())
+        cur.select(QTextCursor.SelectionType.WordUnderCursor)
+        self.setTextCursor(cur)
+        self._pdf_dragging = False
+        event.accept()
 
 
 class FormatDialog(QDialog):

@@ -1,6 +1,6 @@
 # DO Editor (DO编辑器)
 
-[![Download](https://img.shields.io/badge/Download-v2.6.9-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v2.6.9/DO-Editor-Setup-v2.6.9.exe)
+[![Download](https://img.shields.io/badge/Download-v2.9.9-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v2.9.9/DO-Editor-Setup-v2.9.9.exe)
 [![Release](https://img.shields.io/github/v/release/GMY2811/DO-Editor?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/latest)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 
@@ -17,7 +17,7 @@ Developer: RAY <gmy.2811@gmail.com>
 Go to the [Releases](../../releases) page, download the latest `DO编辑器-Setup-v*.exe` installer, and double-click to install.
 
 - Supports Windows 10 / 11
-- Installer is ~112 MB; ~350 MB on disk after installation
+- Installer is ~122 MB; ~350 MB on disk after installation
 - Optionally associate PDF files with DO Editor during setup
 - Includes an uninstaller (via Control Panel or Start Menu)
 

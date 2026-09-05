@@ -6,7 +6,7 @@ from PySide6.QtGui import QImage, QPainter, QPen, QColor, QBrush, QFont, QFontMe
 from PySide6.QtWidgets import QWidget, QLabel, QToolTip, QGraphicsDropShadowEffect
 
 import backend
-from rich_text import merge_runs, runs_all_same_style
+from rich_text import merge_runs, runs_all_same_style, _qt_safe_family
 
 _ACCENT = QColor(37, 99, 235)
 _PLACEHOLDER = QColor(255, 0, 255)   # 文本定位框高对比色（洋红）
@@ -85,6 +85,7 @@ class PageView(QWidget):
         self._edit_overlay = False
         self._edit_lines = {}        # page -> [{rect(QRectF), text}]
         self._edit_hover = None      # (page, idx) 当前悬停的文字行
+        self._edit_excl = None       # (page, QRectF PDF坐标) 就地编辑行：不铺框/不高亮
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -267,12 +268,79 @@ class PageView(QWidget):
             return
         self._edit_overlay = active
         self._edit_hover = None
+        self._edit_excl = None
         if not active:
             self._edit_lines.clear()
             self.setCursor(Qt.CursorShape.ArrowCursor)
         else:
             self.setCursor(Qt.CursorShape.IBeamCursor)
         self.update()
+
+    def set_inline_rect(self, page, rect, paper=None):
+        """标记正在就地编辑的文字行区域（PDF 坐标），绘制时跳过该行的
+        overlay 蓝框/hover 高亮（不给正在编辑的行铺框）。
+
+        Acrobat 就地方案：编辑行的旧字形由文档层实时 redact 清除、新文字
+        由同一 MuPDF 引擎 redact+insert 写回并重渲染位图——画布无需再以
+        纸色覆盖层遮字（那只是旧 Qt 覆盖方案的遗留）。rect=None 时清除。
+        paper 参数保留仅为兼容旧调用（忽略）。
+        """
+        if rect is None:
+            if self._edit_excl is not None:
+                self._edit_excl = None
+                self._edit_hover = None
+                self.update()
+            return
+        self._edit_excl = (int(page), QRectF(rect))
+        self._edit_hover = None
+        self.update()
+
+    def rerender_page_region(self, page, pdf_rect, pad=1.5):
+        """就地编辑后按当前文档内容重新渲染页面上一个小区域（PDF 坐标）。
+
+        编辑会话中每次 redact+insert 都会改变内存 PDF 文本层，本方法把该
+        区域（按 zoom×dpr）重新 get_pixmap 并原位写回 _images 位图，实现
+        「编辑行 = MuPDF 同引擎渲染」，与页面其它行视觉完全一致。区域外扩
+        pad(pt) 以包含字形溢出；像素网格取整避免拼接缝隙。
+        """
+        if not self._doc_open() or page < 0 or page >= len(self._doc):
+            return False
+        img = self._images.get(page)
+        if img is None:
+            return False
+        import math as _math
+        import pymupdf
+        try:
+            dpr = img.devicePixelRatio() or 1.0
+            kx = self._zoom * dpr
+            pw, ph = backend.page_size(self._doc, page)
+            x0 = _math.floor((max(0.0, float(pdf_rect.x()) - pad)) * kx) / kx
+            y0 = _math.floor((max(0.0, float(pdf_rect.y()) - pad)) * kx) / kx
+            x1 = _math.ceil((min(pw, float(pdf_rect.right()) + pad)) * kx) / kx
+            y1 = _math.ceil((min(ph, float(pdf_rect.bottom()) + pad)) * kx) / kx
+            if x1 - x0 < 0.1 or y1 - y0 < 0.1:
+                return False
+            clip = pymupdf.Rect(x0, y0, x1, y1)
+            pix = self._doc[page].get_pixmap(
+                matrix=pymupdf.Matrix(kx, kx), clip=clip, alpha=False)
+            sub = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                         QImage.Format.Format_RGB888).copy()
+            # 逻辑像素目标 = 物理像素 / dpr（图像物理宽 = clip×kx）
+            painter = QPainter(img)
+            tx = (clip.x0 * self._zoom * dpr) / dpr
+            ty = (clip.y0 * self._zoom * dpr) / dpr
+            tw = sub.width() / dpr
+            th = sub.height() / dpr
+            painter.drawImage(
+                QRectF(tx, ty, tw, th), sub,
+                QRectF(0, 0, sub.width(), sub.height()))
+            painter.end()
+            self.update()
+            self._rerender_err = None
+            return True
+        except Exception as exc:
+            self._rerender_err = repr(exc)
+            return False
 
     def _edit_line_hits(self, page):
         """返回一页的可编辑文字行列表（按 PDF 坐标，缓存）。
@@ -319,11 +387,17 @@ class PageView(QWidget):
                         continue
                     # 字符级并集：跳过空白字符（无字形），得出真实擦除区
                     erase = None
+                    origin = None     # 行内首个字符的基线原点 (x, y)，live 写回起点
+                    char_x = []       # 每字符 (x0, x1) 顺序表（含空格），供前缀保留
                     for s in spans:
                         for ch in s.get("chars", []) or []:
                             cb = ch.get("bbox")
                             if not cb or len(cb) != 4:
                                 continue
+                            char_x.append([float(cb[0]), float(cb[2])])
+                            if origin is None and ch.get("origin"):
+                                og = ch["origin"]
+                                origin = [float(og[0]), float(og[1])]
                             if not ch.get("c") or ch["c"].isspace():
                                 continue
                             if erase is None:
@@ -353,7 +427,7 @@ class PageView(QWidget):
                         span_info.append({
                             "text": st,
                             "font": str(s.get("font", "") or ""),
-                            "size": round(float(s.get("size", 10.0)), 1),
+                            "size": round(float(s.get("size", 10.0)), 2),
                             "color": ((sc >> 16) & 255,
                                       (sc >> 8) & 255, sc & 255),
                             "bold": sb,
@@ -362,14 +436,17 @@ class PageView(QWidget):
                     out.append({
                         "rect": QRectF(x0, y0, x1 - x0, y1 - y0),
                         "erase": erase,
+                        "origin": origin,
                         "text": text,
                         "spans": span_info,
+                        "char_x": (char_x if len(char_x) == len(text)
+                                   else None),
                         "font": str(main.get("font", "") or ""),
                         "span_bbox": [float(v) for v in
                                       (main.get("bbox") or bb)],
                         "fmt": {
                             "font": str(main.get("font", "") or ""),
-                            "size": round(float(main.get("size", 10.0)), 1),
+                            "size": round(float(main.get("size", 10.0)), 2),
                             "color": ((col >> 16) & 255,
                                       (col >> 8) & 255, col & 255),
                             "bold": bold,
@@ -378,6 +455,19 @@ class PageView(QWidget):
                     })
         self._edit_lines[page] = out
         return out
+
+    def invalidate_text_cache(self, page=None):
+        """就地编辑提交/取消后使文字缓存失效，下次按新文档内容重建。
+
+        doc 文本已被 redact+insert 改写，缓存的该页可编辑行/words 与
+        文档不一致；失效后再次进入编辑或文字选择会按新内容重新解析。
+        """
+        if page is None:
+            self._edit_lines.clear()
+            self._text_words.clear()
+        else:
+            self._edit_lines.pop(int(page), None)
+            self._text_words.pop(int(page), None)
 
     def _edit_line_at(self, pos):
         """画布坐标 → 命中的文字行 (page, idx)，未命中返回 None。"""
@@ -517,6 +607,7 @@ class PageView(QWidget):
             # 整页文字编辑框：给可编辑文字行铺上轻量蓝框，悬停行加深
             if self._edit_overlay and self._mode == "point":
                 hover = self._edit_hover
+                excl = self._edit_excl
                 p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 for pno in range(len(self._doc)):
                     o = self._offsets[pno]
@@ -524,6 +615,11 @@ class PageView(QWidget):
                     if o + ph < top or o > bottom:
                         continue
                     for idx, ln in enumerate(self._edit_line_hits(pno)):
+                        # 正在就地编辑的行：其区域已由文档层 redact+insert
+                        # 并重渲染（MuPDF 引擎），不铺框不高亮
+                        if (excl is not None and excl[0] == pno
+                                and ln["rect"].intersects(excl[1])):
+                            continue
                         wr = self._widget_rect(pno, ln["rect"])
                         if (pno, idx) == hover:
                             p.fillRect(wr, QColor(37, 99, 235, 66))
@@ -546,7 +642,8 @@ class PageView(QWidget):
                     if mixed:
                         self._paint_text_runs(p, wr, runs)
                     else:
-                        family = obj.get("fontfamily") or "Microsoft YaHei UI"
+                        family = _qt_safe_family(
+                            obj.get("fontfamily") or "Microsoft YaHei UI")
                         f = QFont(family)
                         f.setPixelSize(max(10, int(obj.get("fontsize", 11) * self._zoom)))
                         f.setBold(bool(obj.get("bold", False)))
@@ -639,7 +736,7 @@ class PageView(QWidget):
             return
         infos = []
         for r in runs:
-            f = QFont(r.get("family") or "Microsoft YaHei UI")
+            f = QFont(_qt_safe_family(r.get("family") or "Microsoft YaHei UI"))
             f.setPixelSize(max(
                 2, int(round(float(r.get("size") or 12.0) * self._zoom))))
             f.setBold(bool(r.get("bold")))

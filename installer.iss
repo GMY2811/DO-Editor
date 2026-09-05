@@ -1,6 +1,9 @@
-; DO编辑器 安装脚本 (Inno Setup 6)
+; DO编辑器 安装脚本 (Inno Setup 7)
+#ifndef BuildSource
+#define BuildSource "dist_v299\DO编辑器"
+#endif
 #define MyAppName "DO编辑器"
-#define MyAppVersion "2.6.9"
+#define MyAppVersion "2.9.9"
 #define MyAppPublisher "RAY"
 #define MyAppExeName "DO编辑器.exe"
 
@@ -65,7 +68,7 @@ Name: "desktopicon"; Description: "{cm:DesktopIcon}"; GroupDescription: "{cm:Add
 Name: "pdfassoc"; Description: "{cm:PdfAssociation}"; GroupDescription: "{cm:AdditionalTasks}"
 
 [Files]
-Source: "dist\DO编辑器\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion createallsubdirs
+Source: "{#BuildSource}\*"; DestDir: "{app}"; Excludes: "*.log,*.tmp"; Flags: recursesubdirs ignoreversion createallsubdirs
 Source: "icon.ico"; DestDir: "{app}"; DestName: "{#MyAppName}-v{#MyAppVersion}.ico"; Flags: ignoreversion
 
 [Icons]

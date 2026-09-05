@@ -1,10 +1,11 @@
 """打印对话框（简洁版）：打印机/范围/份数/缩放/位置/方向/纸张/每张页数 + 右侧预览。"""
-from PySide6.QtCore import Qt, QSize, QSizeF, QRectF
+from collections import OrderedDict
+from PySide6.QtCore import Qt, QSize, QSizeF, QRectF, QTimer
 from PySide6.QtGui import QImage, QPixmap, QPageLayout, QPageSize, QPainter, QPen, QColor
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (QButtonGroup, QComboBox, QDialog, QDialogButtonBox,
                                QGroupBox, QHBoxLayout, QLabel, QPushButton, QRadioButton,
-                               QSpinBox, QVBoxLayout, QWidget,
+                               QSpinBox, QVBoxLayout, QWidget, QMessageBox, QSizePolicy,
                                QGridLayout)
 
 import i18n
@@ -24,7 +25,8 @@ PAPERS = {
     "A4": QPageSize(QPageSize.PageSizeId.A4),
     "A3": QPageSize(QPageSize.PageSizeId.A3),
     "A5": QPageSize(QPageSize.PageSizeId.A5),
-    "B5": QPageSize(QPageSize.PageSizeId.B5),
+    "B5": QPageSize(QPageSize.PageSizeId.JisB5),
+    "B5 (ISO)": QPageSize(QPageSize.PageSizeId.B5),
     "Letter": QPageSize(QPageSize.PageSizeId.Letter),
     "Legal": QPageSize(QPageSize.PageSizeId.Legal),
 }
@@ -45,16 +47,42 @@ def _nup_grid(nup):
     return 1, 1
 
 
+def print_target_size(page_rect, cell, resolution, scale_mode,
+                      custom_scale=1.0, rotation=0):
+    """预览和打印共用的尺寸计算：PDF 点数转换为输出设备坐标。"""
+    width, height = page_rect.width, page_rect.height
+    if rotation % 180:
+        width, height = height, width
+    if scale_mode == SCALE_ACTUAL:
+        scale = resolution / 72.0
+    elif scale_mode == SCALE_CUSTOM:
+        scale = resolution / 72.0 * custom_scale
+    else:
+        scale = min(cell.width() / width, cell.height() / height)
+    return width * scale, height * scale
+
+
 class PrintDialog(QDialog):
     """打印设置：打印机/范围/份数/缩放/位置/方向/纸张/每张页数 + 右侧预览。"""
 
     def __init__(self, doc, parent=None):
         super().__init__(parent)
+        self._preview_ready = False
+        self._preview_images = OrderedDict()
+        self._preview_layouts = {}
+        self._configured_printers = {}
+        self._supported_papers = {}
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(80)
+        self._preview_timer.timeout.connect(self._refresh_preview)
         self.setWindowTitle(i18n.tr("print_dialog_title"))
         self._doc = doc
         self._total = len(doc) if doc is not None else 0
         self._printer = None
         self._preview_page = 1
+        view = getattr(parent, 'page_view', None)
+        self._current_page = max(0, view.current_page()) if view is not None else 0
         self._printers = [p for p in QPrinterInfo.availablePrinters()
                           if not p.isNull()]
 
@@ -62,8 +90,13 @@ class PrintDialog(QDialog):
         self._preview_label = QLabel()
         self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview_label.setMinimumSize(330, 430)
+        self._preview_label.setWordWrap(True)
+        self._preview_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._preview_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                          QSizePolicy.Policy.Expanding)
         self._preview_label.setStyleSheet(
-            "background:#e9eaee; border:1px solid #c5c6cb; border-radius:4px;")
+            "background:#e9eaee; color:#30343b; font-size:11pt; "
+            "border:1px solid #c5c6cb; border-radius:4px;")
 
         root = QHBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -91,7 +124,7 @@ class PrintDialog(QDialog):
         if self._printers:
             self._printer_combo.setCurrentIndex(0)
         self._printer_combo.currentIndexChanged.connect(
-            self._refresh_preview)
+            self._schedule_preview)
         grid.addWidget(self._printer_combo, 0, 1, 1, 2)
 
         # 行 1: 范围（radio + 起止页 同一行）
@@ -130,7 +163,7 @@ class PrintDialog(QDialog):
         self._rb_gray = QRadioButton(i18n.tr("print_color_gray"))
         for rb in (self._rb_color, self._rb_gray):
             self._color_group.addButton(rb)
-            rb.toggled.connect(self._refresh_preview)
+            rb.toggled.connect(self._schedule_preview)
         cg = QHBoxLayout(); cg.setSpacing(12); cg.setContentsMargins(0,0,0,0)
         cg.addWidget(self._rb_color); cg.addWidget(self._rb_gray); cg.addStretch(1)
         cgw = QWidget(); cgw.setLayout(cg)
@@ -164,7 +197,7 @@ class PrintDialog(QDialog):
         self._rb_pos_bottom = QRadioButton(i18n.tr("position_bottom_center"))
         for rb in (self._rb_pos_center, self._rb_pos_top, self._rb_pos_bottom):
             self._pos_group.addButton(rb)
-            rb.toggled.connect(self._refresh_preview)
+            rb.toggled.connect(self._schedule_preview)
         pg = QHBoxLayout(); pg.setSpacing(10); pg.setContentsMargins(0,0,0,0)
         for rb in (self._rb_pos_center, self._rb_pos_top, self._rb_pos_bottom):
             pg.addWidget(rb)
@@ -180,7 +213,7 @@ class PrintDialog(QDialog):
             rb = QRadioButton(label)
             self._rot_btns[deg] = rb
             self._rot_group.addButton(rb)
-            rb.toggled.connect(self._refresh_preview)
+            rb.toggled.connect(self._schedule_preview)
         self._rot_btns[0].setChecked(True)
         rog = QHBoxLayout(); rog.setSpacing(10); rog.setContentsMargins(0,0,0,0)
         for deg in (0, 90, 180, 270):
@@ -198,7 +231,7 @@ class PrintDialog(QDialog):
         self._rb_auto.setChecked(True)
         for rb in (self._rb_portrait, self._rb_landscape, self._rb_auto):
             self._orient_group.addButton(rb)
-            rb.toggled.connect(self._refresh_preview)
+            rb.toggled.connect(self._schedule_preview)
         oo = QHBoxLayout(); oo.setSpacing(10); oo.setContentsMargins(0,0,0,0)
         for rb in (self._rb_portrait, self._rb_landscape, self._rb_auto):
             oo.addWidget(rb)
@@ -210,11 +243,11 @@ class PrintDialog(QDialog):
         grid.addWidget(QLabel(i18n.tr("print_paper_label")), 8, 0)
         self._paper_combo = QComboBox()
         for name in PAPERS.keys():
-            self._paper_combo.addItem(name, name)
+            label = {'B5': 'B5 (JIS · 182 × 257 mm)',
+                     'B5 (ISO)': 'B5 (ISO · 176 × 250 mm)'}.get(name, name)
+            self._paper_combo.addItem(label, name)
         self._paper_combo.setCurrentText("A4")
-        for rb in (self._rb_portrait, self._rb_landscape, self._rb_auto):
-            rb.toggled.connect(self._refresh_preview)
-        self._paper_combo.currentTextChanged.connect(self._refresh_preview)
+        self._paper_combo.currentTextChanged.connect(self._schedule_preview)
         grid.addWidget(self._paper_combo, 8, 1, 1, 2)
 
         # 行 9: 每张纸页数（三个 radio 放同一行，避免网格重叠）
@@ -228,7 +261,7 @@ class PrintDialog(QDialog):
         for rb in (self._rb_pps1, self._rb_pps2, self._rb_pps4):
             self._pps_group.addButton(rb)
             ppsg.addWidget(rb)
-            rb.toggled.connect(self._refresh_preview)
+            rb.toggled.connect(self._schedule_preview)
         ppsg.addStretch(1)
         ppsgw = QWidget(); ppsgw.setLayout(ppsg)
         grid.addWidget(ppsgw, 9, 1, 1, 2)
@@ -291,21 +324,13 @@ class PrintDialog(QDialog):
         self.setMinimumWidth(880)
         self.resize(780, 580)
 
-        # 刷新预览：所有设置变化
-        for w in (self._printer_combo, self._paper_combo,
-                  self._from_spin, self._to_spin, self._copy_spin,
-                  self._scale_spin):
-            if isinstance(w, QComboBox):
-                w.currentIndexChanged.connect(self._refresh_preview)
-            else:
-                w.valueChanged.connect(self._refresh_preview)
-        for rb in (self._rb_all, self._rb_current, self._rb_pages,
-                   self._rb_fit, self._rb_actual, self._rb_custom,
-                   self._rb_pos_center, self._rb_pos_top, self._rb_pos_bottom,
-                   self._rb_portrait, self._rb_landscape, self._rb_auto,
-                   self._rb_pps1, self._rb_pps2, self._rb_pps4):
-            rb.toggled.connect(self._refresh_preview)
-        self._refresh_preview()
+        # 其余控件已在创建时连接；这里只补齐页码和百分比输入。
+        for w in (self._from_spin, self._to_spin, self._scale_spin):
+            w.valueChanged.connect(self._schedule_preview)
+        for rb in (self._rb_all, self._rb_current, self._rb_pages):
+            rb.toggled.connect(self._schedule_preview)
+        self._preview_ready = True
+        self._schedule_preview()
 
     # ---------- 交互 ----------
     def _on_pages_toggled(self, checked):
@@ -314,19 +339,30 @@ class PrintDialog(QDialog):
 
     def _on_scale_toggled(self, checked):
         self._scale_spin.setEnabled(self._rb_custom.isChecked())
-        self._refresh_preview()
+        self._schedule_preview()
 
     def _navigate(self, delta):
         if self._total == 0:
             return
         # N-up 时按"一张纸"翻页（_preview_page = 纸张序号）
-        sheets = max(1, -(-self._total // max(1, self.pages_per_sheet())))
+        sheets = self._total_sheets()
         self._preview_page = max(1, min(sheets, self._preview_page + delta))
-        self._refresh_preview()
+        self._schedule_preview()
 
     def _total_sheets(self):
         n = max(1, self.pages_per_sheet())
-        return max(1, -(-self._total // n))
+        return max(1, -(-len(self.selected_pages()) // n))
+
+    def selected_pages(self):
+        if not self._total:
+            return []
+        if self.print_current_only():
+            return [min(self._current_page, self._total - 1)]
+        limits = self.custom_range()
+        if limits:
+            first, last = limits
+            return list(range(max(0, first - 1), min(self._total, last)))
+        return list(range(self._total))
 
     # ---------- 取值 ----------
     def print_current_only(self):
@@ -383,12 +419,13 @@ class PrintDialog(QDialog):
         return self._paper_combo.currentData() or "A4"
 
     def _first_page_landscape(self):
-        # 自动方向：跟随当前预览页（所见即所得）
+        # 整个任务统一使用所选首个页面的方向，浏览预览不会改变输出方向。
         if self._doc is not None and self._total > 0:
             try:
-                pno = min(max(self._preview_page, 1), self._total) - 1
+                pno = (self.selected_pages() or [0])[0]
                 p = self._doc[pno]
-                return p.rect.width > p.rect.height
+                landscape = p.rect.width > p.rect.height
+                return not landscape if self.rotation() % 180 else landscape
             except Exception:
                 pass
         return False
@@ -407,7 +444,36 @@ class PrintDialog(QDialog):
         return QSizeF(size.width(), size.height())
 
     # ---------- 预览 ----------
+    def _schedule_preview(self, *_):
+        if self._preview_ready:
+            self._preview_timer.start()
+
+    def _preview_image(self, page, rotation, gray):
+        import pymupdf
+        from PySide6.QtGui import QTransform
+        key = (page.number, rotation, gray)
+        if key in self._preview_images:
+            self._preview_images.move_to_end(key)
+            return self._preview_images[key]
+        # 仅预览限制像素大小，实际打印仍走独立的 600 DPI 渲染路径。
+        zoom = min(1.4, 1400 / max(page.rect.width, page.rect.height))
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom),
+                              colorspace=pymupdf.csRGB, alpha=False)
+        image = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                       QImage.Format.Format_RGB888).copy()
+        if rotation:
+            image = image.transformed(QTransform().rotate(rotation))
+        if gray:
+            image = image.convertToFormat(QImage.Format.Format_Grayscale8)
+        self._preview_images[key] = image
+        while len(self._preview_images) > 8:
+            self._preview_images.popitem(last=False)
+        return image
+
     def _refresh_preview(self, *_):
+        self._preview_timer.stop()
+        if not self._preview_ready:
+            return
         if self._doc is None or self._total == 0:
             self._preview_label.clear()
             return
@@ -416,7 +482,9 @@ class PrintDialog(QDialog):
             # 每张页数网格
             n = self.pages_per_sheet()
             # 预览页 = 纸张序号：本张纸第一页 = (序号-1)*n
-            pno = min((self._preview_page - 1) * n, self._total - 1)
+            self._preview_page = min(self._preview_page, self._total_sheets())
+            pages = self.selected_pages()
+            start = (self._preview_page - 1) * n
             if n == 4:
                 cols, rows = 2, 2
             elif n == 2:
@@ -440,90 +508,76 @@ class PrintDialog(QDialog):
             p.fillRect(margin, margin, paper_w, paper_h, Qt.GlobalColor.white)
             p.setPen(QPen(QColor("#8a8a90"), 1.5))
             p.drawRect(margin, margin, paper_w, paper_h)
-            if n > 1:
-                # N-up 网格引导线：蓝色虚线，清晰标识每张纸的页格
-                p.setPen(QPen(QColor("#3b8cff"), 1.5, Qt.PenStyle.DashLine))
-                for c in range(1, cols):
-                    x0 = margin + int(c * paper_w / cols)
-                    p.drawLine(x0, margin, x0, margin + paper_h)
-                for r in range(1, rows):
-                    y0 = margin + int(r * paper_h / rows)
-                    p.drawLine(margin, y0, margin + paper_w, y0)
             mode = self.scale_mode()
             pct = self.scale_percent()
             rot = self.rotation()
             want_gray = self.grayscale()
 
-            def _render_page_img(pg):
-                zoom = 1.4
-                pix = pg.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom),
-                                    alpha=False)
-                im = QImage(pix.samples, pix.width, pix.height, pix.stride,
-                            QImage.Format.Format_RGB888).copy()
-                if rot:
-                    from PySide6.QtGui import QTransform
-                    im = im.transformed(QTransform().rotate(rot))
-                if want_gray:
-                    im = im.convertToFormat(QImage.Format.Format_Grayscale8)
-                    im = im.convertToFormat(QImage.Format.Format_RGB32)
-                return im
-
-            if n > 1:
-                # 多页：从当前预览页起依次渲染 n 页填满各格
-                cell_w = paper_w / cols
-                cell_h = paper_h / rows
-                for cell_idx in range(n):
-                    pg_no = pno + cell_idx
-                    if pg_no >= self._total:
-                        break   # 文档没有更多页：剩余格子留空（不重复）
-                    img_c = _render_page_img(self._doc[pg_no])
-                    iw, ih = img_c.width(), img_c.height()
-                    actual_w = iw / 1.4 * 1.6
-                    actual_h = ih / 1.4 * 1.6
-                    if mode == SCALE_ACTUAL:
-                        dw, dh = actual_w, actual_h
-                    elif mode == SCALE_CUSTOM:
-                        dw, dh = actual_w * pct, actual_h * pct
-                    else:
-                        s = min(cell_w * 0.9 / iw, cell_h * 0.9 / ih)
-                        dw, dh = iw * s, ih * s
-                    pos = self.position()
-                    if pos == POS_TOP_CENTER:
-                        x, y = (cell_w - dw) / 2, 6
-                    elif pos == POS_BOTTOM_CENTER:
-                        x, y = (cell_w - dw) / 2, cell_h - dh - 6
-                    else:
-                        x, y = (cell_w - dw) / 2, (cell_h - dh) / 2
-                    col = cell_idx % cols
-                    row = cell_idx // cols
-                    p.drawImage(QRectF(margin + col * cell_w + x,
-                                       margin + row * cell_h + y,
-                                       dw, dh), img_c)
-            else:
-                # 单页模式
-                img = _render_page_img(self._doc[pno])
-                iw, ih = img.width(), img.height()
-                actual_w = iw / 1.4 * 1.6
-                actual_h = ih / 1.4 * 1.6
-                if mode == SCALE_ACTUAL:
-                    dw, dh = actual_w, actual_h
-                elif mode == SCALE_CUSTOM:
-                    dw, dh = actual_w * pct, actual_h * pct
-                else:
-                    s = min(paper_w * 0.9 / iw, paper_h * 0.9 / ih)
-                    dw, dh = iw * s, ih * s
+            # 预览与打印采用同一个驱动配置，按真实可打印区域排版。
+            layout_key = (self._printer_combo.currentData(), self.paper_name(),
+                          self.paper_landscape())
+            if layout_key not in self._preview_layouts:
+                preview_printer = self._configured_printer()
+                self._preview_layouts[layout_key] = QRectF(
+                    preview_printer.pageLayout().paintRect(QPageLayout.Unit.Point))
+            printable = self._preview_layouts[layout_key]
+            preview_scale = 1.6
+            cell_w = printable.width() * preview_scale / cols
+            cell_h = printable.height() * preview_scale / rows
+            for cell_idx in range(n):
+                if start + cell_idx >= len(pages):
+                    break
+                pg_no = pages[start + cell_idx]
+                page = self._doc[pg_no]
+                img = self._preview_image(page, rot, want_gray)
+                col, row = cell_idx % cols, cell_idx // cols
+                cell = QRectF(margin + printable.x() * preview_scale + col * cell_w,
+                              margin + printable.y() * preview_scale + row * cell_h,
+                              cell_w, cell_h)
+                dw, dh = print_target_size(page.rect, cell, 72 * preview_scale,
+                                           mode, pct, rot)
+                x = cell.x() + (cell.width() - dw) / 2
                 pos = self.position()
                 if pos == POS_TOP_CENTER:
-                    x, y = (paper_w - dw) / 2, 10
+                    y = cell.y()
                 elif pos == POS_BOTTOM_CENTER:
-                    x, y = (paper_w - dw) / 2, paper_h - dh - 10
+                    y = cell.bottom() - dh
                 else:
-                    x, y = (paper_w - dw) / 2, (paper_h - dh) / 2
-                p.drawImage(QRectF(margin + x, margin + y, dw, dh), img)
+                    y = cell.y() + (cell.height() - dh) / 2
+                p.save()
+                p.setClipRect(cell)
+                p.drawImage(QRectF(x, y, dw, dh), img)
+                p.restore()
             p.end()
-            self._preview_label.setPixmap(paper_pix.scaled(
-                QSize(340, 460), Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
+            dpr = self._preview_label.devicePixelRatioF()
+            preview = paper_pix.scaled(
+                QSize(round(340 * dpr), round(460 * dpr)),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            if n > 1:
+                # 在最终设备像素上绘制提示线，避免整图缩小把横竖线采样
+                # 成不同粗细；最后叠加也避免被各页的白底遮住。
+                sx, sy = preview.width() / canvas_w, preview.height() / canvas_h
+                left = (margin + printable.x() * preview_scale) * sx
+                top = (margin + printable.y() * preview_scale) * sy
+                width = printable.width() * preview_scale * sx
+                height = printable.height() * preview_scale * sy
+                guide = QPainter(preview)
+                pen = QPen(QColor("#3b8cff"), max(1, round(dpr)),
+                           Qt.PenStyle.DashLine)
+                pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+                guide.setPen(pen)
+                guide.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+                for col in range(1, cols):
+                    x = round(left + col * width / cols)
+                    guide.drawLine(x, round(top), x, round(top + height))
+                for row in range(1, rows):
+                    y = round(top + row * height / rows)
+                    guide.drawLine(round(left), y, round(left + width), y)
+                guide.end()
+            preview.setDevicePixelRatio(dpr)
+            self._preview_label.setMargin(0)
+            self._preview_label.setPixmap(preview)
             # 引导信息
             pos = self.position()
             if pos == POS_TOP_CENTER:
@@ -539,7 +593,7 @@ class PrintDialog(QDialog):
                 scale_name = i18n.tr("scale_actual")
             elif mode == SCALE_CUSTOM:
                 scale_name = (f"{i18n.tr('scale_custom')} "
-                              f"{int(self.scale_percent()*100)}%")
+                              f"{self._scale_spin.value()}%")
             else:
                 scale_name = i18n.tr("scale_fit")
             nup = self.pages_per_sheet()
@@ -560,9 +614,13 @@ class PrintDialog(QDialog):
                 f"{i18n.tr('print_paper_label')} {self.paper_name()}  ·  "
                 f"{paper_pts.width()/72*2.54:.1f} × {paper_pts.height()/72*2.54:.1f} cm")
         except Exception as _e:
+            if 'p' in locals() and p.isActive():
+                p.end()
             import sys as _sys
             print(f"[print-preview] {type(_e).__name__}: {_e}", file=_sys.stderr)
             self._preview_label.clear()
+            self._preview_label.setMargin(20)
+            self._preview_label.setText(str(_e))
 
     # ---------- 结果 ----------
     def result_printer(self):
@@ -573,21 +631,55 @@ class PrintDialog(QDialog):
         """
         if int(self._result_code) != int(QDialog.DialogCode.Accepted):
             return None
-        if self._printer is None:
-            self._printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-            name = self._printer_combo.currentData()
-            if name:
-                self._printer.setPrinterName(name)
-            self._printer.setCopyCount(self.copies())
-            self._printer.setPageSize(PAPERS[self.paper_name()])
-            if self.paper_landscape():
-                self._printer.setPageOrientation(
-                    QPageLayout.Orientation.Landscape)
-            else:
-                self._printer.setPageOrientation(
-                    QPageLayout.Orientation.Portrait)
+        if not self.selected_pages():
+            QMessageBox.warning(self, i18n.tr('hint'), i18n.tr('print_invalid_range'))
+            return None
+        try:
+            self._printer = self._configured_printer()
+        except ValueError as exc:
+            QMessageBox.warning(self, i18n.tr('hint'), str(exc))
+            return None
         return self._printer
 
+    def _configured_printer(self):
+        """预览和输出均通过此处配置纸张、方向、驱动和可打印边距。"""
+        name = self._printer_combo.currentData()
+        printer = self._configured_printers.get(name)
+        if printer is None:
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            if name:
+                printer.setPrinterName(name)
+            # 份数由 print_pdf 逐份排版，驱动不能再次复制。
+            printer.setCopyCount(1)
+            info = QPrinterInfo(printer)
+            self._supported_papers[name] = info.supportedPageSizes()
+            supported = info.supportedResolutions()
+            candidates = [dpi for dpi in supported if dpi > 0]
+            if candidates:
+                preferred = [dpi for dpi in candidates if dpi >= 600]
+                printer.setResolution(min(preferred) if preferred else max(candidates))
+            self._configured_printers[name] = printer
+        requested = PAPERS[self.paper_name()]
+        supported_papers = self._supported_papers.get(name, [])
+        # Windows 驱动可能对不支持的纸张也返回设置成功，须先核对规格。
+        if supported_papers and not any(size.isEquivalentTo(requested)
+                                        for size in supported_papers):
+            raise ValueError(i18n.tr('print_paper_unsupported').format(
+                paper=self._paper_combo.currentText()))
+        if not printer.setPageSize(requested):
+            raise ValueError(i18n.tr('print_paper_rejected').format(paper=self.paper_name()))
+        if not printer.pageLayout().pageSize().isEquivalentTo(requested):
+            raise ValueError(i18n.tr('print_paper_mismatch'))
+        if self.paper_landscape():
+            printer.setPageOrientation(
+                QPageLayout.Orientation.Landscape)
+        else:
+            printer.setPageOrientation(
+                QPageLayout.Orientation.Portrait)
+        printer.setFullPage(False)
+        return printer
+
     def done(self, r):
+        self._preview_timer.stop()
         self._result_code = r
         super().done(r)

@@ -37,6 +37,10 @@ _DROP = {
     'opengl32sw.dll', 'qt6network.dll', 'qt6svg.dll',
     'qsvg.dll', 'qsvgicon.dll', 'qdirect2d.dll', 'qminimal.dll',
     'win32ui.pyd', 'win32trace.pyd',
+    # Qt 使用 Windows 自带的 ICU（未带版本后缀的导出符号）。
+    # 构建机 PATH 中 Poppler 的同名 icuuc.dll 使用 _78 后缀，
+    # PyInstaller 误收集它会令 QtGui 导入报“找不到指定的程序”。
+    'icuuc.dll', 'icudt78.dll',
 }
 a.binaries = [b for b in a.binaries
               if os.path.basename(b[0]).lower() not in _DROP]

@@ -8,6 +8,8 @@ venv/
 # PyInstaller 构建产物
 build/
 dist/
+build_*/
+dist_*/
 *.spec.bak
 
 # 安装包产物
@@ -39,3 +41,9 @@ Thumbs.db
 # 浏览器自动化临时目录
 .chrome-qa*/
 .edge-qa*/
+
+
+# 一次性诊断 / 复现脚本（开发调试产物，不入库）
+_*.py
+_sweep/
+_proc_check.txt

@@ -617,7 +617,7 @@ class MainWindow(QMainWindow):
         self.sidebar_default_visible = self.settings.value(
             "sidebar_default_visible", True, type=bool)
         i18n.set_lang(self.settings.value("language", "zh"))
-        self.setWindowTitle(i18n.tr("app_name", cfg.APP_NAME))
+        self.setWindowTitle(f"{cfg.APP_NAME} [{cfg.APP_VERSION}]")
         self._icon_color = icons.icon_color_for_dark(theme.is_dark(self.theme_mode))
         self._word_workers = []
         self._ocr_worker = None
@@ -954,7 +954,8 @@ class MainWindow(QMainWindow):
         if view.modified:
             r = self._ask_save(i18n.tr("unsaved_changes"))
             if r == "save":
-                view.save()
+                if not view.save():
+                    return
             elif r == "cancel":
                 return
         if self.tabs.count() <= 1:
@@ -1315,12 +1316,11 @@ class MainWindow(QMainWindow):
         """为菜单和工具栏设置清晰的独立字号与字重。"""
         menu_font = QFont("Microsoft YaHei UI")
         menu_font.setPointSizeF(10.0)
-        menu_font.setWeight(QFont.Weight.Medium)
+        menu_font.setWeight(QFont.Weight.Normal)
         menu_font.setHintingPreference(
-            QFont.HintingPreference.PreferVerticalHinting)
-        menu_font.setStyleStrategy(
-            QFont.StyleStrategy.PreferAntialias |
-            QFont.StyleStrategy.NoSubpixelAntialias)
+            QFont.HintingPreference.PreferNoHinting)
+        menu_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias |
+                                   QFont.StyleStrategy.NoSubpixelAntialias)
         menu_font.setKerning(True)
         self.menuBar().setFont(menu_font)
         for menu in (self._m_file, self._m_edit, self._m_tools, self._m_sign,
@@ -1329,12 +1329,11 @@ class MainWindow(QMainWindow):
 
         toolbar_font = QFont("Microsoft YaHei UI")
         toolbar_font.setPointSizeF(9.5)
-        toolbar_font.setWeight(QFont.Weight.Medium)
+        toolbar_font.setWeight(QFont.Weight.Normal)
         toolbar_font.setHintingPreference(
-            QFont.HintingPreference.PreferVerticalHinting)
-        toolbar_font.setStyleStrategy(
-            QFont.StyleStrategy.PreferAntialias |
-            QFont.StyleStrategy.NoSubpixelAntialias)
+            QFont.HintingPreference.PreferNoHinting)
+        toolbar_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias |
+                                      QFont.StyleStrategy.NoSubpixelAntialias)
         toolbar_font.setKerning(True)
         self.tb1.setFont(toolbar_font)
         self.tb2.setFont(toolbar_font)
@@ -1344,10 +1343,9 @@ class MainWindow(QMainWindow):
         tab_font.setPointSizeF(8.0)
         tab_font.setWeight(QFont.Weight.Normal)
         tab_font.setHintingPreference(
-            QFont.HintingPreference.PreferVerticalHinting)
-        tab_font.setStyleStrategy(
-            QFont.StyleStrategy.PreferAntialias |
-            QFont.StyleStrategy.NoSubpixelAntialias)
+            QFont.HintingPreference.PreferNoHinting)
+        tab_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias |
+                                  QFont.StyleStrategy.NoSubpixelAntialias)
         self.tabs.tabBar().setFont(tab_font)
 
     def _save_toolbar_order(self):
@@ -2325,7 +2323,9 @@ class MainWindow(QMainWindow):
                 r = self._ask_save(
                     i18n.tr("unsaved_changes_file").format(f=view.file_path or "未命名"))
                 if r == "save":
-                    view.save()
+                    if not view.save():
+                        e.ignore()
+                        return
                 elif r == "cancel":
                     e.ignore()
                     return

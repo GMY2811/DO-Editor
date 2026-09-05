@@ -1,6 +1,6 @@
 """编辑已插入图片的对话框：仅调整透明度。
 透明度拖动时通过 opacityChanged 信号实时同步到文档页面。"""
-from PySide6.QtCore import Qt, QRectF, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout,
                                QLabel, QSlider, QVBoxLayout, QFormLayout)
 
