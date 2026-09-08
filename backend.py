@@ -765,10 +765,27 @@ def insert_rich_text_auto(page, rect, runs):
                         css="*{margin:0;padding:0;}")
 
 
+def _erase_text_in(page, rect):
+    """移除矩形内文字内容，但保留图片/矢量背景（透出页面底色）。
+
+    MuPDF Page.apply_redactions 默认 images=PDF_REDACT_IMAGE_PIXELS——
+    会把与擦除矩形相交的图片按矩形挖洞并填白，因此非纯白背景的 PDF
+    （底色矩形、扫描图、水印图等）在修改/删除文字后，改动区域会出现
+    一块白底，破坏原背景。显式指定 images=NONE、graphics=NONE 后只删
+    除文本层：图片、矢量底色、表格线等一律保留，底色自然透出；纯白
+    文档视觉与原先完全一致。
+    """
+    import pymupdf as _pym
+    page.add_redact_annot(rect)
+    page.apply_redactions(
+        images=_pym.PDF_REDACT_IMAGE_NONE,
+        graphics=_pym.PDF_REDACT_LINE_ART_NONE,
+        text=_pym.PDF_REDACT_TEXT_REMOVE)
+
+
 def redact_rect(page, rect):
     """删除指定矩形区域内的原有内容（用于修改文字前清除原文）。"""
-    page.add_redact_annot(rect)
-    page.apply_redactions()
+    _erase_text_in(page, rect)
 
 
 def _safe_y_range(page, line_rect, self_cy=None):
@@ -832,7 +849,10 @@ def redact_line_safe(page, line_rect, erase_rect=None):
         return
     page.add_redact_annot(
         _pym.Rect(er.x0, y0, er.x1, y1))
-    page.apply_redactions()
+    page.apply_redactions(
+        images=_pym.PDF_REDACT_IMAGE_NONE,
+        graphics=_pym.PDF_REDACT_LINE_ART_NONE,
+        text=_pym.PDF_REDACT_TEXT_REMOVE)
 
 
 def replace_text(page, rect, new_text, fontsize=12, color=(0, 0, 0), fontfamily="",
