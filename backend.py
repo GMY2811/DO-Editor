@@ -228,8 +228,15 @@ def extract_text(doc, pno, rect=None):
 
 def create_ocr_engine():
     """创建离线 RapidOCR 引擎；延迟导入以免拖慢普通启动。"""
+    from pathlib import Path
+    import rapidocr
     from rapidocr import RapidOCR
-    return RapidOCR()
+    # 修复：rapidocr 内部在 Windows 下会将 pathlib.WindowsPath 直接赋给
+    # OmegaConf 字段 Global.model_root_dir，导致 "WindowsPath is not a supported
+    # primitive type"。这里提前以 str 路径注入 params，让其保持非 None，
+    # 库内 main.py:60 的 is None 分支不会触发，绕开该 OmegaConf 限制。
+    models_dir = Path(rapidocr.__file__).resolve().parent / "models"
+    return RapidOCR(params={"Global.model_root_dir": str(models_dir)})
 
 
 def recognize_page_ocr(engine, doc, pno, dpi=220, min_score=0.45):
