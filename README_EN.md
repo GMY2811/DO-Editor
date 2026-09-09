@@ -1,6 +1,6 @@
 # DO Editor (DO编辑器)
 
-[![Download](https://img.shields.io/badge/Download-v3.1.0-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v3.1.0/DO-Editor-Setup-v3.1.0.exe)
+[![Download](https://img.shields.io/badge/Download-v3.1.1-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v3.1.1/DO-Editor-Setup-v3.1.1.exe)
 [![Release](https://img.shields.io/github/v/release/GMY2811/DO-Editor?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/latest)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 

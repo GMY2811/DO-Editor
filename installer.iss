@@ -1,9 +1,9 @@
 ﻿; DO编辑器 安装脚本 (Inno Setup 7)
 #ifndef BuildSource
-#define BuildSource "dist_v310\DO编辑器"
+#define BuildSource "dist_v311\DO编辑器"
 #endif
 #define MyAppName "DO编辑器"
-#define MyAppVersion "3.1.0"
+#define MyAppVersion "3.1.1"
 #define MyAppPublisher "RAY"
 #define MyAppExeName "DO编辑器.exe"
 
