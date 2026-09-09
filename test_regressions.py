@@ -12,8 +12,8 @@ from unittest.mock import patch
 
 import pymupdf
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QColor, QTextCursor, QCloseEvent
-from PySide6.QtCore import Qt, QPointF
+from PySide6.QtGui import QColor, QTextCursor, QCloseEvent, QMouseEvent
+from PySide6.QtCore import QEvent, Qt, QPointF, QRectF
 from PySide6.QtTest import QTest
 from document_view import DocumentView
 from main_window import MainWindow
@@ -96,6 +96,209 @@ class RegressionTests(unittest.TestCase):
                  for line in b.get('lines', []) for s in line['spans']]
         self.assertTrue(any(s['text'] == 'CD' and s['color'] == 0xFF0000
                             for s in spans))
+
+    def test_font_only_change_is_written_to_pdf(self):
+        edit = self.start_edit()
+        edit.selectAll()
+        edit._apply_char(family='Cambria')
+        spans = [s for b in self.view.doc[0].get_text('dict')['blocks']
+                 for line in b.get('lines', []) for s in line['spans']]
+        changed = next(s for s in spans if s['text'] == 'ABCDE')
+        self.assertIn('Cambria', changed['font'])
+
+    def test_font_combo_family_outside_static_map_is_written(self):
+        font_path = self.view._system_font_file('Candara')
+        if not font_path:
+            self.skipTest('Candara is not installed')
+        edit = self.start_edit()
+        edit.selectAll()
+        edit._apply_char(family='Candara')
+        spans = [s for b in self.view.doc[0].get_text('dict')['blocks']
+                 for line in b.get('lines', []) for s in line['spans']]
+        changed = next(s for s in spans if s['text'] == 'ABCDE')
+        self.assertIn('Candara', changed['font'])
+
+    def test_add_text_selected_font_survives_bake(self):
+        if not self.view._system_font_file('Candara'):
+            self.skipTest('Candara is not installed')
+        self.view.set_mode('text')
+        self.view._begin_inplace_text(0, QPointF(72, 220))
+        edit = self.view._inplace_edit
+        edit.insertPlainText('NEWFONT')
+        edit.selectAll()
+        edit._apply_char(family='Candara')
+        self.view._commit_inplace_text(commit=True)
+        obj = self.view.objects[-1]
+        self.assertEqual(obj['fontfamily'], 'Candara')
+        self.assertTrue(obj.get('embed', {}).get('file', '').lower().endswith(
+            'candara.ttf'))
+        self.view._bake_objects()
+        span = next(s for b in self.view.doc[0].get_text('dict')['blocks']
+                    for line in b.get('lines', []) for s in line['spans']
+                    if s['text'] == 'NEWFONT')
+        self.assertIn('Candara', span['font'])
+
+    def test_added_text_enters_edit_mode_and_can_be_dragged(self):
+        self.view.set_mode('text')
+        self.view._begin_inplace_text(0, QPointF(72, 220))
+        self.view._inplace_edit.insertPlainText('MOVE ME')
+        self.view._commit_inplace_text(commit=True)
+
+        obj = self.view.objects[-1]
+        pv = self.view.page_view
+        self.assertEqual(self.view.current_mode, 'replace_text')
+        self.assertTrue(pv._edit_overlay)
+        self.assertEqual(pv.selected_id(), obj['id'])
+
+        old_rect = QRectF(obj['rect'])
+        center = QPointF(old_rect.center().x() * pv._zoom,
+                         pv._offsets[0] + old_rect.center().y() * pv._zoom)
+        moved = center + QPointF(24, 16)
+        pv.mousePressEvent(QMouseEvent(
+            QEvent.Type.MouseButtonPress, center,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        pv.mouseMoveEvent(QMouseEvent(
+            QEvent.Type.MouseMove, moved,
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        pv.mouseReleaseEvent(QMouseEvent(
+            QEvent.Type.MouseButtonRelease, moved,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier))
+
+        self.assertAlmostEqual(obj['rect'].x(),
+                               old_rect.x() + 24 / pv._zoom, delta=0.2)
+        self.assertAlmostEqual(obj['rect'].y(),
+                               old_rect.y() + 16 / pv._zoom, delta=0.2)
+
+    def test_pasted_text_stays_movable_until_save(self):
+        QApplication.clipboard().setText('PASTED MOVE')
+        self.view.set_mode('view')
+        self.view.paste_text(0, QPointF(90, 230))
+
+        obj = self.view.objects[-1]
+        pv = self.view.page_view
+        self.assertEqual(obj['kind'], 'text')
+        self.assertEqual(obj['text'], 'PASTED MOVE')
+        self.assertEqual(self.view.current_mode, 'replace_text')
+        self.assertTrue(pv._edit_overlay)
+        self.assertEqual(pv.selected_id(), obj['id'])
+
+        old_rect = QRectF(obj['rect'])
+        center = QPointF(old_rect.center().x() * pv._zoom,
+                         pv._offsets[0] + old_rect.center().y() * pv._zoom)
+        moved = center + QPointF(18, 12)
+        pv.mousePressEvent(QMouseEvent(
+            QEvent.Type.MouseButtonPress, center,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        pv.mouseMoveEvent(QMouseEvent(
+            QEvent.Type.MouseMove, moved,
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        pv.mouseReleaseEvent(QMouseEvent(
+            QEvent.Type.MouseButtonRelease, moved,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier))
+        self.assertGreater(obj['rect'].x(), old_rect.x())
+        self.assertGreater(obj['rect'].y(), old_rect.y())
+
+        self.assertTrue(self.view.save())
+        self.assertFalse(self.view.objects)
+        self.assertIn('PASTED MOVE', self.view.doc[0].get_text())
+
+    def test_add_text_format_priority_front_previous_next(self):
+        calibri = r'C:\Windows\Fonts\calibri.ttf'
+        cambria = r'C:\Windows\Fonts\cambria.ttc'
+        if not pathlib.Path(calibri).exists() or not pathlib.Path(cambria).exists():
+            self.skipTest('Calibri/Cambria are not installed')
+        self.view.close_doc()
+        with pymupdf.open() as doc:
+            page = doc.new_page()
+            page.insert_font(fontname='frontcalibri', fontfile=calibri)
+            page.insert_font(fontname='frontcambria', fontfile=cambria)
+            page.insert_text((72, 100), 'LEFT', fontname='frontcalibri',
+                             fontsize=11, color=(1, 0, 0))
+            page.insert_text((110, 100), 'RIGHT', fontname='frontcambria',
+                             fontsize=17, color=(0, 0, 1))
+            page.insert_text((72, 150), 'NEXT', fontname='frontcalibri',
+                             fontsize=13, color=(0, 0.5, 0))
+            doc.save(self.path)
+        self.assertTrue(self.view.load(self.path))
+
+        # 同行前方：取最靠近点击点的 RIGHT/Cambria。
+        same = self.view._detect_format_at(0, QPointF(180, 95))
+        self.assertEqual(same['family'], 'Cambria')
+        self.assertAlmostEqual(same['size'], 17, delta=0.1)
+        self.assertEqual(same['color'].blue(), 255)
+
+        # 新行左侧没有前方文字：先继承上一行最后一段 Cambria。
+        previous = self.view._detect_format_at(0, QPointF(40, 145))
+        self.assertEqual(previous['family'], 'Cambria')
+        self.assertAlmostEqual(previous['size'], 17, delta=0.1)
+
+        # 页面顶部无前方/上一行：最后才使用下一行首段 Calibri。
+        following = self.view._detect_format_at(0, QPointF(40, 35))
+        self.assertEqual(following['family'], 'Calibri')
+        self.assertAlmostEqual(following['size'], 11, delta=0.1)
+
+        self.view.set_mode('text')
+        self.view._begin_inplace_text(0, QPointF(180, 95))
+        self.assertEqual(self.view._inplace_meta['family'], 'Cambria')
+        self.assertAlmostEqual(self.view._inplace_meta['size'], 17, delta=0.1)
+        self.view._commit_inplace_text(commit=False)
+
+    def test_mixed_text_replacement_inherits_preceding_format(self):
+        from rich_text import RichEditBox, single_run
+        edit = RichEditBox()
+        edit.set_runs(
+            single_run('AA', 'Calibri', 10, QColor('red')) +
+            single_run('BB', 'Cambria', 18, QColor('blue')))
+
+        # 混排边界插入：位置 2 的前方是 Calibri。
+        cur = edit.textCursor()
+        cur.setPosition(2)
+        edit.setTextCursor(cur)
+        edit.sync_typing_format_from_cursor()
+        edit.insertPlainText('X')
+        inserted = next(r for r in edit.to_runs() if 'X' in r['text'])
+        self.assertEqual(inserted['family'], 'Calibri')
+        self.assertAlmostEqual(inserted['size'], 10, delta=0.01)
+        self.assertEqual(inserted['color'].name(), QColor('red').name())
+
+        # 从首位替换选区：没有前方字符，继承原首字符而非默认字体。
+        edit.set_runs(
+            single_run('AA', 'Calibri', 10, QColor('red')) +
+            single_run('BB', 'Cambria', 18, QColor('blue')))
+        cur = edit.textCursor()
+        cur.setPosition(0)
+        cur.setPosition(2, QTextCursor.MoveMode.KeepAnchor)
+        edit.setTextCursor(cur)
+        edit.insertPlainText('中')
+        first = edit.to_runs()[0]
+        self.assertEqual(first['family'], 'Calibri')
+        self.assertAlmostEqual(first['size'], 10, delta=0.01)
+        edit.deleteLater()
+
+    def test_add_text_keeps_vertical_position_after_bake(self):
+        """新增文字保存后，其 PDF 行顶应仍位于用户点击的 y 坐标。"""
+        family = 'Candara'
+        if not self.view._system_font_file(family):
+            family = 'Microsoft YaHei'
+        if not self.view._system_font_file(family):
+            self.skipTest('No embeddable test font is installed')
+        top = 220.0
+        self.view._add_text_object(
+            'POSITION', 0, QPointF(72, top), family, 18,
+            QColor('black'), keep_mode=True)
+        obj = self.view.objects[-1]
+        self.assertAlmostEqual(obj['rect'].top(), top, places=3)
+        self.view._bake_objects()
+        span = next(s for b in self.view.doc[0].get_text('dict')['blocks']
+                    for line in b.get('lines', []) for s in line['spans']
+                    if s['text'] == 'POSITION')
+        self.assertAlmostEqual(float(span['bbox'][1]), top, delta=0.35)
 
     def test_save_result_and_cancel(self):
         self.view.modified = True

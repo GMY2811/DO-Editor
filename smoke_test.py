@@ -118,6 +118,28 @@ def main():
     os.remove(secure_path)
     print("[OK] AES-256 密码验证 + PDF 权限")
 
+    # 仅所有者密码（打开密码留空）：任何人可无密码打开，但认证级别
+    # 必须是 user 级(2)，绝不能是 owner 级(4)——上层据此要求输入原
+    # 所有者密码才允许重设权限，防止绕过保护覆盖权限字典。
+    owner_only = os.path.join(
+        tempfile.gettempdir(), f"do-editor-owner-only-{os.getpid()}.pdf")
+    owner_src = pymupdf.open()
+    owner_src.new_page().insert_text((40, 60), "SECRET-OWNER-ONLY")
+    owner_src.save(
+        owner_only, encryption=pymupdf.PDF_ENCRYPT_AES_256,
+        user_pw="", owner_pw="owner-secret",
+        permissions=backend.pdf_permissions(True, False, False, True))
+    owner_src.close()
+    opened = backend.open_pdf(owner_only)          # 无密码直接打开
+    assert opened._do_auth_level == 2              # user 级，非 owner
+    assert not (opened._do_auth_level & 4)
+    opened.close()
+    as_owner = backend.open_pdf(owner_only, "owner-secret")
+    assert as_owner._do_auth_level == 4            # owner 级
+    as_owner.close()
+    os.remove(owner_only)
+    print("[OK] 仅所有者密码文件的认证级别（安全 BUG 回归）")
+
     page = d[0]
     backend.add_highlight(page, pymupdf.Rect(50, 50, 200, 80))
     backend.add_underline(page, pymupdf.Rect(50, 90, 200, 110), (0.0, 0.0, 1.0))
@@ -227,6 +249,9 @@ def main():
     assert win.current_view().start_title.text() == "DO Editor"
     assert win.current_view().start_open_btn.text() == "Open Document"
     assert win.act["watermark"].text() == "Add Watermark"
+    assert win.act["modify_watermark"].text() == "Modify Watermark"
+    assert win.act["delete_watermark"].text() == "Delete Watermark"
+    assert win.act["detect_watermark"].text() == "Detect Suspected Watermarks"
     assert win.act["sign"].text() == "Signature Design"
     assert win.act["sidebar_default"].text() == "Show Sidebar by Default"
     watermark_dialog = AddWatermarkDialog(win)
@@ -276,6 +301,22 @@ def main():
     view = win.current_view()
     assert view.doc is not None
     assert view.page_view.page_count() == 5
+    assert win.mode_actions["replace_text"].text() == "编辑模式"
+    # 搜索框清空按钮/手工删空文本后，全部匹配和当前定位色块立即解除。
+    win.search_edit.setText("page")
+    win._do_search()
+    assert view._search_results
+    assert view.page_view._search_all
+    win.search_edit.clear()
+    app.processEvents()
+    assert not view._search_results
+    assert not view.page_view._search_all
+    assert view.page_view._search_current is None
+    # 前半段后端测试已在 sample 中写入原生批注；GUI 基础对象测试需从
+    # 空的浮动对象集合开始。批注重载本身由 test_annotations.py 覆盖。
+    view.objects = []
+    view._obj_counter = 0
+    view._refresh_objects()
     # 缩略图异步分批生成：驱动事件循环直到全部生成（超大 PDF 不冻结 UI）。
     for _ in range(100):
         app.processEvents()
@@ -435,6 +476,9 @@ def main():
     assert view.thumb_list.defaultDropAction() == Qt.DropAction.MoveAction
     reorder_view = DocumentView()
     assert reorder_view.load(sample)
+    reorder_view.objects = []
+    reorder_view._obj_counter = 0
+    reorder_view._refresh_objects()
     reorder_view.objects.append({
         "id": 999, "page": 0, "rect": QRectF(10, 10, 40, 20),
         "text": "reorder", "color": QColor(0, 0, 0), "fontsize": 12,
@@ -452,6 +496,9 @@ def main():
     reorder_view.close_doc()
     annotation_view = DocumentView()
     assert annotation_view.load(sample)
+    annotation_view.objects = []
+    annotation_view._obj_counter = 0
+    annotation_view._refresh_objects()
     for mode, rect in (
             ("highlight", QRectF(70, 80, 150, 24)),
             ("underline", QRectF(70, 120, 150, 20)),
@@ -472,6 +519,7 @@ def main():
     assert annotation_view.objects[-1]["kind"] == "ink"
     assert len(annotation_view.objects) == 6
     rect_object = next(o for o in annotation_view.objects if o["kind"] == "rect")
+    annotation_view.set_mode("replace_text")
     annotation_view.page_view.select(rect_object["id"])
     annotation_view.delete_selected()
     assert len(annotation_view.objects) == 5
@@ -488,6 +536,9 @@ def main():
     annotation_view.close_doc()
     note_view = DocumentView()
     assert note_view.load(sample)
+    note_view.objects = []
+    note_view._obj_counter = 0
+    note_view._refresh_objects()
     assert note_view._add_note_at("界面批注测试", 0, QPointF(80, 120))
     assert note_view.modified
     note_object = note_view.objects[-1]
@@ -562,6 +613,14 @@ def main():
     assert not win.act["annotation"].icon().isNull()
     assert not win.act["ocr_current"].icon().isNull()
     assert not win.act["ocr_toolbar"].icon().isNull()
+    # 所有下拉菜单功能（含二级菜单入口）都应有图标，避免工具栏
+    # 溢出后出现部分空白图标列。
+    for menu in (win._m_file, win._m_edit, win._m_tools, win._m_sign,
+                 win._m_view, win._m_theme, win._m_lang, win._m_help,
+                 win._m_signature_tools, win._m_ocr):
+        for action in menu.actions():
+            if not action.isSeparator():
+                assert not action.icon().isNull(), (menu.title(), action.text())
     print("[OK] OCR 工具菜单")
     assert win._m_sign.title() == "安全"
     assert win.act["sign"] not in win._m_sign.actions()
@@ -719,6 +778,10 @@ def main():
     assert win.act["split_every"] not in win.tb1.actions()
     assert win.act["merge"] in win._m_tools.actions()
     assert win.act["split_every"] in win._m_tools.actions()
+    assert win.act["modify_watermark"] in win._m_tools.actions()
+    assert win.act["delete_watermark"] in win._m_tools.actions()
+    # 疑似水印检测已自动并入修改/删除，不再暴露额外菜单步骤。
+    assert win.act["detect_watermark"] not in win._m_tools.actions()
     assert sum(action is win.act["watermark"]
                for toolbar in (win.tb1, win.tb2)
                for action in toolbar.actions()) == 1
@@ -851,7 +914,7 @@ def main():
     view.set_mode("text")
     view._add_text_object("双击修改", 0, _QPF(100, 100), keep_mode=True)
     text_obj = view.objects[-1]
-    view.set_mode("text")
+    view.set_mode("replace_text")
     text_pos = _QPF(
         (text_obj["rect"].center().x()) * pv._zoom,
         pv._offsets[0] + text_obj["rect"].center().y() * pv._zoom)

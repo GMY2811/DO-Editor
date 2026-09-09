@@ -20,7 +20,7 @@ import os
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QTimer
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QPalette,
                            QTextBlockFormat, QTextCharFormat, QTextCursor,
-                           QTextFormat, QPainter, QPen)
+                           QTextFormat, QPainter, QPen, QPolygonF)
 from PySide6.QtWidgets import (QColorDialog, QDialog, QDoubleSpinBox,
                                QFontComboBox, QFrame, QHBoxLayout, QLabel,
                                QPushButton, QTextEdit, QVBoxLayout)
@@ -251,6 +251,10 @@ class RichEditBox(QTextEdit):
         self._scale = 1.0              # 屏幕像素 = pt * scale
         self._suppress_focusout = 0
         self._text_visible = True      # set_text_visible 状态，paintEvent 用
+        # 仅记录用户通过格式工具发起的变更。QTextDocument 的
+        # contentsChanged 无法区分“改文字”和“只改格式”，文档层需要这个
+        # 标记决定是否还能走只替换 Tj/TJ 字形编码的原格式保真路径。
+        self._format_revision = 0
         # 基准格式：setText/程序化整文替换时沿用（空文档光标 charFormat
         # 读取在某些平台/空文档上会触发原生崩溃，故自行记录）
         self._base_fmt = {
@@ -396,17 +400,26 @@ class RichEditBox(QTextEdit):
     def sync_typing_format_from_cursor(self):
         """把光标处字符格式同步为后续输入格式。
 
-        就地编辑在彩色/斜体等行内中间继续输入时，若不设置，新键入字符
-        会退化为控件默认样式。空文档则沿用 set_default_format 的基准格式。
+        继承顺序固定为光标/选区前一字符；前方无字符时取当前位置（通常
+        是首字符）。这避免混排 span 边界和整段替换时 Qt 自行取到右侧
+        或控件默认字体。空文档沿用 set_default_format 的基准格式。
         """
         if not self.toPlainText():
             self.set_default_format(self._base_fmt)
             return
-        try:
-            cf = self.textCursor().charFormat()
-        except Exception:
-            return
+        cur = self.textCursor()
+        pos = cur.selectionStart() if cur.hasSelection() else cur.position()
+        char_pos = pos - 1 if pos > 0 else 0
+        cf = self._char_format_at(char_pos)
+        if not self._fmt_family(cf):
+            cf = self._char_format(self._base_fmt)
         self.setCurrentCharFormat(cf)
+
+    def insertPlainText(self, text):
+        """替换选区时显式继承选区前方（首位则首字符）的原格式。"""
+        if self.textCursor().hasSelection():
+            self.sync_typing_format_from_cursor()
+        super().insertPlainText(text)
 
     def set_default_format(self, fmt):
         """设置空文档/后续输入的默认字符格式（不改变已有内容）。
@@ -538,6 +551,9 @@ class RichEditBox(QTextEdit):
                 1.0, float(size_pt) * self._scale / _PX_PER_PT))
         if color is not None:
             cf.setForeground(QBrush(QColor(color)))
+        # 必须在 merge 之前递增：Qt 会在 mergeCurrentCharFormat 内同步发出
+        # contentsChanged，文档层的槽函数需在那一刻就知道这是格式修改。
+        self._format_revision += 1
         # mergeCurrentCharFormat：有选区时并入选中字符，
         # 无选区时并入当前字符格式——均同步为后续输入样式，不会整体替换
         self.mergeCurrentCharFormat(cf)
@@ -681,6 +697,8 @@ class RichEditBox(QTextEdit):
                 click_cur.clearSelection()
                 self.setTextCursor(click_cur)
         super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.sync_typing_format_from_cursor()
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -692,6 +710,8 @@ class RichEditBox(QTextEdit):
             self.cancelRequested.emit()
             event.accept()
             return
+        if event.text() and self.textCursor().hasSelection():
+            self.sync_typing_format_from_cursor()
         super().keyPressEvent(event)
 
     def insertFromMimeData(self, source):
@@ -813,9 +833,11 @@ class PdfRowEditBox(RichEditBox):
                     cur.setPosition(hit.position(), QTextCursor.MoveMode.KeepAnchor)
                     hit = cur
                 self.setTextCursor(hit)
+                self.sync_typing_format_from_cursor()
                 self._pdf_dragging = True
             elif not inside:
                 self.setTextCursor(hit)
+                self.sync_typing_format_from_cursor()
             self.setFocus()
             event.accept()
             return
@@ -842,6 +864,56 @@ class PdfRowEditBox(RichEditBox):
         self.setTextCursor(cur)
         self._pdf_dragging = False
         event.accept()
+
+
+class VisibleArrowFontComboBox(QFontComboBox):
+    """始终绘制清晰下拉三角的字体框。
+
+    Windows 主题或全局 QSS 有时会把原生 QComboBox 箭头隐藏；箭头直接画在
+    控件前景层，不依赖主题图片，同时保留原生下拉按钮的点击行为。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setToolTip("选择文字字体；点击右侧三角展开字体列表")
+        self.setMinimumHeight(34)
+        self.setStyleSheet(
+            "QFontComboBox { padding-right: 30px; }"
+            "QFontComboBox::drop-down { width: 30px; border: none; }"
+            "QFontComboBox::down-arrow { image: none; width: 0; height: 0; }")
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        palette = self.palette()
+        group = (QPalette.ColorGroup.Active if self.isEnabled()
+                 else QPalette.ColorGroup.Disabled)
+        color = QColor(palette.color(group, QPalette.ColorRole.Text))
+        if not color.isValid() or color.alpha() < 80:
+            color = QColor("#f5f7fa" if palette.color(
+                QPalette.ColorRole.Base).lightness() < 128 else "#20252d")
+        background = palette.color(QPalette.ColorRole.Base)
+        # 前景随主题变化；反差描边取相反明暗，深色主题显示亮箭头，
+        # 浅色主题显示深箭头。
+        outline = QColor(0, 0, 0, 210) if color.lightness() > 150 \
+            else QColor(255, 255, 255, 220)
+        divider = QColor(palette.color(QPalette.ColorRole.Mid))
+        divider.setAlpha(150)
+        painter.setPen(QPen(divider, 1.0))
+        painter.drawLine(self.width() - 30, 6,
+                         self.width() - 30, self.height() - 6)
+        painter.setBrush(QBrush(color))
+        cx = float(self.width() - 14)
+        cy = float(self.height()) / 2.0 + 1.0
+        painter.setPen(QPen(outline, 1.2, Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap,
+                            Qt.PenJoinStyle.RoundJoin))
+        painter.drawPolygon(QPolygonF([
+            QPointF(cx - 6.5, cy - 4.0),
+            QPointF(cx + 6.5, cy - 4.0),
+            QPointF(cx, cy + 4.5),
+        ]))
 
 
 class FormatDialog(QDialog):
@@ -871,7 +943,7 @@ class FormatDialog(QDialog):
         row_font.setSpacing(8)
         lbl_font = QLabel("字体")
         row_font.addWidget(lbl_font)
-        self.font_combo = QFontComboBox()
+        self.font_combo = VisibleArrowFontComboBox()
         self.font_combo.setObjectName("textFormatFont")
         self.font_combo.setEditable(True)
         fam = (fmt.get("family") or "").strip()
@@ -889,6 +961,7 @@ class FormatDialog(QDialog):
         self.font_combo.editTextChanged.connect(self._sync_family)
         self.font_combo.currentFontChanged.connect(
             lambda f: self._sync_family(f.family()))
+        self.font_combo.activated.connect(lambda _index: self._sync_family())
         row_font.addWidget(self.font_combo, 1)
         lay.addLayout(row_font)
 
@@ -985,6 +1058,9 @@ class FormatDialog(QDialog):
 
     def result_format(self):
         """返回 {family,size,color,bold,italic}，供调用方应用到选区。"""
+        # 可编辑 QFontComboBox 使用键盘输入/输入法后，currentFontChanged 在
+        # 个别 Qt/Windows 组合下不会触发；确认时以当前可见文本为最终事实。
+        self._sync_family()
         return {
             "family": self._family or "Microsoft YaHei",
             "size": round(self.size_spin.value(), 2),

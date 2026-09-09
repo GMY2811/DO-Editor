@@ -1,8 +1,11 @@
 """连续滚动页面画布：多页垂直连续渲染 + 浮动对象 + 标注交互 + 右键菜单。"""
 from html import escape
+import math
 
 from PySide6.QtCore import Qt, QRectF, QPointF, QPoint, Signal
-from PySide6.QtGui import QImage, QPainter, QPen, QColor, QBrush, QFont, QFontMetrics
+from PySide6.QtGui import (QImage, QPainter, QPen, QColor, QBrush, QFont,
+                           QFontMetrics, QPolygonF, QCursor, QPixmap,
+                           QPainterPath)
 from PySide6.QtWidgets import QWidget, QLabel, QToolTip, QGraphicsDropShadowEffect
 
 import backend
@@ -24,6 +27,9 @@ class PageView(QWidget):
     # 对象拖动/缩放完成后同时发送新旧矩形，让文档层能把整次鼠标操作
     # 合并成一个可撤销步骤。
     objectChanged = Signal(object, QRectF, QRectF)
+    objectRotated = Signal(object, float, float)
+    pdfImageChanged = Signal(int, QRectF, QRectF)
+    pdfImageRotated = Signal(int, float)
     objectSelected = Signal(object)
     objectDoubleClicked = Signal(object)          # 双击对象（oid）
     contextMenuRequested = Signal(QPoint)
@@ -86,6 +92,15 @@ class PageView(QWidget):
         self._edit_lines = {}        # page -> [{rect(QRectF), text}]
         self._edit_hover = None      # (page, idx) 当前悬停的文字行
         self._edit_excl = None       # (page, QRectF PDF坐标) 就地编辑行：不铺框/不高亮
+        self._edit_selected = None   # (page, QRectF) 独立图片等页面对象选中框
+        self._edit_drag = None       # (page, pressPos, originalRect)
+        self._edit_rotation_preview = 0.0
+        self._edit_preview_record = None
+        self._edit_rotation_background = None
+        self._edit_rotation_source = None
+        self._edit_rotation_base_angle = 0.0
+        self._edit_rotation_base_size = None
+        self._rotation_cursor_cache = None
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -103,6 +118,11 @@ class PageView(QWidget):
         self._text_words = {}
         self._edit_lines.clear()
         self._edit_hover = None
+        self._edit_selected = None
+        self._edit_drag = None
+        self._edit_rotation_preview = 0.0
+        self._edit_preview_record = None
+        self._clear_edit_rotation_preview()
         self._objects = []
         self._selected = None
         self._drag = None
@@ -262,13 +282,20 @@ class PageView(QWidget):
 
     # ---------------- 整页文字框编辑（Acrobat 风格） ----------------
     def set_edit_overlay(self, active):
-        """开/关「修改文字」的可编辑文字行框（须配合 point 鼠标模式）。"""
+        """开/关“编辑模式”的文字、图片和签名对象层。"""
         active = bool(active)
+        if not active:
+            self._selected = None
+            self._drag = None
         if active == self._edit_overlay:
+            self.update()
             return
         self._edit_overlay = active
         self._edit_hover = None
         self._edit_excl = None
+        self._edit_selected = None
+        self._edit_drag = None
+        self._edit_rotation_preview = 0.0
         if not active:
             self._edit_lines.clear()
             self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -294,6 +321,140 @@ class PageView(QWidget):
         self._edit_excl = (int(page), QRectF(rect))
         self._edit_hover = None
         self.update()
+
+    def set_edit_selection(self, page=-1, rect=None, record=None):
+        """在编辑模式中标记一个可独立移动、缩放的页面对象。"""
+        self._edit_selected = (int(page), QRectF(rect)) if rect is not None else None
+        self._edit_preview_record = dict(record) if record is not None else None
+        self._edit_drag = None
+        self._edit_rotation_preview = 0.0
+        self._clear_edit_rotation_preview()
+        self.update()
+
+    def _clear_edit_rotation_preview(self):
+        self._edit_rotation_background = None
+        self._edit_rotation_source = None
+        self._edit_rotation_base_angle = 0.0
+        self._edit_rotation_base_size = None
+
+    def _prepare_edit_rotation_preview(self):
+        """缓存已保存 PDF 图片的无残影拖动底图及独立前景图。"""
+        if (not self._doc_open() or self._edit_preview_record is None or
+                self._edit_selected is None):
+            return False
+        preview = backend.pdf_image_rotation_preview(
+            self._doc, self._edit_preview_record, self._zoom, self._dpr)
+        if not preview:
+            return False
+        background = QImage.fromData(preview[0])
+        source = QImage.fromData(preview[1])
+        if background.isNull() or source.isNull():
+            return False
+        background.setDevicePixelRatio(self._dpr)
+        self._edit_rotation_background = background
+        self._edit_rotation_source = source
+        transform = list(self._edit_preview_record.get("transform") or [])
+        if len(transform) == 6:
+            a, b, c, d = (float(value) for value in transform[:4])
+            width = math.hypot(a, b)
+            height = math.hypot(c, d)
+            if width > 1e-7 and height > 1e-7:
+                self._edit_rotation_base_angle = math.degrees(math.atan2(b, a))
+                self._edit_rotation_base_size = (width, height)
+        return True
+
+    def _rotation_cursor(self):
+        """双向弯曲箭头旋转鼠标指针，深浅背景上均保持清晰。"""
+        if self._rotation_cursor_cache is not None:
+            return self._rotation_cursor_cache
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        upper = QPainterPath()
+        upper.moveTo(5.5, 15.0)
+        upper.cubicTo(6.5, 6.0, 21.0, 3.8, 26.0, 11.5)
+        lower = QPainterPath()
+        lower.moveTo(26.5, 17.0)
+        lower.cubicTo(24.8, 26.0, 10.0, 28.0, 5.0, 20.5)
+        # 白色外描边让指针在深色图片上不被吞没。
+        painter.setPen(QPen(QColor(255, 255, 255, 235), 4.8,
+                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawPath(upper)
+        painter.drawPath(lower)
+        painter.setPen(QPen(QColor(24, 73, 145), 2.4,
+                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawPath(upper)
+        painter.drawPath(lower)
+        painter.setPen(Qt.PenStyle.NoPen)
+        # 两端箭头方向相反：上方顺时针，下方逆时针。
+        painter.setBrush(QColor(255, 255, 255, 235))
+        painter.drawPolygon(QPolygonF([
+            QPointF(19.0, 8.0), QPointF(28.8, 12.2), QPointF(24.2, 2.7)]))
+        painter.drawPolygon(QPolygonF([
+            QPointF(13.0, 23.0), QPointF(3.0, 19.5), QPointF(8.2, 28.7)]))
+        painter.setBrush(QColor(24, 73, 145))
+        painter.drawPolygon(QPolygonF([
+            QPointF(20.5, 8.5), QPointF(27.2, 11.6), QPointF(24.0, 5.1)]))
+        painter.drawPolygon(QPolygonF([
+            QPointF(11.5, 22.5), QPointF(4.7, 20.0), QPointF(8.3, 26.3)]))
+        painter.end()
+        self._rotation_cursor_cache = QCursor(pixmap, 16, 16)
+        return self._rotation_cursor_cache
+
+    @staticmethod
+    def _rotate_widget_point(point, center, degrees):
+        angle = math.radians(float(degrees))
+        cosine, sine = math.cos(angle), math.sin(angle)
+        dx, dy = point.x() - center.x(), point.y() - center.y()
+        return QPointF(center.x() + cosine * dx - sine * dy,
+                       center.y() + sine * dx + cosine * dy)
+
+    @classmethod
+    def _rotated_rect_points(cls, rect, degrees=0.0):
+        center = rect.center()
+        return [cls._rotate_widget_point(point, center, degrees)
+                for point in (rect.topLeft(), rect.topRight(),
+                              rect.bottomRight(), rect.bottomLeft())]
+
+    @classmethod
+    def _rotation_handle_point(cls, rect, degrees=0.0):
+        point = QPointF(rect.center().x(), rect.top() - 24.0)
+        return cls._rotate_widget_point(point, rect.center(), degrees)
+
+    def _edit_rotation_handle_at(self, pos):
+        if self._edit_selected is None:
+            return False
+        page, rect = self._edit_selected
+        point = self._rotation_handle_point(self._widget_rect(page, rect))
+        return self._dist(pos, point) <= 10.0
+
+    def _edit_selection_handle_at(self, pos):
+        if self._edit_selected is None:
+            return None
+        page, rect = self._edit_selected
+        for index, point in enumerate(self._handles(self._widget_rect(page, rect))):
+            delta = pos - point
+            if abs(delta.x()) + abs(delta.y()) <= 10:
+                return index
+        return None
+
+    def _resize_edit_selection(self, page, original, handle, pos):
+        """按八个控制点自由调整 PDF 图片矩形，最小边长 6pt。"""
+        px = float(pos.x() / self._zoom)
+        py = float((pos.y() - self._offsets[page]) / self._zoom)
+        left, top = float(original.left()), float(original.top())
+        right, bottom = float(original.right()), float(original.bottom())
+        minimum = 6.0
+        if handle in (0, 3, 6):
+            left = min(px, right - minimum)
+        if handle in (1, 2, 7):
+            right = max(px, left + minimum)
+        if handle in (0, 1, 4):
+            top = min(py, bottom - minimum)
+        if handle in (2, 3, 5):
+            bottom = max(py, top + minimum)
+        return QRectF(left, top, right - left, bottom - top)
 
     def rerender_page_region(self, page, pdf_rect, pad=1.5):
         """就地编辑后按当前文档内容重新渲染页面上一个小区域（PDF 坐标）。
@@ -434,6 +595,7 @@ class PageView(QWidget):
                             "italic": si,
                         })
                     out.append({
+                        "kind": "text",
                         "rect": QRectF(x0, y0, x1 - x0, y1 - y0),
                         "erase": erase,
                         "origin": origin,
@@ -453,6 +615,22 @@ class PageView(QWidget):
                             "italic": italic,
                         },
                     })
+            # Acrobat 的“编辑 PDF”会同时显示可独立操作的图片对象。这里只
+            # 加入由单一内容流承载的图片，因此 Delete 的删除单位明确，
+            # 不会误伤同一内容流中的正文或组合图形。
+            try:
+                for record in backend.isolated_image_objects(self._doc, page):
+                    rb = record.get("rect")
+                    if rb and len(rb) == 4:
+                        out.append({
+                            "kind": "image",
+                            "rect": QRectF(float(rb[0]), float(rb[1]),
+                                           float(rb[2]) - float(rb[0]),
+                                           float(rb[3]) - float(rb[1])),
+                            "text": "", "record": record,
+                        })
+            except Exception:
+                pass
         self._edit_lines[page] = out
         return out
 
@@ -475,8 +653,16 @@ class PageView(QWidget):
             return None
         page = self._page_at(pos.y())
         pt = self._pdf_point(pos)[1]
-        for idx, ln in enumerate(self._edit_line_hits(page)):
-            if ln["rect"].contains(pt):
+        hits = self._edit_line_hits(page)
+        # 图片对象在列表尾部；图片仍按顶层优先选择。文字则按内容流的
+        # 原始顺序选择，避免曾经编辑产生的后置覆盖文字挡住原字体对象，
+        # 导致再次编辑时不断退化为 Helvetica / Arial。
+        for idx in range(len(hits) - 1, -1, -1):
+            ln = hits[idx]
+            if ln.get("kind") == "image" and ln["rect"].contains(pt):
+                return (page, idx)
+        for idx, ln in enumerate(hits):
+            if ln.get("kind") != "image" and ln["rect"].contains(pt):
                 return (page, idx)
         return None
 
@@ -501,19 +687,26 @@ class PageView(QWidget):
                 return o
         return None
 
-    def _object_at(self, pos):
+    def _object_at(self, pos, allowed_kinds=None):
         for o in reversed(self._objects):
-            hit_rect = self._widget_rect(o["page"], o["rect"])
-            # 图标视觉尺寸缩小后仍保留舒适的鼠标命中范围。
-            if o.get("kind") == "note":
-                hit_rect = hit_rect.adjusted(-5, -5, 5, 5)
             kind = o.get("kind")
+            if allowed_kinds is not None and kind not in allowed_kinds:
+                continue
+            hit_rect = self._widget_rect(o["page"], o["rect"])
+            test_pos = QPointF(pos)
+            if (kind in ("image", "signature") and
+                    abs(float(o.get("rotation", 0.0))) > 1e-7):
+                test_pos = self._rotate_widget_point(
+                    test_pos, hit_rect.center(), -float(o.get("rotation", 0.0)))
+            # 图标视觉尺寸缩小后仍保留舒适的鼠标命中范围。
+            if kind == "note":
+                hit_rect = hit_rect.adjusted(-5, -5, 5, 5)
             if kind in ("line", "ink"):
                 points = self._annotation_widget_points(o, hit_rect)
-                if any(self._distance_to_segment(pos, points[i], points[i + 1]) <= 6
+                if any(self._distance_to_segment(test_pos, points[i], points[i + 1]) <= 6
                        for i in range(len(points) - 1)):
                     return o
-            elif hit_rect.contains(pos):
+            elif hit_rect.contains(test_pos):
                 return o
         return None
 
@@ -556,11 +749,28 @@ class PageView(QWidget):
         # 8 个缩放手柄会遮挡图形，也会让拖动命中变得困难。
         if obj.get("kind") == "note":
             return None
-        for i, c in enumerate(self._handles(self._widget_rect(obj["page"], obj["rect"]))):
+        rect = self._widget_rect(obj["page"], obj["rect"])
+        points = self._handles(rect)
+        if obj.get("kind") in ("image", "signature"):
+            points = [self._rotate_widget_point(
+                point, rect.center(), float(obj.get("rotation", 0.0)))
+                      for point in points]
+        for i, c in enumerate(points):
             d = pos - c
             if abs(d.x()) + abs(d.y()) <= 9:
                 return i
         return None
+
+    def _object_rotation_handle_at(self, pos):
+        if self._selected is None:
+            return False
+        obj = self._find(self._selected)
+        if obj is None or obj.get("kind") not in ("image", "signature"):
+            return False
+        rect = self._widget_rect(obj["page"], obj["rect"])
+        point = self._rotation_handle_point(
+            rect, float(obj.get("rotation", 0.0)))
+        return self._dist(pos, point) <= 10.0
 
     # ---------------- 绘制 ----------------
     def paintEvent(self, event):
@@ -578,6 +788,34 @@ class PageView(QWidget):
                 if img is not None:
                     dpr = img.devicePixelRatio() or 1.0
                     p.drawImage(QRectF(0, o, img.width() / dpr, img.height() / dpr), img)
+
+            # 已保存的图片属于页面位图。旋转拖动时用“移除目标图片”的缓存
+            # 页面覆盖当前页，再把目标图片作为独立前景实时旋转。
+            if (self._edit_drag is not None and self._edit_drag[0] == "rotate" and
+                    self._edit_rotation_background is not None and
+                    self._edit_rotation_source is not None and
+                    self._edit_selected is not None):
+                sp, sr = self._edit_selected
+                bg = self._edit_rotation_background
+                bg_dpr = bg.devicePixelRatio() or 1.0
+                p.drawImage(QRectF(0, self._offsets[sp],
+                                   bg.width() / bg_dpr, bg.height() / bg_dpr), bg)
+                wr = self._widget_rect(sp, sr)
+                if self._edit_rotation_base_size is not None:
+                    preview_width = self._edit_rotation_base_size[0] * self._zoom
+                    preview_height = self._edit_rotation_base_size[1] * self._zoom
+                    target = QRectF(wr.center().x() - preview_width / 2.0,
+                                    wr.center().y() - preview_height / 2.0,
+                                    preview_width, preview_height)
+                else:
+                    target = wr
+                p.save()
+                p.translate(wr.center())
+                p.rotate(self._edit_rotation_base_angle +
+                         self._edit_rotation_preview)
+                p.translate(-wr.center())
+                p.drawImage(target, self._edit_rotation_source)
+                p.restore()
 
             # 文本选择高亮
             if self._sel_words and self._sel_page is not None:
@@ -630,9 +868,43 @@ class PageView(QWidget):
                         p.setBrush(Qt.BrushStyle.NoBrush)
                         p.drawRect(wr)
 
+                # 独立页面对象（目前主要是图片）的 Acrobat 式选中框。
+                if self._edit_selected is not None:
+                    sp, sr = self._edit_selected
+                    if 0 <= sp < len(self._doc):
+                        wr = self._widget_rect(sp, sr)
+                        p.setPen(QPen(_ACCENT, 2.0, Qt.PenStyle.SolidLine))
+                        p.setBrush(Qt.BrushStyle.NoBrush)
+                        points = self._rotated_rect_points(
+                            wr, self._edit_rotation_preview)
+                        p.drawPolygon(QPolygonF(points))
+                        hs = 7.0
+                        handles = self._handles(wr)
+                        if abs(self._edit_rotation_preview) > 1e-7:
+                            handles = [self._rotate_widget_point(
+                                point, wr.center(), self._edit_rotation_preview)
+                                       for point in handles]
+                        for c in handles:
+                            p.setPen(QPen(_ACCENT, 1.2))
+                            p.setBrush(QBrush(QColor(255, 255, 255)))
+                            p.drawRect(QRectF(c.x() - hs / 2, c.y() - hs / 2,
+                                             hs, hs))
+                        top_mid = QPointF((points[0].x() + points[1].x()) / 2,
+                                          (points[0].y() + points[1].y()) / 2)
+                        rotate_handle = self._rotation_handle_point(
+                            wr, self._edit_rotation_preview)
+                        p.setPen(QPen(_ACCENT, 1.4))
+                        p.drawLine(top_mid, rotate_handle)
+                        p.setBrush(QBrush(QColor(255, 255, 255)))
+                        p.drawEllipse(rotate_handle, 5.0, 5.0)
+
             for obj in self._objects:
                 wr = self._widget_rect(obj["page"], obj["rect"])
                 kind = obj.get("kind")
+                # 已存在于 PDF 中的原生批注由 MuPDF 页面位图绘制。这里的
+                # 对象只是交互代理，再画一次会令高亮加深、线条变粗。
+                if obj.get("native_proxy"):
+                    continue
                 if kind == "text":
                     p.setPen(QPen(_PLACEHOLDER, 1.6, Qt.PenStyle.DashLine))
                     p.setBrush(Qt.BrushStyle.NoBrush)
@@ -686,6 +958,12 @@ class PageView(QWidget):
                             p.drawLine(points[i], points[i + 1])
                 else:
                     opacity = float(obj.get("opacity", 1.0))
+                    angle = float(obj.get("rotation", 0.0))
+                    if abs(angle) > 1e-7:
+                        p.save()
+                        p.translate(wr.center())
+                        p.rotate(angle)
+                        p.translate(-wr.center())
                     if opacity >= 1.0:
                         p.drawImage(wr, obj["img"])
                     else:
@@ -693,22 +971,46 @@ class PageView(QWidget):
                         p.setOpacity(opacity)
                         p.drawImage(wr, obj["img"])
                         p.setOpacity(prev)
+                    if abs(angle) > 1e-7:
+                        p.restore()
 
-            if self._selected is not None:
+            selected_obj = (self._find(self._selected)
+                            if self._selected is not None else None)
+            edit_selection = self._edit_overlay and self._mode == "point"
+            annotation_selection = (
+                self._mode == "view" and selected_obj is not None and
+                selected_obj.get("kind") in ({"note"} | _ANNOTATION_KINDS))
+            if ((edit_selection or annotation_selection) and
+                    self._selected is not None):
                 obj = self._find(self._selected)
                 # 批注图标本身已经足够醒目，选中时不再额外绘制外框；
                 # 选中状态仍保留，因此拖动、编辑和删除操作不受影响。
                 if obj is not None and obj.get("kind") != "note":
                     wr = self._widget_rect(obj["page"], obj["rect"])
+                    angle = (float(obj.get("rotation", 0.0))
+                             if obj.get("kind") in ("image", "signature") else 0.0)
+                    points = self._rotated_rect_points(wr, angle)
                     p.setPen(QPen(_ACCENT, 1.4, Qt.PenStyle.SolidLine))
                     p.setBrush(Qt.BrushStyle.NoBrush)
-                    p.drawRect(wr)
+                    p.drawPolygon(QPolygonF(points))
                     hs = 7.0
-                    for c in self._handles(wr):
+                    handles = self._handles(wr)
+                    if abs(angle) > 1e-7:
+                        handles = [self._rotate_widget_point(
+                            point, wr.center(), angle) for point in handles]
+                    for c in handles:
                         p.setPen(QPen(_ACCENT, 1.2))
                         p.setBrush(QBrush(QColor(255, 255, 255)))
                         p.drawRect(QRectF(
                             c.x() - hs / 2, c.y() - hs / 2, hs, hs))
+                    if obj.get("kind") in ("image", "signature"):
+                        top_mid = QPointF((points[0].x() + points[1].x()) / 2,
+                                          (points[0].y() + points[1].y()) / 2)
+                        rotate_handle = self._rotation_handle_point(wr, angle)
+                        p.setPen(QPen(_ACCENT, 1.4))
+                        p.drawLine(top_mid, rotate_handle)
+                        p.setBrush(QBrush(QColor(255, 255, 255)))
+                        p.drawEllipse(rotate_handle, 5.0, 5.0)
 
             if self._drawing and self._mode != "view":
                 p.setPen(QPen(QColor(200, 60, 60), 1.5, Qt.PenStyle.DashLine))
@@ -797,36 +1099,80 @@ class PageView(QWidget):
             return
         self._hide_note_tooltip()
         pos = e.position()
+        if (self._mode == "point" and self._edit_overlay and
+                self._edit_selected is not None):
+            page, rect = self._edit_selected
+            if self._edit_rotation_handle_at(pos):
+                center = self._widget_rect(page, rect).center()
+                start_angle = math.degrees(math.atan2(
+                    pos.y() - center.y(), pos.x() - center.x()))
+                self._edit_drag = ("rotate", start_angle, page,
+                                   QPointF(pos), QRectF(rect))
+                self._edit_rotation_preview = 0.0
+                self._prepare_edit_rotation_preview()
+                self.setCursor(self._rotation_cursor())
+                self.update()
+                return
+            handle = self._edit_selection_handle_at(pos)
+            if handle is not None:
+                self._edit_drag = ("resize", handle, page,
+                                   QPointF(pos), QRectF(rect))
+                self.update()
+                return
+            if self._widget_rect(page, rect).contains(pos):
+                self._edit_drag = ("move", None, page,
+                                   QPointF(pos), QRectF(rect))
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.update()
+                return
         if self._mode == "view":
-            h = self._handle_at(pos)
-            if h is not None:
-                obj = self._find(self._selected)
-                self._drag = ("resize", h, pos, QRectF(obj["rect"]), obj["page"])
+            # 阅读模式允许直接操作批注，但图片、签名和文字对象仍只在
+            # “编辑模式”激活。优先检查已选批注的控制点，再检查批注本体。
+            annotation_kinds = {"note"} | _ANNOTATION_KINDS
+            selected_obj = self._find(self._selected)
+            if (selected_obj is not None and
+                    selected_obj.get("kind") in annotation_kinds):
+                h = self._handle_at(pos)
+                if h is not None:
+                    self._drag = ("resize", h, pos,
+                                  QRectF(selected_obj["rect"]),
+                                  selected_obj["page"])
+                    self.update()
+                    return
+            obj = self._object_at(pos, annotation_kinds)
+            if obj is not None:
+                self._selected = obj["id"]
+                self.objectSelected.emit(obj["id"])
+                self._drag = ("move", None, pos, QRectF(obj["rect"]), obj["page"])
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.update()
+                return
+            self._selected = None
+            if self._point_hits_text(pos):
+                self._selecting = True
+                self._sel_start = pos
+                self._sel_cur = pos
+                self._sel_words = []
+                self._sel_page = self._page_at(pos.y())
             else:
-                obj = self._object_at(pos)
-                if obj is not None:
-                    self._selected = obj["id"]
-                    self.objectSelected.emit(obj["id"])
-                    self._drag = ("move", None, pos, QRectF(obj["rect"]), obj["page"])
-                else:
-                    if self._selected is not None:
-                        self._selected = None
-                        self.objectSelected.emit(None)
-                    if self._point_hits_text(pos):
-                        # 从文字上按下仍保持原有滑动选择能力。
-                        self._selecting = True
-                        self._sel_start = pos
-                        self._sel_cur = pos
-                        self._sel_words = []
-                        self._sel_page = self._page_at(pos.y())
-                    else:
-                        # 页面空白、扫描件或页间区域使用抓手自由平移。
-                        self._pan_last = QPointF(e.globalPosition())
-                        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self._pan_last = QPointF(e.globalPosition())
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.update()
         else:
-            # point 模式（文本）：点手柄缩放、点对象拖动、点空白继续添加
-            if self._mode == "point":
+            # 只有编辑覆盖层开启时，point 模式才允许操作页面对象。
+            if self._mode == "point" and self._edit_overlay:
+                if self._object_rotation_handle_at(pos):
+                    obj = self._find(self._selected)
+                    wr = self._widget_rect(obj["page"], obj["rect"])
+                    start_angle = math.degrees(math.atan2(
+                        pos.y() - wr.center().y(),
+                        pos.x() - wr.center().x()))
+                    self._drag = (
+                        "rotate",
+                        (start_angle, float(obj.get("rotation", 0.0))),
+                        pos, QRectF(obj["rect"]), obj["page"])
+                    self.update()
+                    return
                 h = self._handle_at(pos)
                 if h is not None:
                     obj = self._find(self._selected)
@@ -850,7 +1196,26 @@ class PageView(QWidget):
 
     def mouseMoveEvent(self, e):
         pos = e.position()
-        if self._drag is not None:
+        if self._edit_drag is not None:
+            kind, handle, page, start, original = self._edit_drag
+            if kind == "move":
+                delta = pos - start
+                changed = QRectF(original).translated(
+                    delta.x() / self._zoom, delta.y() / self._zoom)
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            elif kind == "resize":
+                changed = self._resize_edit_selection(
+                    page, original, handle, pos)
+            else:
+                center = self._widget_rect(page, original).center()
+                angle = math.degrees(math.atan2(
+                    pos.y() - center.y(), pos.x() - center.x()))
+                self._edit_rotation_preview = angle - float(handle)
+                changed = QRectF(original)
+                self.setCursor(self._rotation_cursor())
+            self._edit_selected = (page, changed)
+            self.update()
+        elif self._drag is not None:
             kind, h, start, orig, page = self._drag
             if kind == "move":
                 delta = pos - start
@@ -859,6 +1224,12 @@ class PageView(QWidget):
                 self._apply_rect(self._selected, wr)
             elif kind == "resize":
                 off = self._offsets[page]
+                obj = self._find(self._selected)
+                if (obj is not None and obj.get("kind") in ("image", "signature")
+                        and abs(float(obj.get("rotation", 0.0))) > 1e-7):
+                    pos = self._rotate_widget_point(
+                        pos, self._widget_rect(page, orig).center(),
+                        -float(obj.get("rotation", 0.0)))
                 if h <= 3:
                     # 四角：等比缩放
                     corners = self._handles(self._widget_rect(page, orig))
@@ -895,6 +1266,15 @@ class PageView(QWidget):
                         new_w = max(6.0, px - orig.x())
                         self._apply_rect(self._selected,
                                          QRectF(orig.x(), orig.y(), new_w, orig.height()))
+            elif kind == "rotate":
+                obj = self._find(self._selected)
+                if obj is not None:
+                    start_angle, original_rotation = h
+                    center = self._widget_rect(page, orig).center()
+                    current_angle = math.degrees(math.atan2(
+                        pos.y() - center.y(), pos.x() - center.x()))
+                    obj["rotation"] = float(original_rotation) + (
+                        current_angle - float(start_angle))
             self.update()
         elif self._pan_last is not None:
             global_pos = QPointF(e.globalPosition())
@@ -925,12 +1305,34 @@ class PageView(QWidget):
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
             return
+        if self._edit_drag is not None:
+            _kind, _handle, page, _start, original = self._edit_drag
+            current = (QRectF(self._edit_selected[1])
+                       if self._edit_selected is not None else QRectF(original))
+            rotation = float(self._edit_rotation_preview)
+            kind = self._edit_drag[0]
+            self._edit_drag = None
+            self._edit_rotation_preview = 0.0
+            self._clear_edit_rotation_preview()
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            if kind == "rotate" and abs(rotation) > 1e-5:
+                self.pdfImageRotated.emit(page, rotation)
+            elif current != original:
+                self.pdfImageChanged.emit(page, current, QRectF(original))
+            self.update()
+            return
         if self._drag is not None:
             oid = self._selected
             obj = self._find(oid)
             if obj is not None:
-                self.objectChanged.emit(
-                    oid, QRectF(obj["rect"]), QRectF(self._drag[3]))
+                if self._drag[0] == "rotate":
+                    old_rotation = float(self._drag[1][1])
+                    new_rotation = float(obj.get("rotation", 0.0))
+                    if abs(new_rotation - old_rotation) > 1e-5:
+                        self.objectRotated.emit(oid, new_rotation, old_rotation)
+                else:
+                    self.objectChanged.emit(
+                        oid, QRectF(obj["rect"]), QRectF(self._drag[3]))
             self._drag = None
             self.update()
             return
@@ -981,9 +1383,30 @@ class PageView(QWidget):
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
             return
+        if self._edit_overlay and self._mode == "point":
+            hit = self._edit_line_at(e.position())
+            if hit is not None:
+                line = dict(self._edit_line_hits(hit[0])[hit[1]])
+                if line.get("kind") == "image":
+                    line["double_click"] = True
+                    self._drawing = False
+                    self._drag = None
+                    self._edit_drag = None
+                    self.textLineClicked.emit(hit[0], line)
+                    self.update()
+                    return
+        if self._mode == "view":
+            obj = self._object_at(e.position(), {"note"} | _ANNOTATION_KINDS)
+            if obj is not None:
+                self._selected = obj["id"]
+                self._drag = None
+                self._selecting = False
+                self.update()
+                self.objectDoubleClicked.emit(obj["id"])
+                return
         # 新建文本确认后会继续停留在 point（文本）模式；此时双击已有
         # 文本也应进入编辑，而不是被模式判断直接忽略。
-        if self._mode not in ("view", "point"):
+        if not (self._mode == "point" and self._edit_overlay):
             return
         obj = self._object_at(e.position())
         if obj is not None and obj.get("kind") in (
@@ -999,11 +1422,21 @@ class PageView(QWidget):
             super().mouseDoubleClickEvent(e)
 
     def _on_custom_context_menu(self, pos):
-        obj = self._object_at(QPointF(pos))
+        obj = None
+        if self._mode == "point" and self._edit_overlay:
+            obj = self._object_at(QPointF(pos))
+        elif self._mode == "view":
+            obj = self._object_at(QPointF(pos), {"note"} | _ANNOTATION_KINDS)
         if obj is not None:
             self._selected = obj["id"]
             self.objectSelected.emit(obj["id"])
             self.update()
+        elif self._edit_overlay and self._mode == "point":
+            hit = self._edit_line_at(QPointF(pos))
+            if hit is not None:
+                line = dict(self._edit_line_hits(hit[0])[hit[1]])
+                if line.get("kind") == "image":
+                    self.textLineClicked.emit(hit[0], line)
         self.contextMenuRequested.emit(self.mapToGlobal(pos))
 
     # ---------------- 文本选择 ----------------
@@ -1086,7 +1519,48 @@ class PageView(QWidget):
         if self._mode not in ("view", "point"):
             self._hide_note_tooltip()
             return
-        h = self._handle_at(pos)
+        if (self._mode == "point" and self._edit_overlay and
+                self._edit_selected is not None):
+            page, rect = self._edit_selected
+            if self._edit_rotation_handle_at(pos):
+                self.setCursor(self._rotation_cursor())
+                QToolTip.showText(self.mapToGlobal(pos.toPoint()), "拖动旋转", self)
+                self._hide_note_tooltip()
+                return
+            handle = self._edit_selection_handle_at(pos)
+            if handle is not None:
+                if handle in (0, 2):
+                    self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                elif handle in (1, 3):
+                    self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                elif handle in (4, 5):
+                    self.setCursor(Qt.CursorShape.SizeVerCursor)
+                else:
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                self._hide_note_tooltip()
+                return
+            if self._widget_rect(page, rect).contains(pos):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                self._hide_note_tooltip()
+                return
+        selected_obj = self._find(self._selected)
+        reading_annotation = (
+            self._mode == "view" and selected_obj is not None and
+            selected_obj.get("kind") in ({"note"} | _ANNOTATION_KINDS))
+        editing_objects = ((self._mode == "point" and self._edit_overlay) or
+                           reading_annotation)
+        # 阅读模式下批注无需先点击选中：鼠标直接悬停即可显示便笺内容，
+        # 同时仍只把批注视为可交互对象，不激活图片、签名和编辑文字。
+        hover_obj = self._object_at(
+            pos, ({"note"} | _ANNOTATION_KINDS)
+            if self._mode == "view" else None
+        ) if (editing_objects or self._mode == "view") else None
+        if editing_objects and self._object_rotation_handle_at(pos):
+            self.setCursor(self._rotation_cursor())
+            QToolTip.showText(self.mapToGlobal(pos.toPoint()), "拖动旋转", self)
+            self._hide_note_tooltip()
+            return
+        h = self._handle_at(pos) if editing_objects else None
         if h is not None:
             tips = {0: "等比缩放", 1: "等比缩放", 2: "等比缩放", 3: "等比缩放",
                     4: "上下缩放", 5: "上下缩放", 6: "左右缩放", 7: "左右缩放"}
@@ -1100,13 +1574,11 @@ class PageView(QWidget):
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
             self._hide_note_tooltip()
             QToolTip.showText(self.mapToGlobal(pos.toPoint()), tips[h], self)
-        elif (obj := self._object_at(pos)) is not None:
+        elif hover_obj is not None:
             self.setCursor(Qt.CursorShape.SizeAllCursor)
-            if obj.get("kind") == "note" and str(obj.get("text", "")).strip():
-                self._show_note_tooltip(obj, pos)
-            elif self._mode == "view":
-                self._hide_note_tooltip()
-                QToolTip.showText(self.mapToGlobal(pos.toPoint()), "拖动移动", self)
+            if (hover_obj.get("kind") == "note" and
+                    str(hover_obj.get("text", "")).strip()):
+                self._show_note_tooltip(hover_obj, pos)
             else:
                 self._hide_note_tooltip()
         else:

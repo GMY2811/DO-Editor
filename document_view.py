@@ -82,7 +82,8 @@ def _live_diag_snap(doc, meta, tag):
 MODE_DEFS = [
     ("view",         "选择",     "view",  "select"),
     ("text_select",  "快捷复制", "rect",  "text_select"),
-    ("replace_text", "修改文字", "point", "edit"),
+    # 内部键名为兼容旧设置继续使用 replace_text；界面统一称“编辑模式”。
+    ("replace_text", "编辑模式", "point", "edit"),
     ("highlight",    "高亮",     "rect",  "highlight"),
     ("underline",    "下划线",   "rect",  "underline"),
     ("strikeout",    "删除线",   "rect",  "strikeout"),
@@ -191,9 +192,11 @@ class AddWatermarkDialog(QDialog):
     文字：文字 + 字号 + 颜色 + 透明度 + 旋转 + 平铺；
     图片：图片文件 + 大小 + 透明度 + 旋转 + 平铺。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, record=None):
         super().__init__(parent)
-        self.setWindowTitle(i18n.tr("add_watermark"))
+        self._record = record or None
+        self.setWindowTitle(i18n.tr(
+            "modify_watermark" if record else "add_watermark"))
         from PySide6.QtWidgets import (QPushButton, QHBoxLayout, QVBoxLayout,
                                       QSpinBox, QSlider, QCheckBox, QComboBox,
                                       QFileDialog, QToolButton)
@@ -316,7 +319,37 @@ class AddWatermarkDialog(QDialog):
         lay.addLayout(row4)
         lay.addLayout(row5)
         self.resize(470, 220)
-        self._on_type_changed(0)
+        if record:
+            self._load_record(record)
+        else:
+            self._on_type_changed(0)
+
+    def _load_record(self, record):
+        kind = record.get("kind", "text")
+        # 无法从外部结构确定类型时，以可编辑的文字水印作为安全默认值。
+        is_image = kind == "image"
+        self._type_combo.setCurrentIndex(1 if is_image else 0)
+        if record.get("text"):
+            self._text_edit.setText(str(record["text"]))
+        self._size_spin.setValue(max(
+            self._size_spin.minimum(), min(self._size_spin.maximum(),
+            int(round(float(record.get("fontsize", 50)))))))
+        color = record.get("color")
+        if isinstance(color, (list, tuple)) and len(color) >= 3:
+            self._color = QColor.fromRgbF(
+                float(color[0]), float(color[1]), float(color[2]))
+            self._style_color_btn()
+        self._opacity_slider.setValue(max(
+            5, min(100, int(round(float(record.get("opacity", 0.3)) * 100)))))
+        self._rotate_spin.setValue(max(
+            0, min(360, int(round(float(record.get("rotate", 45)))))))
+        self._tiled_check.setChecked(bool(record.get("tiled", True)))
+        self._scale_spin.setValue(max(
+            5, min(100, int(round(float(record.get("scale", 0.5)) * 100)))))
+        if is_image:
+            self._img_label.setText(
+                str(record.get("image_name") or i18n.tr("watermark_embedded_image")))
+        self._on_type_changed(self._type_combo.currentIndex())
 
     def _on_type_changed(self, idx):
         is_text = idx == 0
@@ -728,6 +761,9 @@ class DocumentView(QWidget):
         self.page_view.pointClicked.connect(self._on_point)
         self.page_view.textLineClicked.connect(self._on_text_line_clicked)
         self.page_view.objectChanged.connect(self._on_object_changed)
+        self.page_view.objectRotated.connect(self._on_object_rotated)
+        self.page_view.pdfImageChanged.connect(self._on_pdf_image_changed)
+        self.page_view.pdfImageRotated.connect(self._on_pdf_image_rotated)
         self.page_view.objectSelected.connect(self._on_object_selected)
         self.page_view.objectDoubleClicked.connect(self._on_object_double_clicked)
         self.page_view.contextMenuRequested.connect(self._on_context_menu)
@@ -757,8 +793,7 @@ class DocumentView(QWidget):
         self._open_password = password
         self._auth_level = int(getattr(doc, "_do_auth_level", 0))
         self._clear_undo_history()
-        self.objects = []
-        self._obj_counter = 0
+        self._load_native_annotations()
         self.titleChanged.emit(os.path.basename(path))
         self.workspace_stack.setCurrentWidget(self.scroll)
         self._refresh()
@@ -917,12 +952,14 @@ class DocumentView(QWidget):
                 try:
                     os.replace(tmp, recover)
                     self.doc = backend.open_pdf(recover, reopen_password)
+                    self._load_native_annotations()
                     restored = True
                 except Exception:
                     # rename 极罕见失败（如 AV 恰好扫到 tmp）：退而直接从
                     # tmp 打开，宁可下次保存前再处理也不让 doc 停在 closed。
                     try:
                         self.doc = backend.open_pdf(tmp, reopen_password)
+                        self._load_native_annotations()
                         restored = True
                     except Exception:
                         self.doc = None
@@ -952,6 +989,7 @@ class DocumentView(QWidget):
                 raise RuntimeError(
                     f"保存失败：{e}{backup_note}{hint}") from e
             self.doc = backend.open_pdf(path, reopen_password)
+            self._load_native_annotations()
             # 本次保存成功：清理此前保存失败遗留的 .recover.pdf 备份。
             # （其句柄已在本次 doc.save 后的 close 中释放，可安全删除。）
             try:
@@ -1165,6 +1203,10 @@ class DocumentView(QWidget):
 
     def _bake_objects(self):
         for obj in self.objects:
+            # 保存后从 PDF 重新载入的原生批注只是一个可交互代理；其内容
+            # 已经存在于 PDF 中，不能再次写入，否则每保存一次就会复制一份。
+            if obj.get("native_proxy"):
+                continue
             page = self.doc[obj["page"]]
             r = obj["rect"]
             fr = pymupdf.Rect(r.x(), r.y(), r.right(), r.bottom())
@@ -1219,15 +1261,34 @@ class DocumentView(QWidget):
                     bold=bool(obj.get("bold", False)),
                     italic=bool(obj.get("italic", False)))
             else:
+                image_bytes = obj["png"]
+                angle = float(obj.get("rotation", 0.0))
+                if abs(angle) > 1e-7:
+                    # 保存前的图片/签名以透明画布旋转后写入其外接矩形；
+                    # 页面显示尺寸与编辑模式预览一致，任意角度均可保存。
+                    rotated = obj["img"].transformed(
+                        QTransform().rotate(angle),
+                        Qt.TransformationMode.SmoothTransformation)
+                    image_bytes = qimage_to_png_bytes(rotated)
+                    rad = __import__("math").radians(angle)
+                    new_w = abs(r.width() * __import__("math").cos(rad)) + \
+                        abs(r.height() * __import__("math").sin(rad))
+                    new_h = abs(r.width() * __import__("math").sin(rad)) + \
+                        abs(r.height() * __import__("math").cos(rad))
+                    center = r.center()
+                    fr = pymupdf.Rect(center.x() - new_w / 2,
+                                      center.y() - new_h / 2,
+                                      center.x() + new_w / 2,
+                                      center.y() + new_h / 2)
                 opacity = obj.get("opacity", 1.0)
                 if opacity >= 1.0:
-                    page.insert_image(fr, stream=obj["png"])
+                    page.insert_image(fr, stream=image_bytes)
                 else:
                     # PyMuPDF 的 alpha 参数是 int(0/1 有无透明)，不是透明度值；
                     # 把透明度固化到图像自身的 alpha 通道，保存/重开后依然生效。
                     from PIL import Image as _PILImage
                     from io import BytesIO as _BytesIO
-                    _img = _PILImage.open(_BytesIO(obj["png"])).convert("RGBA")
+                    _img = _PILImage.open(_BytesIO(image_bytes)).convert("RGBA")
                     _r, _g, _b, _a = _img.split()
                     _a = _a.point(lambda v: int(v * opacity))
                     _img = _PILImage.merge("RGBA", (_r, _g, _b, _a))
@@ -1236,6 +1297,116 @@ class DocumentView(QWidget):
                     page.insert_image(fr, stream=_buf.getvalue())
         self.objects = []
         self._obj_counter = 0
+
+    @staticmethod
+    def _annotation_color(annot, fallback):
+        """读取 PDF 批注颜色并转换为 Qt 颜色。"""
+        try:
+            values = (annot.colors or {}).get("stroke") or []
+            if len(values) == 1:
+                gray = max(0.0, min(1.0, float(values[0])))
+                return QColor.fromRgbF(gray, gray, gray)
+            if len(values) >= 3:
+                return QColor.fromRgbF(
+                    max(0.0, min(1.0, float(values[0]))),
+                    max(0.0, min(1.0, float(values[1]))),
+                    max(0.0, min(1.0, float(values[2]))))
+        except Exception:
+            pass
+        return QColor(fallback)
+
+    @staticmethod
+    def _normalized_annotation_points(points, rect):
+        if not points or rect.width() <= 0 or rect.height() <= 0:
+            return []
+        return [((float(p[0]) - rect.x()) / rect.width(),
+                 (float(p[1]) - rect.y()) / rect.height())
+                for p in points]
+
+    def _load_native_annotations(self):
+        """把 PDF 原生批注恢复成可选、可编辑的界面代理对象。
+
+        页面本身仍负责绘制原生外观，代理只负责命中和后续操作。因此既
+        不改变第三方 PDF 的批注外观，也不会在第二次保存时产生重复项。
+        """
+        self.objects = []
+        self._obj_counter = 0
+        if self.doc is None:
+            return
+        kinds = {
+            pymupdf.PDF_ANNOT_TEXT: "note",
+            pymupdf.PDF_ANNOT_HIGHLIGHT: "highlight",
+            pymupdf.PDF_ANNOT_UNDERLINE: "underline",
+            pymupdf.PDF_ANNOT_STRIKE_OUT: "strikeout",
+            pymupdf.PDF_ANNOT_SQUARE: "rect",
+            pymupdf.PDF_ANNOT_LINE: "line",
+            pymupdf.PDF_ANNOT_INK: "ink",
+        }
+        for pno in range(len(self.doc)):
+            page = self.doc[pno]
+            try:
+                annotations = list(page.annots() or [])
+            except Exception:
+                continue
+            for annot in annotations:
+                kind = kinds.get(int(annot.type[0]))
+                if kind is None:
+                    continue
+                ar = annot.rect
+                rect = QRectF(ar.x0, ar.y0, ar.width, ar.height)
+                vertices = annot.vertices
+                raw_points = []
+                if kind in ("highlight", "underline", "strikeout") and vertices:
+                    # 标记批注的外接 rect 含 MuPDF 外观留白；用四边形顶点
+                    # 恢复用户原先框选的文字区域，移动后再次保存不会变大。
+                    flat = list(vertices)
+                    xs = [float(p[0]) for p in flat]
+                    ys = [float(p[1]) for p in flat]
+                    rect = QRectF(min(xs), min(ys),
+                                  max(1.0, max(xs) - min(xs)),
+                                  max(1.0, max(ys) - min(ys)))
+                elif kind == "line" and vertices:
+                    raw_points = list(vertices)
+                elif kind == "ink" and vertices:
+                    # 本编辑器创建的墨迹是一条 stroke；第三方多 stroke 墨迹
+                    # 仍保留在 PDF 中，代理使用第一条进行命中和整体变换。
+                    first = vertices[0] if isinstance(vertices[0], list) else vertices
+                    raw_points = list(first)
+                self._obj_counter += 1
+                fallback = "#ff9f0a" if kind == "note" else (
+                    "#ffd400" if kind == "highlight" else "#c81e1e")
+                obj = {
+                    "id": self._obj_counter,
+                    "page": pno,
+                    "rect": rect,
+                    "kind": kind,
+                    "color": self._annotation_color(annot, fallback),
+                    "width": float((annot.border or {}).get("width", 1.5) or 1.5),
+                    "points": self._normalized_annotation_points(raw_points, rect),
+                    "native_proxy": True,
+                    "native_xref": int(annot.xref),
+                }
+                if kind == "note":
+                    obj["text"] = str((annot.info or {}).get("content", ""))
+                    obj["img"] = self._note_marker_image(obj["color"])
+                self.objects.append(obj)
+
+    def _detach_native_annotation(self, obj):
+        """删除代理对应的原生批注，使对象回到保存前的可绘制状态。"""
+        xref = obj.get("native_xref")
+        if not obj.get("native_proxy") or not xref or self.doc is None:
+            return False
+        try:
+            page = self.doc[int(obj["page"])]
+            annot = page.load_annot(int(xref))
+            if annot is not None:
+                page.delete_annot(annot)
+        except Exception:
+            return False
+        obj.pop("native_proxy", None)
+        obj.pop("native_xref", None)
+        self._undo_pdf_cache = None
+        return True
 
     def _bake_text_original_font(self, page, fr, obj, rgb):
         """以原字体写回修改后的整行文字，保证字形/字族与文档其它行一致。
@@ -1305,7 +1476,21 @@ class DocumentView(QWidget):
         size = max(4.0, float(obj.get("fontsize") or 10.0))
         base = obj.get("baseline")
         if base is None:
-            base = fr.y1 - size * 0.15
+            # 新增文字对象的 rect.y0 就是用户点击并在画布预览时看到的
+            # 文字行顶部。旧实现从包含额外上下留白的 rect.y1 反推基线，
+            # 保存后字形会随文本框高度整体下沉。PDF 字体的 span bbox 顶部
+            # 等于 baseline - ascender * fontsize，因此按实际写入字体的升部
+            # 指标从 rect.y0 计算基线，保存前后的行顶位置即可保持一致。
+            try:
+                font_metrics = self._cached_embed_font(embed)
+                ascender = float(font_metrics.ascender)
+                if not (0.5 <= ascender <= 2.0):
+                    raise ValueError("invalid font ascender")
+            except Exception:
+                # 主流 PDF 字体升部约为 0.8~1.1 em；只有字体指标不可读时
+                # 才使用保守值，仍不能再依赖带 UI 留白的对象框底部。
+                ascender = 1.0
+            base = fr.y0 + size * ascender
         # 中文斜体：Windows 中文字体通常没有斜体变体文件，字体选择
         # 可能仍返回正体；直接写回会丢失对象的斜体样式。
         # 含 CJK 的斜体改用 morph 错切合成：斜切随字形写入 content
@@ -2043,9 +2228,15 @@ class DocumentView(QWidget):
                 return
             page, pt = target
         self.pending_paste_text = None
-        self._add_text_object(text, int(page), QPointF(pt))
+        # 粘贴内容在保存前仍是浮动文字对象：立即进入统一编辑层并保持
+        # 选中，用户可以继续移动、双击编辑或删除；保存时才烘焙进 PDF。
+        self._add_text_object(text, int(page), QPointF(pt), keep_mode=True)
+        pasted_oid = self._obj_counter
+        self.set_mode("replace_text")
+        self.page_view.select(pasted_oid)
         self.statusMessage.emit(
-            i18n.tr("paste_text_done").format(p=int(page) + 1), 3000)
+            i18n.tr("paste_text_done").format(p=int(page) + 1) +
+            "；保存前可直接拖动", 4000)
 
     def start_note(self, page=None, pt=None):
         """输入便笺内容；有坐标时直接添加，否则进入页面定位模式。"""
@@ -2059,6 +2250,9 @@ class DocumentView(QWidget):
             return False
         if page is not None and pt is not None:
             return self._add_note_at(text, int(page), QPointF(pt))
+        # 从“修改文字”进入放置工具时必须先关闭整页文字编辑覆盖层；
+        # 否则页面点击会被 textLineClicked 截获，便笺/签名都无法落下。
+        self.set_mode("view")
         self.pending_note_text = text
         self.current_mode = "note"
         self._check_none()
@@ -2298,8 +2492,12 @@ class DocumentView(QWidget):
         elif m == "note" and self.pending_note_text:
             self._add_note_at(self.pending_note_text, page, pt)
         elif m == "paste" and self.pending_paste_text:
-            self._add_text_object(self.pending_paste_text, page, pt)
+            self._add_text_object(
+                self.pending_paste_text, page, pt, keep_mode=True)
+            pasted_oid = self._obj_counter
             self.pending_paste_text = None
+            self.set_mode("replace_text")
+            self.page_view.select(pasted_oid)
 
     def _on_text_line_clicked(self, page, line):
         """「修改文字」整页框模式：点击一行 → 该行就地变成可编辑框。
@@ -2313,9 +2511,27 @@ class DocumentView(QWidget):
         self._row_focus_pending = False
         was_editing = self._commit_row_edit(commit=True)
         if line is None:
+            self._selected_pdf_content = None
+            self.page_view.set_edit_selection()
             if not (was_editing or focus_done):
                 self.statusMessage.emit(i18n.tr("replace_no_text"), 3000)
             return
+        if line.get("kind") == "image" and line.get("record"):
+            # Acrobat“编辑 PDF”：单击独立图片对象后直接选中，Delete 删除。
+            self._selected_pdf_content = dict(line["record"])
+            self.page_view.set_edit_selection(
+                int(page), line["rect"], self._selected_pdf_content)
+            self.page_view.setFocus()
+            if line.get("double_click"):
+                self._replace_selected_pdf_image(
+                    self._selected_pdf_content, line["rect"])
+                return
+            self.statusMessage.emit(
+                "已选中图片对象；可移动、缩放、旋转，双击替换或 Delete 删除",
+                7000)
+            return
+        self._selected_pdf_content = None
+        self.page_view.set_edit_selection()
         self._begin_row_edit(int(page), line)
 
 
@@ -2331,6 +2547,27 @@ class DocumentView(QWidget):
             return
         from PySide6.QtGui import QTextCursor
         self._close_inline_editor()
+
+        # 先判断所点文字是否恰好属于一个独立内容流。对这类对象直接在
+        # 原流中替换 Tj 字符串，完整保留字体资源、Tm 旋转矩阵、灰度和
+        # 透明度；删除则清空该流。全程不做 redaction，所以下层正文不受
+        # 影响。这是用户样本和 Acrobat 编辑行为的关键路径。
+        isolated_record = backend.find_isolated_text_object(
+            self.doc, int(page), str(line.get("text", "")),
+            [line["rect"].left(), line["rect"].top(),
+             line["rect"].right(), line["rect"].bottom()])
+        # 单一 span 优先直接改原内容流中的字形代码。这样不需要重嵌字体，
+        # 自定义/商业字体也能原样保留字号、颜色、粗斜和文字矩阵。
+        source_spans = [s for s in (line.get("spans") or [])
+                        if str(s.get("text", ""))]
+        direct_record = None
+        if (len(source_spans) == 1 and
+                str(source_spans[0].get("text", "")) == str(line.get("text", ""))):
+            direct_record = backend.find_direct_text_object(
+                self.doc, int(page), str(line.get("text", "")),
+                [line["rect"].left(), line["rect"].top(),
+                 line["rect"].right(), line["rect"].bottom()],
+                source_spans[0].get("font", ""))
 
         # 编辑框是页面画布的子控件：page_view 就是滚动内容本身
         # （整页高度），所以直接使用画布局部坐标即可随页面滚动与缩放。
@@ -2494,6 +2731,9 @@ class DocumentView(QWidget):
             "last_key": None,  # 上次 live 的 runs 指纹（防重入/防空转）
             "last_span": None, # 上次写入内容占用的 PDF 区域 [x0,y0,x1,y1]
             "fseq": 0,         # 字体注册名去重序号
+            "isolated_record": isolated_record,
+            "direct_record": direct_record,
+            "format_revision": int(getattr(edit, "_format_revision", 0)),
         }
         # 连接后补记初始指纹：跳过 setTextCursor/sync_typing_format_from_cursor
         # 可能触发的一次空 contentsChanged tick（内容未变则 live 不空跑）。
@@ -2503,6 +2743,12 @@ class DocumentView(QWidget):
             meta0["last_key"] = self._row_fingerprint(init_runs)
         except Exception:
             pass
+        if isolated_record is not None:
+            # 独立对象按 Acrobat 对象语义进入：首击选中全部文字，直接输入
+            # 即替换，Delete/Backspace 即删除；无需再进“水印管理器”。
+            edit.selectAll()
+            self.statusMessage.emit(
+                "已选中独立文字对象；直接输入可替换，Delete 可删除", 6000)
         # 该行进入就地编辑：立即从整页蓝框/hover 模式摘除（不改任何像素，
         # 原字形继续由 PDF 位图显示；直到用户真正输入才 live 写回）
         canvas.set_inline_rect(page, QRectF(r))
@@ -2574,6 +2820,69 @@ class DocumentView(QWidget):
             x0 = float(er[0])
             base = float(er[3]) - max(1.0, (float(er[3]) - float(er[1])) * 0.15)
         return x0, base, float(er[1]), float(er[3])
+
+    def _sync_row_layout_from_pdf(self, edit, meta, text):
+        """原位内容流写回后，用 PDF 的真实逐字边界刷新点击/光标映射。
+
+        direct / isolated 路径只替换原内容流，不经过下方重排分支；旧代码
+        因而一直保留编辑开始时的 ``char_x``。插入字符后 PDF 已正确变长，
+        但编辑框仍只有旧字符数个命中区，后续点击会落到错误字符。这里以
+        原行起点和基线为锚，从 rawdict 中选回刚写入的同一行，并同步其
+        每字符 bbox、编辑框尺寸和纵向命中带。
+        """
+        if not isinstance(edit, PdfRowEditBox) or self.doc is None:
+            return False
+        pno = int(meta.get("page", -1))
+        if pno < 0 or pno >= len(self.doc):
+            return False
+        x0, base_y, old_top, old_bottom = self._row_live_geom(meta)
+        candidates = []
+        try:
+            raw = self.doc[pno].get_text("rawdict")
+            for block in raw.get("blocks", []):
+                for line in block.get("lines", []):
+                    chars = [char for span in line.get("spans", [])
+                             for char in span.get("chars", [])]
+                    if not chars or "".join(str(c.get("c", ""))
+                                             for c in chars) != text:
+                        continue
+                    origin = chars[0].get("origin") or (chars[0]["bbox"][0],
+                                                         base_y)
+                    score = abs(float(origin[0]) - x0) + \
+                        4.0 * abs(float(origin[1]) - base_y)
+                    candidates.append((score, chars))
+        except Exception:
+            return False
+        if not candidates:
+            return False
+        chars = min(candidates, key=lambda item: item[0])[1]
+        if len(chars) != len(text):
+            return False
+
+        ranges = [(float(c["bbox"][0]), float(c["bbox"][2])) for c in chars]
+        ink_top = min(float(c["bbox"][1]) for c in chars)
+        ink_bottom = max(float(c["bbox"][3]) for c in chars)
+        top = min(old_top, ink_top)
+        bottom = max(old_bottom, ink_bottom)
+        pv = self.page_view
+        if pv is None:
+            return False
+        zoom = pv._zoom
+        origin_x = min(x0, float(meta["rect"].left()), ranges[0][0])
+        bx = int(origin_x * zoom)
+        by = int(pv._offsets[pno] + top * zoom)
+        right = max(ranges[-1][1], float(meta["rect"].right())) * zoom
+        page_right = backend.page_size(self.doc, pno)[0] * zoom
+        edit.setGeometry(
+            bx, by, max(2, int(min(page_right, right + 4.0) - bx)),
+            max(2, int((bottom - top) * zoom) + 2))
+        edit.set_pdf_layout(
+            text, [(left * zoom - bx, right * zoom - bx)
+                   for left, right in ranges],
+            (ink_top - top) * zoom, (ink_bottom - top) * zoom,
+            x0 * zoom - bx)
+        meta["last_span"] = [ranges[0][0], top, ranges[-1][1], bottom]
+        return True
 
 
 
@@ -2667,7 +2976,7 @@ class DocumentView(QWidget):
                     if fo0 is None:
                         continue
                     if self._subset_covers(fo0, ftype, text, orig_text):
-                        clean = re.sub(r"^[A-Fa-f0-9]{6}\+", "",
+                        clean = re.sub(r"^[A-Za-z]{6}\+", "",
                                        (raw or "")).strip()
                         nm = re.sub(r"[^A-Za-z0-9]", "", clean) or "font"
                         embed = {"name": nm, "buffer": buf}
@@ -2789,6 +3098,10 @@ class DocumentView(QWidget):
         _live_diag_log(meta, "> write text=%r" % text)
         # Qt 框内文字保持透明（防格式编辑把 alpha 改回出现双引擎叠字）
         edit = getattr(self, "_row_edit", None)
+        format_changed = bool(
+            edit is not None and
+            int(getattr(edit, "_format_revision", 0)) >
+            int(meta.get("format_revision", 0)))
         if edit is not None:
             try:
                 edit.set_text_visible(False)
@@ -2798,6 +3111,76 @@ class DocumentView(QWidget):
         if not meta.get("undo"):
             if self.begin_undo_step(document_change=True):
                 meta["undo"] = True
+        isolated = meta.get("isolated_record")
+        direct = meta.get("direct_record")
+        if format_changed:
+            # direct / isolated 的原位路径只改字符编码，刻意保留 Tf / rg 等
+            # 原格式操作符；继续走它会让字号、颜色、粗斜体“点击后没反应”。
+            # 格式一旦改变，本编辑会话永久切换到下方富文本分段写回路径。
+            meta["direct_record"] = None
+            meta["isolated_record"] = None
+            direct = None
+            isolated = None
+        if direct is not None:
+            # 原 PDF 字体的 ToUnicode 反向编码路径：只替换 Tj/TJ 数据，
+            # 所有格式操作符保持逐字节不变。
+            if not backend.replace_direct_text_object(self.doc, direct, text):
+                # 例如 Albany / Helvetica 子集没有中文字形。旧逻辑只拒绝
+                # 本次写入，而编辑框仍保留汉字，于是后续英文也因整段包含
+                # 该汉字而持续失败。现在先恢复会话开始时的原内容流，再
+                # 永久切换到下方“保留原前缀 + 缺字段兼容字体”路径。
+                try:
+                    self.doc.update_stream(
+                        int(direct["stream_xref"]),
+                        bytes(direct["source_stream"]))
+                except Exception:
+                    self.statusMessage.emit(
+                        "原字体缺少所输入字符，且无法切换兼容字体", 5000)
+                    return str(meta.get("text") or "")
+                meta["direct_record"] = None
+                # 同一对象即使也被识别为独立文字流，此刻仍应采用按字符
+                # 分字体的通用路径，否则又会被原对象编码限制拦住。
+                meta["isolated_record"] = None
+                direct = None
+                isolated = None
+                meta["written"] = False
+                meta["last_span"] = None
+                meta["preserved_prefix"] = len(str(meta.get("text") or ""))
+                self.statusMessage.emit(
+                    "原字体不含该字形，改动部分已自动使用兼容字体", 5000)
+            else:
+                meta["written"] = True
+                meta["live"] = True
+                meta["last_span"] = list(meta.get("erase") or
+                                         [0.0, 0.0, 0.0, 0.0])
+                self._sync_row_layout_from_pdf(edit, meta, text)
+                self.modified = True
+                if pv is not None:
+                    pv._images.pop(pno, None)
+                    pv._render_page(pno)
+                    pv.set_inline_rect(pno, meta["rect"])
+                    pv.update()
+                return text
+        if isolated is not None:
+            # 独立对象的安全路径：原位改内容流，不使用会擦到下层正文的
+            # redaction。原模板保存在 record 中，所以删空后继续输入仍可恢复。
+            if not backend.replace_isolated_text_object(self.doc, isolated, text):
+                self.statusMessage.emit(
+                    "该对象使用了当前字体无法原位编码的字符；未改动原文", 5000)
+                return str(meta.get("text") or "")
+            meta["written"] = True
+            meta["live"] = True
+            meta["last_span"] = list(meta.get("erase") or
+                                     [0.0, 0.0, 0.0, 0.0])
+            self._sync_row_layout_from_pdf(edit, meta, text)
+            self.modified = True
+            # 旋转对象替换后的边界可能改变；整页重渲染可避免旧字形残影。
+            if pv is not None:
+                pv._images.pop(pno, None)
+                pv._render_page(pno)
+                pv.set_inline_rect(pno, meta["rect"])
+                pv.update()
+            return text
         # 只有文字和样式都未改、且此前从未被擦除的原字符才能保留。
         # 已重写的区域不能再次当成原文；否则把 X 改回 A 时会跳过写回。
         orig_text = str(meta.get("text") or "")
@@ -2867,8 +3250,12 @@ class DocumentView(QWidget):
                     rgb = (0.0, 0.0, 0.0)
                 bold = bool(r.get("bold"))
                 italic = bool(r.get("italic"))
-                family_hint = (self._map_pdf_font(r.get("family") or "")
-                              or "Arial")
+                requested_family = str(r.get("family") or "").strip()
+                # _map_pdf_font 负责 PDF 内部别名；用户从系统字体框选择的
+                # 正常字族（Candara、Corbel 等）未必在别名表中，必须原样
+                # 交给系统字体文件解析，不能静默降级成 Arial。
+                family_hint = (self._map_pdf_font(requested_family)
+                               or requested_family or "Arial")
                 sub_segments = self._partition_chars_for_glyph(
                     family_hint, seg)
                 if not sub_segments:
@@ -3054,9 +3441,10 @@ class DocumentView(QWidget):
         self._close_inline_editor()
 
         fmt = self._detect_format_at(page, pt)
-        family = _qt_safe_family(
-            self._map_pdf_font(fmt.get("family", ""))) or _qt_safe_family(
-                "Microsoft YaHei")
+        # _detect_format_at 已把 PDF 字体别名/嵌入字体解析成真实字族；这里
+        # 不能再次只走静态映射，否则 Candara 等系统字体会被误降级为雅黑。
+        family = str(fmt.get("family", "") or "Microsoft YaHei")
+        display_family = _qt_safe_family(family)
         size = float(fmt.get("size") or 10.0)
         color = fmt.get("color")
         if color is None or not isinstance(color, QColor):
@@ -3097,7 +3485,9 @@ class DocumentView(QWidget):
         })
         # 控件本身也用兜底后的 QFont：保证光标/系统弹出与空文档默认
         # 字符样式都用一个真实可绘制的字体，避免 Qt 在未定义字族上输出豆腐。
-        base_qfont = QFont(family)
+        # QFont 预览可使用当前 Qt 后端可解析的兜底字体，但编辑元数据和
+        # runs 始终保留 PDF 的真实逻辑字族，保存时据此寻找字体文件。
+        base_qfont = QFont(display_family)
         base_qfont.setPointSizeF(max(1.0, float(size)))
         if bold:
             base_qfont.setBold(True)
@@ -3137,6 +3527,7 @@ class DocumentView(QWidget):
         runs = self._trim_runs(edit.to_runs())
         new_text = runs_text(runs)
         self._close_inline_editor()
+        created_oid = None
         if commit and new_text.strip():
             if runs and len(runs) > 1:
                 self._add_text_object(
@@ -3153,6 +3544,12 @@ class DocumentView(QWidget):
                     r0.get("bold", meta.get("bold", False)),
                     r0.get("italic", meta.get("italic", False)),
                     keep_mode=True)
+            created_oid = self._obj_counter
+        if created_oid is not None:
+            # 新增文字提交后立即交给统一的对象编辑层，保持选中，用户无需
+            # 再切换工具即可直接移动、双击编辑或删除。
+            self.set_mode("replace_text")
+            self.page_view.select(created_oid)
         return True
 
     def _close_inline_editor(self):
@@ -3178,7 +3575,8 @@ class DocumentView(QWidget):
     def _detect_format_at(self, page, pt):
         """检测点击位置文字格式（字体/字号/颜色/粗细）。
 
-        优先取同行左侧文字；同行左侧无字则取上一行最后一段。
+        严格按“同行前方文字 → 上一行 → 下一行”的优先级继承；三者
+        都不存在时才使用默认格式。
         返回 {"family", "size", "color", "bold", "italic"}。
         """
         fmt = {"family": "", "size": 10, "color": QColor(0, 0, 0),
@@ -3190,36 +3588,66 @@ class DocumentView(QWidget):
                 if block.get("type") != 0:
                     continue
                 for line in block.get("lines", []):
-                    spans = line.get("spans", [])
+                    spans = [s for s in line.get("spans", [])
+                             if str(s.get("text", "")) and s.get("bbox")]
                     if spans:
-                        lines.append(spans)
+                        spans.sort(key=lambda s: (float(s["bbox"][0]),
+                                                  float(s["bbox"][1])))
+                        lines.append({
+                            "spans": spans,
+                            "x0": min(float(s["bbox"][0]) for s in spans),
+                            "x1": max(float(s["bbox"][2]) for s in spans),
+                            "y0": min(float(s["bbox"][1]) for s in spans),
+                            "y1": max(float(s["bbox"][3]) for s in spans),
+                            "base": float(next(
+                                (s.get("origin", (0, s["bbox"][3]))[1]
+                                 for s in spans if s.get("origin")),
+                                max(float(s["bbox"][3]) for s in spans))),
+                        })
             if not lines:
                 return fmt
+            lines.sort(key=lambda ln: ((ln["y0"] + ln["y1"]) / 2.0,
+                                       ln["x0"]))
+            py = float(pt.y())
+            px = float(pt.x())
+            same = [ln for ln in lines if ln["y0"] - 3.0 <= py <=
+                    ln["y1"] + 3.0]
+            span = None
+            if same:
+                left = [s for ln in same for s in ln["spans"]
+                        if float(s["bbox"][0]) < px + 0.01]
+                if left:
+                    span = max(left, key=lambda s: float(s["bbox"][2]))
 
-            # 找 pt 所在行（按 y 范围）
-            target_idx = None
-            for i, spans in enumerate(lines):
-                y0 = min(s["bbox"][1] for s in spans)
-                y1 = max(s["bbox"][3] for s in spans)
-                if y0 - 3 <= pt.y() <= y1 + 3:
-                    target_idx = i
-                    break
-            if target_idx is None:
-                target_idx = min(
-                    range(len(lines)),
-                    key=lambda i: abs(min(s["bbox"][1] for s in lines[i]) - pt.y()))
-            target = lines[target_idx]
+            anchor_y = (min(same, key=lambda ln: abs(ln["base"] - py))["base"]
+                        if same else py)
+            if span is None:
+                previous = [ln for ln in lines if ln["base"] < anchor_y - 0.5]
+                if previous:
+                    prev_base = max(ln["base"] for ln in previous)
+                    prev_spans = [s for ln in previous
+                                  if abs(ln["base"] - prev_base) <= 0.5
+                                  for s in ln["spans"]]
+                    span = max(prev_spans, key=lambda s: float(s["bbox"][2]))
+            if span is None:
+                following = [ln for ln in lines if ln["base"] > anchor_y + 0.5]
+                if following:
+                    next_base = min(ln["base"] for ln in following)
+                    next_spans = [s for ln in following
+                                  if abs(ln["base"] - next_base) <= 0.5
+                                  for s in ln["spans"]]
+                    span = min(next_spans, key=lambda s: float(s["bbox"][0]))
+            if span is None:
+                return fmt
 
-            # 同行左侧文字
-            left = [s for s in target if s["bbox"][2] <= pt.x() + 2]
-            if left:
-                span = left[-1]
-            elif target_idx > 0:
-                span = lines[target_idx - 1][-1]   # 上一行最后一段
-            else:
-                span = target[0]
-
-            fam = self._map_pdf_font(span.get("font", ""))
+            pdf_font = str(span.get("font", "") or "")
+            fam = self._row_font_family(page, pdf_font)
+            if not fam:
+                candidate = re.sub(r"^[A-Za-z]{6}\+", "", pdf_font).strip()
+                candidate = re.sub(
+                    r"(?:[-, ](?:Regular|Bold|Italic|BoldItalic|MT))+$",
+                    "", candidate, flags=re.IGNORECASE).strip()
+                fam = candidate or self._map_pdf_font(pdf_font)
             if fam:
                 fmt["family"] = fam
             fmt["size"] = round(span.get("size", 10), 1)
@@ -3236,12 +3664,21 @@ class DocumentView(QWidget):
         family = self._map_pdf_font(pdf_font)
         if family:
             return family
-        buf, _, _ = self._extract_embed_buffer(self.doc[pno], pdf_font)
+        buf, raw_name, _ = self._extract_embed_buffer(self.doc[pno], pdf_font)
         if buf:
             try:
-                return self._map_pdf_font(pymupdf.Font(fontbuffer=buf).name)
+                embedded = pymupdf.Font(fontbuffer=buf).name
+                mapped = self._map_pdf_font(embedded)
+                if mapped:
+                    return mapped
             except Exception:
                 pass
+            # 未列入系统映射表的嵌入字体（例如 Albany WT J）也必须保留
+            # 真实名称，不能静默回退 Arial。直接内容流编辑会继续使用原字体。
+            name = re.sub(r"^[A-Za-z]{6}\+", "",
+                          raw_name or pdf_font or "").strip()
+            if name:
+                return name
         return ""
 
     @staticmethod
@@ -3378,6 +3815,7 @@ class DocumentView(QWidget):
                         "I": r"C:\Windows\Fonts\couri.ttf",
                         "BI": r"C:\Windows\Fonts\courbi.ttf"},
     }
+    _WINDOWS_FONT_REGISTRY = None
 
     @staticmethod
     def _style_suffix(bold, italic):
@@ -3397,11 +3835,74 @@ class DocumentView(QWidget):
         返回 None 表示系统无对应字体文件。
         """
         import os as _os
-        variants = cls._SYSTEM_FONT_FILES.get(family or "") or {}
-        if not variants:
-            return None
+        family = (family or "").strip()
+        variants = cls._SYSTEM_FONT_FILES.get(family) or {}
         key = cls._style_suffix(bold, italic)
         p = variants.get(key) or variants.get("")
+        if p and _os.path.exists(p):
+            return p
+        # QFontComboBox 会列出所有已安装字体，而静态表只覆盖常用字体。
+        # 从 Windows 字体注册表按字族及粗斜体档解析实际文件，确保选择
+        # Candara / Corbel / Comic Sans 等字体时不会无提示回退为 Arial。
+        if cls._WINDOWS_FONT_REGISTRY is None:
+            records = {}
+            try:
+                import re as _re
+                import winreg as _winreg
+                roots = [
+                    (_winreg.HKEY_LOCAL_MACHINE,
+                     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+                    (_winreg.HKEY_CURRENT_USER,
+                     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+                ]
+                suffixes = [
+                    (" bold italic", "BI"), (" bold oblique", "BI"),
+                    (" semibold italic", "BI"), (" semibold", "B"),
+                    (" bold", "B"), (" italic", "I"), (" oblique", "I"),
+                    (" regular", ""),
+                ]
+                for root, subkey in roots:
+                    try:
+                        key_handle = _winreg.OpenKey(root, subkey)
+                    except OSError:
+                        continue
+                    try:
+                        index = 0
+                        while True:
+                            try:
+                                label, value, _kind = _winreg.EnumValue(
+                                    key_handle, index)
+                                index += 1
+                            except OSError:
+                                break
+                            if not isinstance(value, str) or not value:
+                                continue
+                            label = _re.sub(r"\s*\([^)]*\)\s*$", "", label).strip()
+                            style = ""
+                            lowered = label.casefold()
+                            for suffix, candidate in suffixes:
+                                if lowered.endswith(suffix):
+                                    label = label[:-len(suffix)].strip()
+                                    style = candidate
+                                    break
+                            path = (value if _os.path.isabs(value) else
+                                    _os.path.join(_os.environ.get(
+                                        "WINDIR", r"C:\Windows"), "Fonts", value))
+                            if not _os.path.exists(path):
+                                continue
+                            for name in _re.split(r"\s*&\s*", label):
+                                normalized = _re.sub(r"\s+", " ", name).strip().casefold()
+                                if normalized:
+                                    records.setdefault(normalized, {})[style] = path
+                    finally:
+                        _winreg.CloseKey(key_handle)
+            except Exception:
+                records = {}
+            cls._WINDOWS_FONT_REGISTRY = records
+        import re as _re
+        normalized_family = _re.sub(r"\s+", " ", family).strip().casefold()
+        dynamic = (cls._WINDOWS_FONT_REGISTRY or {}).get(normalized_family) or {}
+        p = dynamic.get(key) or dynamic.get("")
         if p and _os.path.exists(p):
             return p
         return None
@@ -3478,7 +3979,7 @@ class DocumentView(QWidget):
         须改用原行文本启发式判定。
         """
         try:
-            cleaned = re.sub(r"^[A-Fa-f0-9]{6}\+", "",
+            cleaned = re.sub(r"^[A-Za-z]{6}\+", "",
                              (span_font or "")).strip()
             base = re.sub(r"[\s-]", "", cleaned).lower()
             if not base:
@@ -3615,7 +4116,9 @@ class DocumentView(QWidget):
             "opacity": 1.0,
         })
         self.modified = True
-        self.set_mode("view")
+        # 图片和签名创建后统一进入编辑模式，随后才允许移动、缩放、
+        # 替换或删除；阅读/选择模式不再承担对象编辑职责。
+        self.set_mode("replace_text")
         self._refresh_objects()
         self.page_view.select(self._obj_counter)
 
@@ -3652,6 +4155,15 @@ class DocumentView(QWidget):
         }
         if runs and len(runs) > 1:
             obj["runs"] = runs
+        else:
+            # “添加文字”过去只保存 fontfamily 字符串，烘焙时 generic
+            # HTML 路径会把它压成 serif / sans-serif / monospace，导致用户
+            # 选中的具体字体在保存后失效。单样式新文字直接携带对应系统
+            # 字体文件，与修改既有文字的字体保真路径保持一致。
+            embed = self._embed_for_style(
+                fontfamily, fontsize, bool(bold), bool(italic))
+            if embed:
+                obj["embed"] = embed
         self.objects.append(obj)
         self.modified = True
         if not keep_mode:
@@ -3685,12 +4197,19 @@ class DocumentView(QWidget):
                 self.permission_allowed(pymupdf.PDF_PERM_ANNOTATE)):
             self.statusMessage.emit("文档安全设置禁止删除对象", 4000)
             return
-        if self._find_object(oid) is None:
+        obj = self._find_object(oid)
+        if obj is None:
             return
-        self.begin_undo_step()
+        native = bool(obj.get("native_proxy"))
+        if not self.begin_undo_step(document_change=native):
+            return
+        detached = self._detach_native_annotation(obj) if native else False
         self.objects = [o for o in self.objects if o["id"] != oid]
         self.modified = True
-        self._refresh_objects()
+        if detached:
+            self._refresh()
+        else:
+            self._refresh_objects()
         self.page_view.update()
 
     def _on_object_double_clicked(self, oid):
@@ -3752,9 +4271,14 @@ class DocumentView(QWidget):
             obj.get("text", ""))
         text = text.strip()
         if ok and text:
-            self.begin_undo_step()
+            native = bool(obj.get("native_proxy"))
+            if not self.begin_undo_step(document_change=native):
+                return
+            detached = self._detach_native_annotation(obj) if native else False
             obj["text"] = text
             self.modified = True
+            if detached:
+                self._refresh()
             self.page_view.select(oid)
             self.statusMessage.emit(i18n.tr("note_updated"), 3000)
 
@@ -3911,11 +4435,17 @@ class DocumentView(QWidget):
         c = QColorDialog.getColor(obj.get("color") or QColor(self.edit_color),
                                   self, "选择标注颜色")
         if c.isValid():
-            self.begin_undo_step()
+            native = bool(obj.get("native_proxy"))
+            if not self.begin_undo_step(document_change=native):
+                return
+            detached = self._detach_native_annotation(obj) if native else False
             obj["color"] = QColor(c)
             self.edit_color = QColor(c)
             self.modified = True
-            self._refresh_objects()
+            if detached:
+                self._refresh()
+            else:
+                self._refresh_objects()
             self.page_view.select(oid)
             self.statusMessage.emit("标注颜色已更新", 3000)
 
@@ -3932,6 +4462,8 @@ class DocumentView(QWidget):
         if obj is None:
             return
         new_rect = QRectF(rect)
+        native = bool(obj.get("native_proxy"))
+        detached = False
         if old_rect is not None:
             old_rect = QRectF(old_rect)
             if old_rect == new_rect:
@@ -3939,15 +4471,49 @@ class DocumentView(QWidget):
             # PageView 与此处共享对象字典，鼠标拖动时对象已是新矩形。
             # 临时恢复旧值后记录，保证撤销回到拖动开始的位置。
             obj["rect"] = old_rect
-            self.begin_undo_step()
+            if not self.begin_undo_step(document_change=native):
+                self._refresh_objects()
+                return
+            detached = self._detach_native_annotation(obj) if native else False
         elif QRectF(obj["rect"]) != new_rect:
-            self.begin_undo_step()
+            if not self.begin_undo_step(document_change=native):
+                return
+            detached = self._detach_native_annotation(obj) if native else False
+        elif native:
+            # 某些调用方与 PageView 共享对象字典，进入此处时 rect 已经是
+            # 新值；原生批注仍需脱离，否则保存后会恢复到旧位置。
+            if not self.begin_undo_step(document_change=True):
+                return
+            detached = self._detach_native_annotation(obj)
         obj["rect"] = new_rect
         self.modified = True
+        if detached:
+            self._refresh()
+            self.page_view.select(oid)
+
+    def _on_object_rotated(self, oid, rotation, old_rotation):
+        """提交保存前图片/签名的一次旋转，并合并为一个撤销步骤。"""
+        obj = self._find_object(oid)
+        if obj is None or obj.get("kind") not in ("image", "signature"):
+            return
+        obj["rotation"] = float(old_rotation)
+        if not self.begin_undo_step():
+            self._refresh_objects()
+            return
+        obj["rotation"] = float(rotation)
+        self.modified = True
+        self._refresh_objects()
+        self.page_view.select(oid)
+        self.statusMessage.emit("对象已旋转，可按 Ctrl+Z 撤销", 3500)
 
     def _on_object_selected(self, oid):
+        obj = self._find_object(oid) if oid is not None else None
+        reading_annotation = (
+            self.current_mode == "view" and obj is not None and
+            obj.get("kind") in ({"note"} | ANNOTATION_OBJECT_KINDS))
+        if self.current_mode != "replace_text" and not reading_annotation:
+            return
         if oid is not None:
-            obj = self._find_object(oid)
             if obj is not None and obj.get("kind") == "note":
                 preview = obj.get("text", "").replace("\n", " ")
                 if len(preview) > 40:
@@ -3959,10 +4525,167 @@ class DocumentView(QWidget):
                     "拖动移动，拖动控制点缩放，双击改色，Delete 删除", 7000)
             else:
                 self.statusMessage.emit(
-                    "拖动移动，拖动角点缩放，Delete 删除", 6000)
+                    "拖动移动，控制点缩放，上方圆点旋转，Delete 删除", 6000)
 
     def delete_selected(self):
-        self.delete_object(self.page_view.selected_id())
+        record = getattr(self, "_selected_pdf_content", None)
+        oid = self.page_view.selected_id()
+        selected_obj = self._find_object(oid) if oid is not None else None
+        reading_annotation = (
+            self.current_mode == "view" and selected_obj is not None and
+            selected_obj.get("kind") in ({"note"} | ANNOTATION_OBJECT_KINDS))
+        # 阅读模式只允许删除批注；图片、签名、文字和 PDF 图片仍必须进入
+        # 编辑模式。页面缩略图有独立删除入口，不受这里影响。
+        if self.current_mode != "replace_text" and not reading_annotation:
+            if record is not None or oid is not None:
+                return
+        if record is not None:
+            if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
+                return
+            if not self.begin_undo_step(document_change=True):
+                return
+            if (record.get("kind") == "image"):
+                removed = backend.remove_pdf_image_object(self.doc, record)
+            else:
+                removed = bool(backend.remove_watermark(self.doc, record))
+            if not removed:
+                self.undo()
+                self.statusMessage.emit("无法安全删除该对象", 3500)
+                return
+            pages = list(record.get("pages") or [record.get("page", 0)])
+            self._selected_pdf_content = None
+            self.modified = True
+            self.page_view.set_edit_selection()
+            for pno in pages:
+                self.page_view.invalidate_text_cache(int(pno))
+                self.page_view._images.pop(int(pno), None)
+                self.page_view._render_page(int(pno))
+            self.page_view.update()
+            self.statusMessage.emit("对象已删除，可按 Ctrl+Z 撤销", 3500)
+            return
+        self.delete_object(oid)
+
+    def _on_pdf_image_changed(self, page, rect, old_rect):
+        """提交编辑模式中 PDF 图片/已保存签名的一次移动或自由缩放。"""
+        record = getattr(self, "_selected_pdf_content", None)
+        if (record is None or record.get("kind") != "image" or
+                int(record.get("page", -1)) != int(page)):
+            self.page_view.set_edit_selection(int(page), old_rect)
+            return
+        if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
+            self.page_view.set_edit_selection(int(page), old_rect)
+            return
+        moved_or_resized = QRectF(rect) != QRectF(old_rect)
+        if not moved_or_resized:
+            self.page_view.set_edit_selection(int(page), old_rect)
+            return
+        if not self.begin_undo_step(document_change=True):
+            self.page_view.set_edit_selection(int(page), old_rect)
+            return
+        size_changed = (abs(float(rect.width() - old_rect.width())) > 1e-7 or
+                        abs(float(rect.height() - old_rect.height())) > 1e-7)
+        if size_changed:
+            changed = backend.resize_pdf_image_object(
+                self.doc, record,
+                [rect.left(), rect.top(), rect.right(), rect.bottom()])
+        else:
+            dx = float(rect.x() - old_rect.x())
+            dy = float(rect.y() - old_rect.y())
+            changed = backend.move_pdf_image_object(self.doc, record, dx, dy)
+        if not changed:
+            self.undo()
+            self.statusMessage.emit("无法安全移动或缩放该图片对象", 3500)
+            return
+        pno = int(page)
+        self.modified = True
+        self.page_view.invalidate_text_cache(pno)
+        self.page_view._images.pop(pno, None)
+        self.page_view._render_page(pno)
+        # 重新枚举以取得 PDF 引擎计算后的精确 bbox/变换，便于连续拖动。
+        fresh = next((item for item in backend.isolated_image_objects(
+            self.doc, pno) if item.get("id") == record.get("id")), None)
+        if fresh is not None:
+            self._selected_pdf_content = fresh
+            rr = fresh.get("rect") or record.get("rect")
+            rect = QRectF(float(rr[0]), float(rr[1]),
+                          float(rr[2]) - float(rr[0]),
+                          float(rr[3]) - float(rr[1]))
+        self.page_view.set_edit_selection(pno, rect, self._selected_pdf_content)
+        self.page_view.setFocus()
+        self.statusMessage.emit(
+            "图片已缩放，可按 Ctrl+Z 撤销" if size_changed else
+            "图片已挪动，可按 Ctrl+Z 撤销", 3500)
+
+    def _on_pdf_image_rotated(self, page, degrees):
+        """提交编辑模式中 PDF 图片/已保存签名的任意角度旋转。"""
+        record = getattr(self, "_selected_pdf_content", None)
+        if (record is None or record.get("kind") != "image" or
+                int(record.get("page", -1)) != int(page)):
+            return
+        if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
+            return
+        if abs(float(degrees)) < 1e-5:
+            return
+        if not self.begin_undo_step(document_change=True):
+            return
+        if not backend.rotate_pdf_image_object(self.doc, record, degrees):
+            self.undo()
+            self.statusMessage.emit("无法安全旋转该图片对象", 3500)
+            return
+        pno = int(page)
+        self.modified = True
+        self.page_view.invalidate_text_cache(pno)
+        self.page_view._images.pop(pno, None)
+        self.page_view._render_page(pno)
+        fresh = next((item for item in backend.isolated_image_objects(
+            self.doc, pno) if item.get("id") == record.get("id")), None)
+        if fresh is not None:
+            self._selected_pdf_content = fresh
+            rr = fresh.get("rect") or record.get("rect")
+        else:
+            rr = record.get("rect")
+        rect = QRectF(float(rr[0]), float(rr[1]),
+                      float(rr[2]) - float(rr[0]),
+                      float(rr[3]) - float(rr[1]))
+        self.page_view.set_edit_selection(pno, rect, self._selected_pdf_content)
+        self.page_view.setFocus()
+        self.statusMessage.emit("图片已旋转，可按 Ctrl+Z 撤销", 3500)
+
+    def _replace_selected_pdf_image(self, record, rect):
+        """替换“修改文字”模式选中的独立 PDF 图片对象。"""
+        if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "编辑文档"):
+            return False
+        path, _ = QFileDialog.getOpenFileName(
+            self, "替换图片", "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not path:
+            return False
+        preview = QImage(path)
+        if preview.isNull():
+            QMessageBox.warning(self, "替换图片", "无法读取所选图片。")
+            return False
+        try:
+            with open(path, "rb") as stream:
+                image_bytes = stream.read()
+        except OSError as exc:
+            QMessageBox.warning(self, "替换图片", f"无法读取所选图片：\n{exc}")
+            return False
+        if not self.begin_undo_step(document_change=True):
+            return False
+        if not backend.replace_isolated_image_object(
+                self.doc, record, image_bytes):
+            self.undo()
+            QMessageBox.warning(self, "替换图片", "无法安全替换该图片对象。")
+            return False
+        pno = int(record.get("page", 0))
+        self.modified = True
+        self._selected_pdf_content = record
+        self.page_view.invalidate_text_cache(pno)
+        self.page_view._images.pop(pno, None)
+        self.page_view._render_page(pno)
+        self.page_view.set_edit_selection(pno, rect, self._selected_pdf_content)
+        self.page_view.setFocus()
+        self.statusMessage.emit("图片已替换，原缩放、旋转和透明度保持不变", 4500)
+        return True
 
     def _on_context_menu(self, global_pos):
         menu = self._build_context_menu(global_pos)
@@ -4019,7 +4742,11 @@ class DocumentView(QWidget):
                     self.start_image(p, pt))
             action.setEnabled(can_modify and target is not None)
             menu.addSeparator()
-        if sel_obj is not None:
+        editing = self.current_mode == "replace_text"
+        annotation_interaction = (
+            self.current_mode == "view" and sel_obj is not None and
+            sel_obj.get("kind") in ({"note"} | ANNOTATION_OBJECT_KINDS))
+        if (editing or annotation_interaction) and sel_obj is not None:
             if sel_obj.get("kind") == "note":
                 action = menu.addAction(
                     i18n.tr("edit_annotation"),
@@ -4034,6 +4761,15 @@ class DocumentView(QWidget):
                 menu.addSeparator()
             action = menu.addAction(i18n.tr("delete_object"), self.delete_selected)
             action.setEnabled(can_modify or can_annotate)
+        pdf_record = getattr(self, "_selected_pdf_content", None)
+        if (editing and pdf_record is not None and
+                pdf_record.get("kind") == "image"):
+            action = menu.addAction(
+                "替换图片", lambda: self._replace_selected_pdf_image(
+                    pdf_record, self.page_view._edit_selected[1]))
+            action.setEnabled(can_modify)
+            action = menu.addAction(i18n.tr("delete_object"), self.delete_selected)
+            action.setEnabled(can_modify)
         if self.pending_sign_qimg is not None or self.pending_image_qimg is not None \
                 or self.pending_paste_text or self.pending_note_text:
             menu.addAction(i18n.tr("cancel_place"), self._cancel_placement)
@@ -4082,6 +4818,8 @@ class DocumentView(QWidget):
                 permission, operation):
             key = "view"
         self.current_mode = key
+        self._selected_pdf_content = None
+        self.page_view.set_edit_selection()
         self._viewport_pan_last = None
         self.scroll.viewport().setCursor(
             Qt.CursorShape.OpenHandCursor
@@ -4211,6 +4949,9 @@ class DocumentView(QWidget):
         self._prepare_sign(img, match_image_scale=True)
 
     def _prepare_sign(self, img, match_image_scale=False):
+        # 签名设计与签名库共用此入口。先通过正式模式切换退出“修改文字”
+        # 覆盖层并提交可能尚未失焦的行内编辑，再进入点击放置状态。
+        self.set_mode("view")
         self.pending_sign_qimg = img.copy()
         self.pending_sign_match_image_scale = bool(match_image_scale)
         self.current_mode = "sign"

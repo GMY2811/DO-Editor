@@ -1,9 +1,9 @@
-; DO编辑器 安装脚本 (Inno Setup 7)
+﻿; DO编辑器 安装脚本 (Inno Setup 7)
 #ifndef BuildSource
-#define BuildSource "dist_v301\DO编辑器"
+#define BuildSource "dist_v310\DO编辑器"
 #endif
 #define MyAppName "DO编辑器"
-#define MyAppVersion "3.0.1"
+#define MyAppVersion "3.1.0"
 #define MyAppPublisher "RAY"
 #define MyAppExeName "DO编辑器.exe"
 
@@ -22,7 +22,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={cm:AppDisplayName}
 DisableProgramGroupPage=yes
 OutputDir=installer
-OutputBaseFilename={#MyAppName}-Setup-v{#MyAppVersion}
+OutputBaseFilename=DO-Editor-Setup-v{#MyAppVersion}
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern

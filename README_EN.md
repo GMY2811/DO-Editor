@@ -1,6 +1,6 @@
 # DO Editor (DO编辑器)
 
-[![Download](https://img.shields.io/badge/Download-v3.0.1-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v3.0.1/DO-Editor-Setup-v3.0.1.exe)
+[![Download](https://img.shields.io/badge/Download-v3.1.0-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v3.1.0/DO-Editor-Setup-v3.1.0.exe)
 [![Release](https://img.shields.io/github/v/release/GMY2811/DO-Editor?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/latest)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 
@@ -33,10 +33,11 @@ python main.py
 ## Features
 
 - **Reading**: continuous scrolling, zoom, page navigation, thumbnail sidebar, multi-tab, clean fullscreen mode
-- **Editing**: highlight, underline, strikethrough, rectangle, line, freehand drawing, text (font/size/color), replace text, insert image
+- **Editing**: highlight, underline, strikethrough, rectangle, line, freehand drawing, text (font/size/color), replace text, insert images; move, replace, or delete embedded PDF images directly
 - **Merge / Split**: merge multiple files, split by page range / every N pages, extract specific pages
 - **Signature**: signature design, text signature, signature library (save/reuse)
-- **Watermark**: text watermark (size/color/opacity/rotation/tiled)
+- **Watermarks**: add, modify, and non-destructively remove text/image watermarks;
+  supports Acrobat OCG and FixedPrint watermarks plus isolated-stream detection
 - **Copy / Search**: drag to select text and copy, Ctrl+C / Ctrl+V, search with highlighted results
 - **Open Word**: convert .docx/.doc to PDF via local Microsoft Word
 - **Multilingual**: Chinese / English UI switching

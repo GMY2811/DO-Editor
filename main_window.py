@@ -462,6 +462,17 @@ class PdfSecurityDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
+        # 打开密码留空时的风险提示（随输入实时显隐）。
+        self.no_user_warning = QLabel(
+            "⚠ 打开密码留空：任何拿到文件的人都能直接打开文档。\n"
+            "所有者密码只能拦截常规编辑，无法阻止他人用其他 PDF 工具"
+            "重设权限。如需真正防止他人修改，请务必设置打开密码。",
+            self)
+        self.no_user_warning.setWordWrap(True)
+        self.no_user_warning.setStyleSheet("color:#d9803a;")
+        self.no_user_warning.setVisible(False)
+        layout.addWidget(self.no_user_warning)
+
         form = QFormLayout()
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(10)
@@ -480,6 +491,10 @@ class PdfSecurityDialog(QDialog):
         form.addRow("所有者密码：", self.owner_password)
         form.addRow("确认所有者密码：", self.owner_confirm)
         layout.addLayout(form)
+
+        # 打开密码留空（仅所有者密码）时展示风险提示。
+        self.user_password.textChanged.connect(self._update_no_user_warning)
+        self.user_confirm.textChanged.connect(self._update_no_user_warning)
 
         self.show_passwords = QCheckBox("显示密码", self)
         self.show_passwords.toggled.connect(self._toggle_passwords)
@@ -515,6 +530,12 @@ class PdfSecurityDialog(QDialog):
         for edit in (self.user_password, self.user_confirm,
                      self.owner_password, self.owner_confirm):
             edit.setEchoMode(mode)
+
+    def _update_no_user_warning(self):
+        """打开密码两栏均为空 → 显示风险提示；任一生效 → 隐藏。"""
+        empty = (not self.user_password.text() and
+                 not self.user_confirm.text())
+        self.no_user_warning.setVisible(empty)
 
     def _validate_and_accept(self):
         user_pw = self.user_password.text()
@@ -888,7 +909,8 @@ class MainWindow(QMainWindow):
 
         self.act["print"].setEnabled(can_print)
         self.act["copy_all"].setEnabled(can_copy)
-        for key in ("image", "watermark", "delete_page"):
+        for key in ("image", "watermark", "modify_watermark",
+                    "delete_watermark", "detect_watermark", "delete_page"):
             self.act[key].setEnabled(can_modify)
         for key in ("sign", "sign_lib", "annotation"):
             self.act[key].setEnabled(can_annotate)
@@ -984,14 +1006,14 @@ class MainWindow(QMainWindow):
            triggered=self.open_pdf)
         mk("save", "save", "保存", shortcut=QKeySequence.StandardKey.Save,
            triggered=lambda: self.current_view().save())
-        mk("save_as", None, "另存为", shortcut="Ctrl+Shift+S",
+        mk("save_as", "save", "另存为", shortcut="Ctrl+Shift+S",
            triggered=lambda: self.current_view().save_as())
         mk("print", "print", "打印", shortcut=QKeySequence.StandardKey.Print,
            triggered=lambda: self.current_view().print_pdf())
-        mk("close", None, "关闭标签页", shortcut="Ctrl+W",
+        mk("close", "close", "关闭标签页", shortcut="Ctrl+W",
            triggered=lambda: self._close_tab(self.tabs.currentIndex()))
 
-        mk("undo", None, "撤销", shortcut=QKeySequence.StandardKey.Undo,
+        mk("undo", "undo", "撤销", shortcut=QKeySequence.StandardKey.Undo,
            triggered=self._perform_undo)
         a["undo"].setEnabled(False)
 
@@ -1002,7 +1024,7 @@ class MainWindow(QMainWindow):
         mk("fit_width", "fit_width", "适合宽度",
            triggered=lambda: self.current_view().toggle_fit())
         mk("sidebar", "sidebar", "侧边栏", triggered=self._toggle_sidebar)
-        mk("sidebar_default", None, "启动时显示侧边栏", checkable=True,
+        mk("sidebar_default", "sidebar", "启动时显示侧边栏", checkable=True,
            toggled=self._set_sidebar_default)
         a["sidebar_default"].setChecked(self.sidebar_default_visible)
 
@@ -1010,20 +1032,26 @@ class MainWindow(QMainWindow):
            triggered=lambda: self.current_view().delete_current_page())
         mk("merge", "merge", "合并 PDF", triggered=self.merge_pdfs)
         mk("split_every", "split", "每 N 页拆分", triggered=self.split_every_n)
-        mk("split_ranges", None, "按页码范围拆分", triggered=self.split_by_ranges)
-        mk("extract", None, "提取指定页", triggered=self.extract_pages)
+        mk("split_ranges", "split", "按页码范围拆分", triggered=self.split_by_ranges)
+        mk("extract", "extract", "提取指定页", triggered=self.extract_pages)
         mk("watermark", "watermark", "添加水印", triggered=self.add_watermark)
+        mk("modify_watermark", "edit", "修改水印",
+           triggered=self.modify_watermark)
+        mk("delete_watermark", "trash", "删除水印",
+           triggered=self.delete_watermark)
+        mk("detect_watermark", "watermark", "检测疑似水印",
+           triggered=self.detect_watermark)
         mk("ocr_current", "ocr", "识别当前页面",
            triggered=self.ocr_current_page)
         mk("ocr_all", "ocr_all", "识别全部页面",
            triggered=self.ocr_all_pages)
         mk("ocr_toolbar", "ocr", "OCR识别",
            triggered=self.ocr_current_page)
-        mk("security_set", None, "设置密码", triggered=self.set_pdf_security)
-        mk("security_remove", None, "删除密码", triggered=self.remove_pdf_security)
-        mk("security_status", None, "查看加密状态",
+        mk("security_set", "lock", "设置密码", triggered=self.set_pdf_security)
+        mk("security_remove", "unlock", "删除密码", triggered=self.remove_pdf_security)
+        mk("security_status", "info", "查看加密状态",
            triggered=self.show_pdf_security_status)
-        mk("copy_all", None, "复制本页全部文字",
+        mk("copy_all", "text_select", "复制本页全部文字",
            triggered=lambda: self.current_view().copy_page_text())
         mk("image", "image", "插入图片",
            triggered=lambda: self.current_view().start_image())
@@ -1034,22 +1062,22 @@ class MainWindow(QMainWindow):
            triggered=lambda: self.current_view().start_sign())
         mk("sign_lib", "library", "签名库",
            triggered=lambda: self.current_view().open_sign_lib())
-        mk("fullscreen", None, "全屏", triggered=self.toggle_fullscreen)
+        mk("fullscreen", "fullscreen", "全屏", triggered=self.toggle_fullscreen)
         mk("slideshow", "slideshow", "幻灯片", shortcut="F5",
            triggered=lambda: self.current_view().start_slideshow())
-        mk("about", None, "关于", triggered=self.about)
-        mk("star_us", None, "给个 Star", triggered=self._open_repo_url)
-        mk("feedback", None, "反馈建议", triggered=self._open_feedback_url)
-        mk("check_update", None, "检查更新", triggered=self._check_update_now)
-        mk("reward", None, "支持作者", triggered=self._show_reward_from_menu)
+        mk("about", "info", "关于", triggered=self.about)
+        mk("star_us", "sun", "给个 Star", triggered=self._open_repo_url)
+        mk("feedback", "annotation", "反馈建议", triggered=self._open_feedback_url)
+        mk("check_update", "undo", "检查更新", triggered=self._check_update_now)
+        mk("reward", "sign", "支持作者", triggered=self._show_reward_from_menu)
 
         self.theme_group = QActionGroup(self)
         self.theme_group.setExclusive(True)
-        mk("theme_light", None, "浅色", checkable=True,
+        mk("theme_light", "sun", "浅色", checkable=True,
            triggered=lambda: self.set_theme("light"))
-        mk("theme_dark", None, "深色", checkable=True,
+        mk("theme_dark", "moon", "深色", checkable=True,
            triggered=lambda: self.set_theme("dark"))
-        mk("theme_system", None, "跟随系统", checkable=True,
+        mk("theme_system", "system", "跟随系统", checkable=True,
            triggered=lambda: self.set_theme("system"))
         for k in ("theme_light", "theme_dark", "theme_system"):
             self.theme_group.addAction(a[k])
@@ -1393,13 +1421,21 @@ class MainWindow(QMainWindow):
         self._m_tools.addAction(self.act["split_ranges"])
         self._m_tools.addAction(self.act["extract"])
         self._m_tools.addAction(self.act["watermark"])
+        self._m_tools.addAction(self.act["modify_watermark"])
+        self._m_tools.addAction(self.act["delete_watermark"])
+        # 可安全隔离的候选已自动并入修改/删除，不再让用户先走“检测”。
         self._m_tools.addAction(self.act["annotation"])
         self._m_tools.addSeparator()
         self._m_signature_tools = self._m_tools.addMenu(i18n.tr("sign_title"))
+        self._m_signature_tools.setIcon(
+            icons.get("library", self._icon_color))
+        self._icon_key_of[self._m_signature_tools.menuAction()] = "library"
         self._m_signature_tools.addAction(self.act["sign"])
         self._m_signature_tools.addAction(self.act["sign_lib"])
         self._m_tools.addSeparator()
         self._m_ocr = self._m_tools.addMenu(i18n.tr("menu_ocr"))
+        self._m_ocr.setIcon(icons.get("ocr", self._icon_color))
+        self._icon_key_of[self._m_ocr.menuAction()] = "ocr"
         self._m_ocr.addAction(self.act["ocr_current"])
         self._m_ocr.addAction(self.act["ocr_all"])
 
@@ -1411,16 +1447,23 @@ class MainWindow(QMainWindow):
 
         self._m_view = self.menuBar().addMenu(i18n.tr("menu_view"))
         self._m_theme = self._m_view.addMenu(i18n.tr("menu_theme"))
+        self._m_theme.setIcon(icons.get("color", self._icon_color))
+        self._icon_key_of[self._m_theme.menuAction()] = "color"
         self._m_theme.addAction(self.act["theme_light"])
         self._m_theme.addAction(self.act["theme_dark"])
         self._m_theme.addAction(self.act["theme_system"])
 
         # 语言子菜单
         self._m_lang = self._m_view.addMenu(i18n.tr("menu_lang"))
+        self._m_lang.setIcon(icons.get("language", self._icon_color))
+        self._icon_key_of[self._m_lang.menuAction()] = "language"
         self._lang_group = QActionGroup(self)
         self._lang_group.setExclusive(True)
         self._lang_zh_act = QAction(i18n.tr("lang_zh"), self, checkable=True)
         self._lang_en_act = QAction(i18n.tr("lang_en"), self, checkable=True)
+        for action in (self._lang_zh_act, self._lang_en_act):
+            action.setIcon(icons.get("language", self._icon_color))
+            self._icon_key_of[action] = "language"
         self._lang_group.addAction(self._lang_zh_act)
         self._lang_group.addAction(self._lang_en_act)
         self._lang_zh_act.triggered.connect(lambda: self.set_language("zh"))
@@ -1625,10 +1668,40 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("OCR 已取消，文档未作修改", 3000)
 
     # ================= PDF 安全 =================
+    def _authenticate_owner(self, view, action_desc):
+        """要求输入当前所有者密码验证 owner 身份。通过返回 True。
+
+        只有真正的所有者（知道当前 owner 密码）才允许修改/移除现有
+        密码与权限设置；否则任何能打开文件的人都可覆盖权限字典后再
+        解除限制（PDF 权限只存在加密字典中，重设 owner 即重置全部
+        权限位——这是绕过保护的关键一步，必须在 UI 层堵住）。
+        """
+        owner_pw, ok = QInputDialog.getText(
+            self, "验证所有者密码",
+            f"{action_desc}需要输入当前所有者密码：",
+            QLineEdit.EchoMode.Password)
+        if not ok:
+            return False
+        try:
+            auth_level = int(view.doc.authenticate(owner_pw))
+        except Exception:
+            auth_level = 0
+        if not (auth_level & 4):
+            QMessageBox.warning(self, "验证失败", "所有者密码不正确。")
+            return False
+        view._auth_level = auth_level
+        view._open_password = owner_pw
+        return True
+
     def set_pdf_security(self):
         view = self._view_doc()
         if not view:
             return
+        # 已加密文档：非所有者必须先通过当前所有者密码验证，否则任意
+        # 打开者都能重设密码并勾满权限，覆盖原文档的所有权保护。
+        if view._source_encrypted and not (view._auth_level & 4):
+            if not self._authenticate_owner(view, "重新设置密码与权限"):
+                return
         dialog = PdfSecurityDialog(self)
         if self._exec_themed_dialog(dialog) != QDialog.DialogCode.Accepted:
             return
@@ -1650,18 +1723,8 @@ class MainWindow(QMainWindow):
             return
 
         if view._source_encrypted and not (view._auth_level & 4):
-            owner_pw, ok = QInputDialog.getText(
-                self, "验证所有者密码",
-                "移除 PDF 保护需要输入所有者密码：",
-                QLineEdit.EchoMode.Password)
-            if not ok:
+            if not self._authenticate_owner(view, "移除 PDF 保护"):
                 return
-            auth_level = int(view.doc.authenticate(owner_pw))
-            if not (auth_level & 4):
-                QMessageBox.warning(self, "验证失败", "所有者密码不正确。")
-                return
-            view._auth_level = auth_level
-            view._open_password = owner_pw
 
         answer = QMessageBox.question(
             self, "删除 PDF 密码",
@@ -1708,6 +1771,8 @@ class MainWindow(QMainWindow):
         self.act["exit"] = QAction(i18n.tr("exit"), self,
                                    shortcut=QKeySequence.StandardKey.Quit,
                                    triggered=self.close)
+        self.act["exit"].setIcon(icons.get("close", self._icon_color))
+        self._icon_key_of[self.act["exit"]] = "close"
         return self.act["exit"]
 
     def _build_statusbar(self):
@@ -1726,6 +1791,7 @@ class MainWindow(QMainWindow):
             icons.get("search", self._icon_color),
             QLineEdit.ActionPosition.LeadingPosition)
         self.search_edit.returnPressed.connect(self._do_search)
+        self.search_edit.textChanged.connect(self._on_search_text_changed)
 
         self.btn_search = QToolButton()
         self.btn_search.setObjectName("btn_search")
@@ -2042,6 +2108,15 @@ class MainWindow(QMainWindow):
         else:
             view.search(text)
 
+    def _on_search_text_changed(self, text):
+        """清空搜索框即结束搜索，并立即移除全部命中色块。"""
+        if str(text).strip():
+            return
+        view = self.current_view()
+        if view is not None:
+            view.search("")
+        self.statusBar().clearMessage()
+
     def _search_prev(self):
         view = self.current_view()
         if view:
@@ -2135,6 +2210,169 @@ class MainWindow(QMainWindow):
         view.modified = True
         view._refresh()
         self.statusBar().showMessage(i18n.tr("watermark_added"), 3000)
+
+    @staticmethod
+    def _watermark_display(record):
+        label = str(record.get("label") or record.get("text") or
+                    record.get("name") or record.get("id"))
+        pages = record.get("pages") or []
+        if pages:
+            page_text = ", ".join(str(int(p) + 1) for p in pages[:6])
+            if len(pages) > 6:
+                page_text += ", …"
+            label += f"  [p. {page_text}]"
+        origin = record.get("origin")
+        if origin == "acrobat-ocg":
+            label += "  (Acrobat OCG)"
+        elif origin == "acrobat-fixed":
+            label += "  (FixedPrint)"
+        elif origin == "candidate":
+            label += "  (?)"
+        return label
+
+    def _choose_watermark(self, records, title_key, prompt_key):
+        if not records:
+            return None
+        labels = [self._watermark_display(record) for record in records]
+        selected, ok = QInputDialog.getItem(
+            self, i18n.tr(title_key), i18n.tr(prompt_key), labels, 0, False)
+        if not ok:
+            return None
+        try:
+            return records[labels.index(selected)]
+        except (ValueError, IndexError):
+            return None
+
+    def modify_watermark(self):
+        view = self._view_doc()
+        if not view:
+            return
+        # 确定性水印与安全隔离的候选统一呈现，用户无需先运行“检测”。
+        records = backend.list_watermarks(view.doc, include_candidates=True)
+        if not records:
+            QMessageBox.information(
+                self, i18n.tr("hint"), i18n.tr("watermark_none"))
+            return
+        record = self._choose_watermark(
+            records, "modify_watermark", "watermark_choose")
+        if record is None:
+            return
+        from document_view import AddWatermarkDialog
+        dlg = AddWatermarkDialog(self, record=record)
+        if record.get("origin") != "do-editor":
+            dlg.setToolTip(i18n.tr("watermark_external_replace"))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        res = dlg.result()
+        source_bytes = None
+        if res[0] == "image":
+            _, img_path, scale, opacity, rotate, tiled = res
+            if not img_path:
+                source_bytes = backend.watermark_source_bytes(view.doc, record)
+            if not img_path and not source_bytes:
+                QMessageBox.information(
+                    self, i18n.tr("hint"), i18n.tr("watermark_image_empty"))
+                return
+        else:
+            _, text, fontsize, color, opacity, rotate, tiled = res
+            if not text:
+                QMessageBox.information(
+                    self, i18n.tr("hint"), i18n.tr("watermark_empty"))
+                return
+        view.begin_undo_step(document_change=True)
+        if record.get("origin") == "do-editor":
+            if res[0] == "image":
+                changed = backend.update_watermark(
+                    view.doc, record, kind="image", image_path=img_path,
+                    image_bytes=source_bytes, scale=scale, opacity=opacity,
+                    rotate=rotate, tiled=tiled)
+            else:
+                changed = backend.update_watermark(
+                    view.doc, record, kind="text", text=text,
+                    fontsize=fontsize, color=color, opacity=opacity,
+                    rotate=rotate, tiled=tiled)
+        else:
+            removed = backend.remove_watermark(view.doc, record)
+            if res[0] == "image":
+                changed = removed and backend.add_image_watermark(
+                    view.doc, img_path, image_bytes=source_bytes,
+                    image_name=record.get("image_name"), scale=scale,
+                    opacity=opacity, rotate=rotate, tiled=tiled,
+                    pages=record.get("pages"))
+            else:
+                changed = removed and backend.add_watermark(
+                    view.doc, text, fontsize=fontsize, color=color,
+                    opacity=opacity, rotate=rotate, tiled=tiled,
+                    pages=record.get("pages"))
+        if not changed:
+            view.undo()
+            QMessageBox.warning(
+                self, i18n.tr("hint"), i18n.tr("watermark_modify_failed"))
+            return
+        view.modified = True
+        view._refresh()
+        self.statusBar().showMessage(i18n.tr("watermark_modified"), 3000)
+
+    def delete_watermark(self):
+        view = self._view_doc()
+        if not view:
+            return
+        # Acrobat 式单入口：可安全隔离的外部水印也直接出现在删除列表。
+        records = backend.list_watermarks(view.doc, include_candidates=True)
+        if not records:
+            QMessageBox.information(
+                self, i18n.tr("hint"), i18n.tr("watermark_none"))
+            return
+        record = self._choose_watermark(
+            records, "delete_watermark", "watermark_choose")
+        if record is None:
+            return
+        name = self._watermark_display(record)
+        if QMessageBox.question(
+                self, i18n.tr("delete_watermark"),
+                i18n.tr("watermark_delete_confirm").format(name=name),
+                QMessageBox.StandardButton.Yes |
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        view.begin_undo_step(document_change=True)
+        if not backend.remove_watermark(view.doc, record):
+            view.undo()
+            QMessageBox.warning(
+                self, i18n.tr("hint"), i18n.tr("watermark_delete_failed"))
+            return
+        view.modified = True
+        view._refresh()
+        self.statusBar().showMessage(i18n.tr("watermark_deleted"), 3000)
+
+    def detect_watermark(self):
+        view = self._view_doc()
+        if not view:
+            return
+        records = backend.detect_watermark_candidates(view.doc)
+        if not records:
+            QMessageBox.information(
+                self, i18n.tr("hint"), i18n.tr("watermark_candidate_none"))
+            return
+        record = self._choose_watermark(
+            records, "detect_watermark", "watermark_choose_candidate")
+        if record is None:
+            return
+        name = self._watermark_display(record)
+        if QMessageBox.question(
+                self, i18n.tr("detect_watermark"),
+                i18n.tr("watermark_candidate_confirm").format(name=name),
+                QMessageBox.StandardButton.Yes |
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        view.begin_undo_step(document_change=True)
+        if not backend.remove_watermark(view.doc, record):
+            view.undo()
+            QMessageBox.warning(
+                self, i18n.tr("hint"), i18n.tr("watermark_delete_failed"))
+            return
+        view.modified = True
+        view._refresh()
+        self.statusBar().showMessage(i18n.tr("watermark_deleted"), 3000)
 
     def merge_pdfs(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择要合并的 PDF", "",

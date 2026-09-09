@@ -1,6 +1,6 @@
 # DO编辑器（DO Editor）
 
-[![Download](https://img.shields.io/badge/Download-v3.0.1-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v3.0.1/DO-Editor-Setup-v3.0.1.exe)
+[![Download](https://img.shields.io/badge/Download-v3.1.0-0a84ff?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/download/v3.1.0/DO-Editor-Setup-v3.1.0.exe)
 [![Release](https://img.shields.io/github/v/release/GMY2811/DO-Editor?style=for-the-badge&logo=github)](https://github.com/GMY2811/DO-Editor/releases/latest)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=for-the-badge)](LICENSE)
 
@@ -33,10 +33,11 @@ python main.py
 ## 功能
 
 - **阅读**：连续滚动、缩放、翻页、缩略图侧栏、多标签页、全屏纯净模式
-- **编辑**：高亮、下划线、删除线、矩形、直线、手绘、文本（字体/字号/颜色）、修改文字、插入图片
+- **编辑**：高亮、下划线、删除线、矩形、直线、手绘、文本（字体/字号/颜色）、修改文字、插入图片；PDF 内嵌图片可直接挪动、替换和删除
 - **合并 / 拆分**：多文件合并、按页码/每 N 页拆分、提取指定页
 - **签名**：签名设计、文字签名、签名库（保存/调用）
-- **水印**：文字水印（字号/颜色/透明度/旋转/平铺）
+- **水印**：文字/图片水印，可修改和无损删除；兼容 Acrobat OCG、FixedPrint
+  水印，并可检测位于独立内容流中的疑似水印
 - **复制 / 搜索**：滑动选取文字复制、Ctrl+C/Ctrl+V、搜索高亮定位
 - **读取 Word**：借助本机 Microsoft Word 把 .docx/.doc 转为 PDF 查看
 - **多语言**：中文 / English 界面切换

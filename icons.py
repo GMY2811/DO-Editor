@@ -22,6 +22,11 @@ _ACCENT_LIGHT = {
     "ocr": "#5368c9", "ocr_all": "#6757c8",
     "trash": "#cf4545", "select": "#3e63c7",
     "slideshow": "#0e8a5f",
+    "undo": "#526f91", "extract": "#6d55c7",
+    "lock": "#8057c8", "unlock": "#168068", "info": "#2474d2",
+    "fullscreen": "#2474d2", "sun": "#a86f08", "moon": "#6755b5",
+    "system": "#526f91", "language": "#087f75",
+    "print": "#2474d2",
 }
 _ACCENT_DARK = {
     "open": "#69adff", "save": "#69adff", "fit_width": "#69adff",
@@ -34,6 +39,11 @@ _ACCENT_DARK = {
     "ocr": "#9caeff", "ocr_all": "#b7a5ff",
     "trash": "#ff746f", "select": "#91adff",
     "slideshow": "#4ecf96",
+    "undo": "#a8c9ec", "extract": "#b6a0ff",
+    "lock": "#c09cff", "unlock": "#62d5af", "info": "#69adff",
+    "fullscreen": "#69adff", "sun": "#f2c45c", "moon": "#b7a4ff",
+    "system": "#a8c9ec", "language": "#5bd4c7",
+    "print": "#69adff",
 }
 _WIDE_ICONS = frozenset(_ACCENT_LIGHT)
 
@@ -328,11 +338,12 @@ def icon_close():
 
 def icon_print():
     def d(p, s):
-        p.drawRect(QRectF(6, 7, 12, 10))
-        _line(p, 9, 4, 15, 4)
-        _line(p, 9, 4, 9, 7)
-        _line(p, 15, 4, 15, 7)
-        p.drawRect(QRectF(9, 14, 6, 4))
+        # 与保存、侧边栏等主工具一致：32×24 宽版、2px 圆头线框，
+        # 不使用旧图标的小方框叠加造型。
+        p.drawRoundedRect(QRectF(4, 8, 16, 9), 2, 2)
+        p.drawRect(QRectF(7, 3, 10, 7))
+        p.drawRect(QRectF(7, 14, 10, 7))
+        p.drawEllipse(QRectF(16.5, 10.5, 1.5, 1.5))
     return _build(d)
 
 
@@ -441,6 +452,96 @@ def icon_color():
     return _build(d)
 
 
+def icon_undo():
+    def d(p, s):
+        path = QPainterPath(QPointF(19, 17))
+        path.cubicTo(18, 9, 10, 7, 6, 12)
+        p.drawPath(path)
+        p.drawPolyline([QPointF(6, 7), QPointF(6, 12), QPointF(11, 12)])
+    return _build(d)
+
+
+def icon_extract():
+    def d(p, s):
+        p.drawRect(QRectF(4, 4, 11, 16))
+        _line(p, 8, 8, 12, 8)
+        _line(p, 8, 11, 12, 11)
+        _line(p, 13, 15, 21, 15)
+        p.drawPolyline([QPointF(18, 12), QPointF(21, 15), QPointF(18, 18)])
+    return _build(d)
+
+
+def icon_lock():
+    def d(p, s):
+        p.drawRoundedRect(QRectF(5, 10, 14, 11), 2, 2)
+        p.drawArc(QRectF(8, 3, 8, 12), 0, 180 * 16)
+        p.drawEllipse(QRectF(11, 14, 2, 2))
+    return _build(d)
+
+
+def icon_unlock():
+    def d(p, s):
+        p.drawRoundedRect(QRectF(5, 10, 14, 11), 2, 2)
+        p.drawArc(QRectF(10, 3, 8, 12), 15 * 16, 150 * 16)
+        _line(p, 10, 3, 8, 3)
+        p.drawEllipse(QRectF(11, 14, 2, 2))
+    return _build(d)
+
+
+def icon_info():
+    def d(p, s):
+        p.drawEllipse(QRectF(4, 4, 16, 16))
+        p.drawEllipse(QRectF(11, 7, 2, 2))
+        _line(p, 12, 11, 12, 17)
+    return _build(d)
+
+
+def icon_fullscreen():
+    def d(p, s):
+        p.drawPolyline([QPointF(10, 5), QPointF(5, 5), QPointF(5, 10)])
+        p.drawPolyline([QPointF(14, 5), QPointF(19, 5), QPointF(19, 10)])
+        p.drawPolyline([QPointF(5, 14), QPointF(5, 19), QPointF(10, 19)])
+        p.drawPolyline([QPointF(19, 14), QPointF(19, 19), QPointF(14, 19)])
+    return _build(d)
+
+
+def icon_sun():
+    def d(p, s):
+        p.drawEllipse(QRectF(8, 8, 8, 8))
+        for x1, y1, x2, y2 in ((12, 3, 12, 6), (12, 18, 12, 21),
+                               (3, 12, 6, 12), (18, 12, 21, 12),
+                               (5.5, 5.5, 7.5, 7.5), (16.5, 16.5, 18.5, 18.5),
+                               (16.5, 7.5, 18.5, 5.5), (5.5, 18.5, 7.5, 16.5)):
+            _line(p, x1, y1, x2, y2)
+    return _build(d)
+
+
+def icon_moon():
+    def d(p, s):
+        path = QPainterPath(QPointF(16, 4))
+        path.cubicTo(8, 5, 7, 16, 15, 19)
+        path.cubicTo(9, 21, 4, 17, 4, 11)
+        path.cubicTo(4, 6, 9, 2, 16, 4)
+        p.drawPath(path)
+    return _build(d)
+
+
+def icon_system():
+    def d(p, s):
+        p.drawRoundedRect(QRectF(3, 4, 18, 13), 2, 2)
+        _line(p, 9, 21, 15, 21)
+        _line(p, 12, 17, 12, 21)
+    return _build(d)
+
+
+def icon_language():
+    def d(p, s):
+        p.drawEllipse(QRectF(4, 4, 16, 16))
+        p.drawEllipse(QRectF(8, 4, 8, 16))
+        _line(p, 4, 12, 20, 12)
+    return _build(d)
+
+
 ICONS = {
     "open": icon_open,
     "save": icon_save,
@@ -478,6 +579,16 @@ ICONS = {
     "close": icon_close,
     "print": icon_print,
     "color": icon_color,
+    "undo": icon_undo,
+    "extract": icon_extract,
+    "lock": icon_lock,
+    "unlock": icon_unlock,
+    "info": icon_info,
+    "fullscreen": icon_fullscreen,
+    "sun": icon_sun,
+    "moon": icon_moon,
+    "system": icon_system,
+    "language": icon_language,
 }
 
 
