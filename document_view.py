@@ -1971,10 +1971,12 @@ class DocumentView(QWidget):
         """缩略图右键菜单：空白处可添加 PDF；缩略图项支持删除。"""
         item = self.thumb_list.itemAt(pos)
         if item is None:
-            # 空白处：仅提供"添加 PDF 文件"入口
+            # 空白处：提供"添加 PDF 文件"与"添加空白页"入口
             menu = QMenu(self.thumb_list)
             menu.addAction(i18n.tr("insert_pdf_file"),
                            self._on_add_pdf_empty)
+            menu.addAction(i18n.tr("add_blank_page"),
+                           self._on_add_blank_page_empty)
             menu.exec(self.thumb_list.viewport().mapToGlobal(pos))
             return
         if self.doc is None:
@@ -2003,6 +2005,10 @@ class DocumentView(QWidget):
         menu.addAction(
             i18n.tr("insert_pdf_file"),
             lambda checked=False, at=insert_at: self._on_thumb_insert_pdf(at))
+        # 在选中页之后插入一张空白页（多选时取最后选中页）
+        menu.addAction(
+            i18n.tr("insert_blank_page"),
+            lambda checked=False, p=max(pages): self.insert_blank_page(p))
         # 文档多时空白处难点到，缩略图项上也提供"插入到末尾"入口
         menu.addAction(
             i18n.tr("insert_pdf_to_end"),
@@ -2077,6 +2083,58 @@ class DocumentView(QWidget):
             f"{i18n.tr('insert_done')} {insert_count} "
             f"{i18n.tr('insert_pages_hint')}", 3000)
         return True
+
+    def insert_blank_page(self, after_page):
+        """在 after_page（0-based）之后插入一张空白页。
+
+        空白页尺寸与参考页（after_page 页）一致；文档为空时使用 A4。
+        返回新页的 0-based 页码，失败返回 -1。
+        """
+        if self.doc is None:
+            return -1
+        if not self._require_permission(pymupdf.PDF_PERM_MODIFY, "插入空白页"):
+            return -1
+        count = len(self.doc)
+        if count == 0:
+            after_page = -1
+            at_page = 0
+            width, height = 595.0, 842.0  # A4
+        else:
+            after_page = max(0, min(int(after_page), count - 1))
+            at_page = after_page + 1
+            rect = self.doc[after_page].rect
+            width, height = rect.width, rect.height
+        self.begin_undo_step(document_change=True)
+        try:
+            self.doc.insert_page(at_page, width=width, height=height)
+        except Exception as exc:
+            QMessageBox.warning(self, i18n.tr("hint"),
+                                f"无法插入空白页\n{exc}")
+            return -1
+        # PyMuPDF 1.28 insert_page 的返回值并非新页页码（实测恒为 0），
+        # 插入成功后新页就位于 at_page，直接以该位置为准。
+        new_pno = at_page
+        # 调整已有页面对象的页码（新页之后的整体后移一页）
+        shifted = []
+        for obj in self.objects:
+            if obj["page"] >= at_page:
+                obj = dict(obj)
+                obj["page"] = obj["page"] + 1
+            shifted.append(obj)
+        self.objects = shifted
+        self.modified = True
+        self._refresh()
+        self._rebuild_thumbnails()
+        self.show_page(new_pno)
+        self.statusMessage.emit(i18n.tr("insert_blank_done"), 3000)
+        return new_pno
+
+    def _on_add_blank_page_empty(self):
+        """侧边栏空白处右键：在文档末尾添加一张空白页。"""
+        if self.doc is None:
+            return
+        count = len(self.doc)
+        self.insert_blank_page(count - 1 if count > 0 else -1)
 
     def _selected_thumbnail_pages(self):
         """返回侧边栏中选中的零基页码。"""
