@@ -2092,6 +2092,9 @@ class MainWindow(QMainWindow):
         view = self.current_view()
         if view is not None and view.doc is None and self.tabs.count() == 1:
             view.load(path, password)
+            # 复用欢迎页空标签时，DocumentView 侧边栏初始为隐藏，
+            # 与新建标签一致地应用"启动时显示侧边栏"默认值。
+            view.set_sidebar_visible(self.sidebar_default_visible)
         else:
             view = self._new_tab()
             view.load(path, password)
