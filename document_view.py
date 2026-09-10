@@ -22,6 +22,7 @@ from PySide6.QtPrintSupport import QPrinter
 
 import backend
 import i18n
+from check_menu import CheckMenu
 from page_view import PageView
 from rich_text import (RichEditBox, PdfRowEditBox, merge_runs, runs_text, single_run,
                        runs_all_same_style, _qt_safe_family)
@@ -1972,7 +1973,7 @@ class DocumentView(QWidget):
         item = self.thumb_list.itemAt(pos)
         if item is None:
             # 空白处：提供"添加 PDF 文件"与"添加空白页"入口
-            menu = QMenu(self.thumb_list)
+            menu = CheckMenu(self.thumb_list)
             menu.addAction(i18n.tr("insert_pdf_file"),
                            self._on_add_pdf_empty)
             menu.addAction(i18n.tr("add_blank_page"),
@@ -1990,7 +1991,7 @@ class DocumentView(QWidget):
         pages = self._selected_thumbnail_pages()
         if not pages:
             return
-        menu = QMenu(self.thumb_list)
+        menu = CheckMenu(self.thumb_list)
         label = (i18n.tr("delete_this_page") if len(pages) == 1 else
                  i18n.tr("delete_selected_pages"))
         menu.addAction(label, lambda checked=False, p=pages: self.delete_pages(p))
@@ -4754,7 +4755,7 @@ class DocumentView(QWidget):
         """构建右键菜单(不弹出)。抽出以便测试直接断言菜单项；text 对象
         右键已去掉「编辑文字/更改颜色」入口(编辑走双击就地编辑、改色走
         编辑框内「格式编辑…」)，批注对象保留「更改颜色」。"""
-        menu = QMenu(self)
+        menu = CheckMenu(self)
         oid = self.page_view.selected_id()
         sel_obj = self._find_object(oid) if oid is not None else None
         if self.doc is not None:

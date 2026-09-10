@@ -23,6 +23,7 @@ import app_config as cfg
 import theme
 import icons
 import i18n
+from check_menu import CheckMenu
 from document_view import DocumentView, MODE_DEFS
 
 
@@ -1246,8 +1247,8 @@ class MainWindow(QMainWindow):
         self.toolbar_seam_cover.setFixedWidth(0)
         self.toolbar_seam_cover.hide()
 
-        # 独立溢出入口使用普通 QMenu，确保菜单背景与当前主题同步。
-        self.more_tools_menu = QMenu(self)
+        # 独立溢出入口使用 CheckMenu（QMenu 子类），确保菜单背景与当前主题同步。
+        self.more_tools_menu = CheckMenu(self)
         self.more_tools_menu.setObjectName("toolbarOverflowMenu")
         self.more_tools_menu.aboutToShow.connect(self._refresh_more_tools_menu)
 
@@ -1394,8 +1395,15 @@ class MainWindow(QMainWindow):
         self.tb2.updateGeometry()
         QTimer.singleShot(0, self._schedule_more_tools_visibility)
 
+    def _add_menu(self, parent, title):
+        """创建 CheckMenu（右侧勾选标记）并挂到 parent（菜单栏或上级菜单）。"""
+        menu = CheckMenu(self)
+        menu.setTitle(title)
+        parent.addMenu(menu)
+        return menu
+
     def _build_menus(self):
-        self._m_file = self.menuBar().addMenu(i18n.tr("menu_file"))
+        self._m_file = self._add_menu(self.menuBar(), i18n.tr("menu_file"))
         self._m_file.addAction(self.act["open"])
         self._m_file.addAction(self.act["save"])
         self._m_file.addAction(self.act["save_as"])
@@ -1405,7 +1413,7 @@ class MainWindow(QMainWindow):
         self._m_file.addSeparator()
         self._m_file.addAction(self.act["exit"] if "exit" in self.act else self._mk_exit())
 
-        self._m_edit = self.menuBar().addMenu(i18n.tr("menu_edit"))
+        self._m_edit = self._add_menu(self.menuBar(), i18n.tr("menu_edit"))
         self._m_edit.addAction(self.act["undo"])
         self._m_edit.addSeparator()
         for key, _l, _vm, _i in MODE_DEFS:
@@ -1415,7 +1423,7 @@ class MainWindow(QMainWindow):
         self._m_edit.addAction(self.act["edit_color"])
         self._m_edit.addAction(self.act["delete_page"])
 
-        self._m_tools = self.menuBar().addMenu(i18n.tr("menu_tools"))
+        self._m_tools = self._add_menu(self.menuBar(), i18n.tr("menu_tools"))
         self._m_tools.addAction(self.act["merge"])
         self._m_tools.addAction(self.act["split_every"])
         self._m_tools.addAction(self.act["split_ranges"])
@@ -1426,27 +1434,27 @@ class MainWindow(QMainWindow):
         # 可安全隔离的候选已自动并入修改/删除，不再让用户先走“检测”。
         self._m_tools.addAction(self.act["annotation"])
         self._m_tools.addSeparator()
-        self._m_signature_tools = self._m_tools.addMenu(i18n.tr("sign_title"))
+        self._m_signature_tools = self._add_menu(self._m_tools, i18n.tr("sign_title"))
         self._m_signature_tools.setIcon(
             icons.get("library", self._icon_color))
         self._icon_key_of[self._m_signature_tools.menuAction()] = "library"
         self._m_signature_tools.addAction(self.act["sign"])
         self._m_signature_tools.addAction(self.act["sign_lib"])
         self._m_tools.addSeparator()
-        self._m_ocr = self._m_tools.addMenu(i18n.tr("menu_ocr"))
+        self._m_ocr = self._add_menu(self._m_tools, i18n.tr("menu_ocr"))
         self._m_ocr.setIcon(icons.get("ocr", self._icon_color))
         self._icon_key_of[self._m_ocr.menuAction()] = "ocr"
         self._m_ocr.addAction(self.act["ocr_current"])
         self._m_ocr.addAction(self.act["ocr_all"])
 
-        self._m_sign = self.menuBar().addMenu(i18n.tr("menu_sign"))
+        self._m_sign = self._add_menu(self.menuBar(), i18n.tr("menu_sign"))
         self._m_sign.addAction(self.act["security_set"])
         self._m_sign.addAction(self.act["security_remove"])
         self._m_sign.addSeparator()
         self._m_sign.addAction(self.act["security_status"])
 
-        self._m_view = self.menuBar().addMenu(i18n.tr("menu_view"))
-        self._m_theme = self._m_view.addMenu(i18n.tr("menu_theme"))
+        self._m_view = self._add_menu(self.menuBar(), i18n.tr("menu_view"))
+        self._m_theme = self._add_menu(self._m_view, i18n.tr("menu_theme"))
         self._m_theme.setIcon(icons.get("color", self._icon_color))
         self._icon_key_of[self._m_theme.menuAction()] = "color"
         self._m_theme.addAction(self.act["theme_light"])
@@ -1454,7 +1462,7 @@ class MainWindow(QMainWindow):
         self._m_theme.addAction(self.act["theme_system"])
 
         # 语言子菜单
-        self._m_lang = self._m_view.addMenu(i18n.tr("menu_lang"))
+        self._m_lang = self._add_menu(self._m_view, i18n.tr("menu_lang"))
         self._m_lang.setIcon(icons.get("language", self._icon_color))
         self._icon_key_of[self._m_lang.menuAction()] = "language"
         self._lang_group = QActionGroup(self)
@@ -1477,7 +1485,7 @@ class MainWindow(QMainWindow):
         self._m_view.addAction(self.act["fullscreen"])
         self._m_view.addAction(self.act["slideshow"])
 
-        self._m_help = self.menuBar().addMenu(i18n.tr("menu_help"))
+        self._m_help = self._add_menu(self.menuBar(), i18n.tr("menu_help"))
         self._m_help.addAction(self.act["check_update"])
         self._m_help.addSeparator()
         self._m_help.addAction(self.act["star_us"])

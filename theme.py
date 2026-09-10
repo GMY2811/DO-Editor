@@ -1,15 +1,9 @@
 """DO编辑器界面主题：现代浅色 / 深色主题与系统主题检测。"""
-import os
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import Qt
 
-from PySide6.QtGui import (QGuiApplication, QColor, QImage, QPainter, QPen)
-from PySide6.QtCore import Qt, QPointF, QStandardPaths
-
-_MENU_CHECK_COLOR = {
-    "%MENU_CHECK_LIGHT%": "#0071e3",   # 亮色主题勾选（菜单白底）
-    "%MENU_CHECK_DARK%": "#64a8ff",    # 深色主题勾选（菜单深底）
-    "%MENU_CHECK_WHITE%": "#ffffff",   # 悬停高亮蓝底上的勾选
-}
-_check_icon_dir = None
+# 菜单勾选标记不再走 QMenu::indicator（左侧指示区与菜单项图标冲突，
+# 带图标时无法显示）。现由 check_menu.CheckMenu 在条目右侧自绘。
 
 
 LIGHT = r"""
@@ -39,9 +33,6 @@ QMenuBar::item { padding: 4px 10px; border-radius: 5px; color: #2c2c2e; font-wei
 QMenuBar::item:selected { background: #e7e7eb; color: #0066cc; }
 QMenu { background: #ffffff; border: 1px solid #d2d2d7; border-radius: 0; padding: 6px; }
 QMenu::item { padding: 7px 30px 7px 12px; border-radius: 0; color: #2c2c2e; }
-QMenu::indicator { width: 15px; height: 15px; margin-left: 2px; }
-QMenu::indicator:checked { image: url(%MENU_CHECK_LIGHT%); }
-QMenu::indicator:checked:selected { image: url(%MENU_CHECK_WHITE%); }
 QMenu::item:selected { background: #007aff; color: #ffffff; }
 QMenu::item:disabled { color: #aeaeb2; }
 QMenu::separator { height: 1px; background: #e5e5ea; margin: 5px 8px; }
@@ -167,9 +158,6 @@ QMenuBar::item { padding: 4px 10px; border-radius: 5px; color: #d1d1d6; font-wei
 QMenuBar::item:selected { background: #3a3a3c; color: #64a8ff; }
 QMenu { background: #2c2c2e; border: 1px solid #48484a; border-radius: 0; padding: 6px; }
 QMenu::item { padding: 7px 30px 7px 12px; border-radius: 0; color: #f2f2f7; }
-QMenu::indicator { width: 15px; height: 15px; margin-left: 2px; }
-QMenu::indicator:checked { image: url(%MENU_CHECK_DARK%); }
-QMenu::indicator:checked:selected { image: url(%MENU_CHECK_WHITE%); }
 QMenu::item:selected { background: #0a84ff; color: #ffffff; }
 QMenu::item:disabled { color: #636366; }
 QMenu::separator { height: 1px; background: #48484a; margin: 5px 8px; }
@@ -461,61 +449,6 @@ QPushButton#textFormatToggle:checked {
 """
 
 
-def _ensure_menu_check_icons():
-    """生成菜单勾选标记 PNG，返回所在目录（失败返回 None）。
-
-    QMenu::indicator 的 image: url() 不支持 data URI（实测不渲染），
-    必须落盘本地路径。首次调用生成 16x16 对勾，之后直接复用。
-    """
-    global _check_icon_dir
-    if _check_icon_dir is not None:
-        return _check_icon_dir or None
-    try:
-        base = QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.AppLocalDataLocation)
-        if not base:
-            base = os.path.join(os.environ.get("LOCALAPPDATA",
-                                               os.path.expanduser("~")),
-                                "DOEditor")
-        check_dir = os.path.join(base, "theme")
-        os.makedirs(check_dir, exist_ok=True)
-        for name, color in _MENU_CHECK_COLOR.items():
-            path = os.path.join(check_dir, name.strip("%") + ".png")
-            if not os.path.exists(path):
-                img = QImage(16, 16, QImage.Format.Format_ARGB32)
-                img.fill(Qt.GlobalColor.transparent)
-                painter = QPainter(img)
-                painter.setRenderHint(
-                    QPainter.RenderHint.Antialiasing)
-                painter.setPen(QPen(QColor(color), 2.6,
-                                    Qt.PenStyle.SolidLine,
-                                    Qt.PenCapStyle.RoundCap,
-                                    Qt.PenJoinStyle.RoundJoin))
-                painter.drawPolyline([
-                    QPointF(3.0, 8.6),
-                    QPointF(6.6, 12.2),
-                    QPointF(13.0, 4.4),
-                ])
-                painter.end()
-                if not img.save(path, "PNG"):
-                    raise OSError(path)
-        _check_icon_dir = check_dir
-    except Exception:
-        _check_icon_dir = ""
-    return _check_icon_dir or None
-
-
-def _apply_menu_check_icons(qss):
-    """把勾选标记占位符替换为实际 PNG 路径（未生成为无害降级）。"""
-    check_dir = _ensure_menu_check_icons()
-    if not check_dir:
-        return qss
-    for name in _MENU_CHECK_COLOR:
-        path = os.path.join(check_dir, name.strip("%") + ".png")
-        qss = qss.replace(name, path.replace("\\", "/"))
-    return qss
-
-
 def system_is_dark():
     """检测系统是否处于深色模式（Qt 6.5+）。"""
     try:
@@ -535,9 +468,8 @@ def _resolve_dark(mode, dark_override=None):
 
 
 def qss_for(mode, dark_override=None):
-    """根据主题模式返回 QSS 字符串（含菜单勾选标记路径注入）。"""
-    qss = DARK if _resolve_dark(mode, dark_override) else LIGHT
-    return _apply_menu_check_icons(qss)
+    """根据主题模式返回 QSS 字符串。"""
+    return DARK if _resolve_dark(mode, dark_override) else LIGHT
 
 
 def is_dark(mode, dark_override=None):
